@@ -39,6 +39,7 @@ import Data.Maybe (fromMaybe)
 import Text.Printf (printf)
 
 import Shikumi.Adapter (ToPrompt (..))
+import Shikumi.Combinator (retry)
 import Shikumi.Error (ShikumiError)
 import Shikumi.LLM (defaultLLMConfig, runLLMResilient)
 import Shikumi.LLM qualified as L
@@ -130,6 +131,15 @@ demoParams =
 summarizeP :: Program Article Summary
 summarizeP = P.mapParams (const demoParams) summarize
 
+-- | The same prediction wrapped in a program-level retry. The transport-level
+-- resilience in runLLMResilient only re-issues transient failures (rate
+-- limits, timeouts); a malformed *reply* is a successful HTTP exchange whose
+-- failure only appears at decode time, and re-asking costs money — so that
+-- policy is a combinator on the program, here: up to 2 total attempts
+-- (one re-ask) on any ShikumiError before the last error propagates.
+summarizeRobust :: Program Article Summary
+summarizeRobust = retry 2 summarizeP
+
 sampleArticle :: Article
 sampleArticle =
   Article
@@ -148,7 +158,7 @@ main = do
           , ("sentiment", "Neutral")
           ]
 
-  result <- runStub stub summarizeP sampleArticle
+  result <- runStub stub summarizeRobust sampleArticle
   putStrLn "offline (stub):"
   case result of
     Right s  -> print s                     -- a fully-typed Summary
@@ -164,7 +174,7 @@ main = do
           , ("sentiment", "Neutral")
           ]
 
-  bad <- runStub badStub summarizeP sampleArticle
+  bad <- runStub badStub summarizeRobust sampleArticle
   print (bad :: Either ShikumiError Summary)
 
   -- Optionally, run the *same program value* against a real provider.
@@ -226,7 +236,7 @@ runLive = do
       . teeLLM                       -- DEBUG: print each raw model reply
       . withRequestDefaults defaults -- cap output tokens for the demo
       . routeLLM                     -- stamps the ambient model onto calls
-      $ runProgram summarizeP sampleArticle
+      $ runProgram summarizeRobust sampleArticle
 
   case liveResult of
     Right s  -> print s
