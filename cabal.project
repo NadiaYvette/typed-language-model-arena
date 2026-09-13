@@ -25,6 +25,8 @@ packages: shikumi-coder
 
 packages: toy-fixer
 
+packages: shikumi-campaign
+
 packages: ../shikumi/shikumi
           ../shikumi/shikumi-testing
           ../shikumi/shikumi-eval

@@ -1,7 +1,7 @@
-
 dist-newstyle/
 *.swp
 *.hi
 *.o
 .shikumi/
 classify.json
+db/
