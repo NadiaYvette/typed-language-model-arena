@@ -10,6 +10,8 @@ with-compiler: ghc-9.12.4
 
 packages: shikumi-hello
 
+packages: toy-fixer
+
 packages: ../shikumi/shikumi
           ../shikumi/shikumi-testing
           ../shikumi/shikumi-eval
