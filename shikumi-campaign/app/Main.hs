@@ -27,23 +27,34 @@
 --   4. /Session evidence/: the campaign's fix session (one turn per
 --      journaled attempt) is recorded through kioku's session API — L0
 --      evidence kioku's distillers can promote to memory atoms later.
---   5. /Restart proof/ (after each act): a fresh store connection — a new
+--   5. /Distillation/: kioku's L1 distiller runs LIVE over that session —
+--      an AI config file generated from the OmniRoute environment (no
+--      secrets on disk: the config names @OMNIROUTE_API_KEY@ and baikai
+--      reads the key at call time), 'loadAIRuntime', then
+--      'distillSessionL1' with the keyword-only merge scan (no embeddings
+--      needed). L0 turns become machine-written memory atoms, shown by
+--      recalling them back through the same read the workflow uses.
+--   6. /Restart proof/ (after each act): a fresh store connection — a new
 --      \"process\" — finds no unfinished work. The campaign state lives in
 --      the journal, not in the process.
 --
--- Everything runs offline: the model is 'markerResponse' scripts, the
--- checker is pure, and Postgres is the only external dependency.
+-- Acts 1–4 run offline: the model is 'markerResponse' scripts, the checker
+-- is pure, and Postgres is the only external dependency. Act 5 is the one
+-- live act — it drives a real model through the local OmniRoute proxy.
 module Main
   ( main,
   )
 where
 
+import Control.Applicative ((<|>))
 import Control.Monad (unless, when)
 import Data.Aeson qualified as Aeson
 import Data.Aeson.Key qualified as Key
 import Data.Aeson.KeyMap qualified as KeyMap
+import Data.ByteString.Lazy qualified as BL
 import Data.Foldable (for_, traverse_)
-import Data.IORef (atomicModifyIORef', newIORef, readIORef)
+import Data.IORef (atomicModifyIORef', newIORef, readIORef, writeIORef)
+import Data.Maybe (isJust)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
@@ -80,13 +91,34 @@ import Kiroku.Store.Types
     StreamName (..),
     StreamVersion (..),
   )
+import System.Directory (removeFile)
 import System.Environment (lookupEnv)
+import System.IO (hClose, openTempFile)
 
+import Kioku.AI.Config (AIExecutionError (..), AIFeature (..))
+import Kioku.AI.File (loadAIRuntime)
+import Kioku.AI.Runtime (AIRuntime, runAIProgram)
+import Kioku.Distill.Consolidate (ConsolidateInput, ConsolidationDecision, consolidateProgram)
+import Kioku.Distill.Extract
+  ( ExtractInput (..),
+    ExtractOutput (..),
+    ExtractedAtom (..),
+    extractSignature,
+  )
+import Kioku.Distill.L1 (L1Outcome (..), L1RunMode (..), L1Summary (..), distillSessionL1, scopedScanCandidates)
+import Kioku.Distill.Runtime (TestRunners (..), newDistillRuntime, withTestRunners)
+import Kioku.Id (SessionId)
 import Kioku.ReadModel (registerKiokuReadModels)
+import Shikumi.Error (ShikumiError (..))
+import Shikumi.Module (predict)
+import Shikumi.Program (Program)
+import Shikumi.Schema.Types (field)
+import Shikumi.Signature (Demo (..), getInstruction, setDemos, setInstruction)
 
 import Campaign.Cell (Cell (..), CellId (..), FixAttempt (..), cellForId, unCellId)
 import Campaign.Memory
-  ( completeFixSession,
+  ( campaignAccessContext,
+    completeFixSession,
     recallNotes,
     recordFixTurn,
     recordLesson,
@@ -110,7 +142,8 @@ main = do
   runInformedRetryAct
   runEscalationAct
   runMemoryAct
-  runSessionAct
+  sid <- runSessionAct
+  runDistillAct sid
 
 -- ---------------------------------------------------------------------------
 -- Store plumbing (jitsurei's shape; no projection schema — the journal is
@@ -548,13 +581,15 @@ runMemoryAct = do
 -- Act 4: the fix session as L0 evidence in kioku
 -- ---------------------------------------------------------------------------
 
-runSessionAct :: IO ()
+runSessionAct :: IO SessionId
 runSessionAct = do
   putStrLn "\n=== act 4: the fix session as kioku L0 evidence ==="
   cell <- requireCell "alpha.py"
+  sidRef <- newIORef (error "session id unset")
   withCampaignStore $ \store -> do
     putStrLn "[session] starting a fix session for alpha.py"
     sid <- runKiokuWrite store (startFixSession (unCellId cell.cellId))
+    writeIORef sidRef sid
     putStrLn ("  session started: " <> show sid)
 
     -- One turn per journaled attempt of act 1's journal — the campaign's
@@ -584,3 +619,183 @@ runSessionAct = do
         for_ ns \n -> TIO.putStrLn ("    - " <> n)
 
   putStrLn "[session] done"
+  readIORef sidRef
+
+-- ---------------------------------------------------------------------------
+-- Act 5: kioku's L1 distiller runs live — L0 evidence becomes memory atoms
+-- ---------------------------------------------------------------------------
+
+-- | The campaign's AI config, generated from the OmniRoute environment so no
+-- secret ever lands on disk: the JSON names @OMNIROUTE_API_KEY@ (or the
+-- OpenAI fallback) and baikai resolves the key at call time — the same
+-- discipline as the live tier-1 stack. Embeddings stay unset: the
+-- keyword-only merge scan needs no vectors, and this host has no pgvector.
+campaignAIConfigJSON :: IO BL.ByteString
+campaignAIConfigJSON = do
+  keyEnv <- do
+    omni <- lookupEnv "OMNIROUTE_API_KEY"
+    pure (if isJust omni then ("OMNIROUTE_API_KEY" :: Text) else "OPENAI_API_KEY")
+  modelId <- do
+    -- SHIKUMI_MODEL wins (e.g. auto/smart), then OMNIROUTE_CHAT_MODEL, then
+    -- the proxy's ambient free-models tier.
+    override <- lookupEnv "SHIKUMI_MODEL"
+    ambient <- lookupEnv "OMNIROUTE_CHAT_MODEL"
+    pure (maybe "free-models" T.pack (override <|> ambient))
+  baseUrl <- do
+    openAiBase <- lookupEnv "OPENAI_API_BASE"
+    omniBase <- lookupEnv "OMNIROUTE_BASE_URL"
+    pure $ case (openAiBase, omniBase) of
+      (Just b, _) -> T.pack b
+      (_, Just b) -> T.pack b
+      _ -> "http://localhost:20128/v1"
+  pure $
+    Aeson.encode $
+      Aeson.object
+        [ "version" Aeson..= (1 :: Int),
+          "permissions" Aeson..= ["api" :: Text],
+          "distillation"
+            Aeson..= Aeson.object
+              [ "mode" Aeson..= ("api" :: Text),
+                "api" Aeson..= ("openai-chat-completions" :: Text),
+                "model" Aeson..= modelId,
+                -- "openai" is the wire protocol (baikai's provider registry key),
+                -- and it is what shikumi's capabilityFor checks to stamp the
+                -- strict JSON schema — OmniRoute is an OpenAI-compatible proxy,
+                -- so the native-schema path is exactly right here.
+                "provider" Aeson..= ("openai" :: Text),
+                "baseUrl" Aeson..= baseUrl,
+                "options"
+                  Aeson..= Aeson.object
+                    [ "apiKeyEnv" Aeson..= keyEnv,
+                      "maxTokens" Aeson..= (16384 :: Int),
+                      "timeoutMs" Aeson..= (120000 :: Int)
+                    ]
+              ]
+        ]
+
+-- | A shape contract for the extractor, worked as a demonstration: the model
+-- must reply with @atoms@ as a JSON array of /objects/ (the four named fields),
+-- never a list of sentences. Kioku's stock guide lists top-level fields only, so
+-- capable models still answered @atoms: ["sentence", ...]@ and the typed decode
+-- failed with @expected object, got string@ — through every model tier. This is
+-- the DSPy remedy at the signature level: show the exact output shape. The
+-- runner goes through kioku's own 'TestRunners' seam (the sanctioned override
+-- point), delegating execution to the same validated 'AIRuntime' and config as
+-- every other feature, so the live stack is unchanged.
+shapeInstruction :: Text
+shapeInstruction =
+  getInstruction extractSignature
+    <> "\n\nWIRE FORMAT (mandatory): atoms MUST be a JSON array of objects, each \
+       \object with exactly these keys: atomType (one of fact | pattern | \
+       \preference | constraint | instruction), content (one concise sentence), \
+       \priority (integer 0..100), confidence (one of high | medium | low). \
+       \Never reply with a bare list of strings; if there is nothing durable \
+       \to retain, reply with an empty array."
+
+shapeDemo :: Demo ExtractInput ExtractOutput
+shapeDemo = Demo
+  { input =
+      ExtractInput
+        { focus = field "fix cell alpha.py",
+          scopeLabel = field "cell alpha.py (verification campaign)",
+          conversation =
+            field
+              "attempt 1: diagnostics before: [W-todo] found a TODO marker; \
+               \after: (clean); repair: the TODO line was deleted entirely"
+        },
+    output =
+      ExtractOutput
+        { atoms =
+            [ ExtractedAtom
+                { atomType = field "pattern",
+                  content = field "the fixer deletes TODO lines entirely once diagnostics confirm the marker",
+                  priority = field (60 :: Int),
+                  confidence = field "medium"
+                }
+            ]
+        }
+  }
+
+shapeProgram :: Program ExtractInput ExtractOutput
+shapeProgram = predict (setDemos [shapeDemo] (setInstruction shapeInstruction extractSignature))
+
+-- | Run the shape-contract extractor on the live stack, surfacing shikumi
+-- errors as kioku expects them.
+campaignExtractRunner :: AIRuntime -> ExtractInput -> IO (Either ShikumiError ExtractOutput)
+campaignExtractRunner air input =
+  runAIProgram air Extraction shapeProgram input >>= \case
+    Left (AIProgramFailed err) -> pure (Left err)
+    Left other -> pure (Left (ProviderFailure (T.pack (show other))))
+    Right out -> pure (Right out)
+
+-- | Consolidation stays on kioku's stock program — the same call the
+-- non-overridden path would make (a decision over one or two atoms, no shape
+-- contract needed).
+campaignConsolidateRunner :: AIRuntime -> ConsolidateInput -> IO (Either ShikumiError ConsolidationDecision)
+campaignConsolidateRunner air input =
+  runAIProgram air Consolidation consolidateProgram input >>= \case
+    Left (AIProgramFailed err) -> pure (Left err)
+    Left other -> pure (Left (ProviderFailure (T.pack (show other))))
+    Right out -> pure (Right out)
+
+runDistillAct :: SessionId -> IO ()
+runDistillAct sid = do
+  putStrLn "\n=== act 5: kioku's L1 distiller runs live — evidence becomes memory ==="
+
+  -- Generate the config from the environment, hand it to kioku by path (no
+  -- KIOKU_AI_CONFIG env needed — loadAIRuntime takes an explicit path), and
+  -- remove the temp file once the runtime has parsed it.
+  cfgJSON <- campaignAIConfigJSON
+  (cfgPath, cfgHandle) <- openTempFile "/tmp" "campaign-ai.json"
+  BL.hPut cfgHandle cfgJSON
+  hClose cfgHandle
+  air <- loadAIRuntime False (Just cfgPath)
+  removeFile cfgPath
+  -- The extraction runner carries the shape contract; consolidation (one or
+  -- two atoms to decide over) stays on the stock path.
+  let distillRT =
+        withTestRunners
+          (newDistillRuntime air Nothing)
+          ( \tr ->
+              tr
+                { runExtract = campaignExtractRunner air,
+                  runConsolidate = campaignConsolidateRunner air
+                }
+          )
+
+  withCampaignStore $ \store -> do
+    -- The distiller's effect row is the campaign's write row, so it runs
+    -- inside the same store handle as every other kioku write. Merge
+    -- candidates come from the keyword-only scan — no embeddings required.
+    result <-
+      runCampaignStore store $
+        distillSessionL1
+          campaignAccessContext
+          IgnoreWatermark
+          distillRT
+          (scopedScanCandidates 8)
+          sid
+    case result of
+      Left err -> fail ("  store error: " <> show err)
+      Right inner -> case inner of
+        Left err -> fail ("  L1 distillation failed: " <> show err)
+        Right L1SkippedUpToDate ->
+          putStrLn "  distiller: session already up to date — no new turns since the last pass"
+        Right (L1Distilled summary) ->
+          putStrLn
+            ( "  distilled: " <> show summary.extracted <> " candidate(s) extracted, "
+                <> show summary.stored <> " stored, "
+                <> show summary.merged <> " merged, "
+                <> show summary.skipped <> " skipped"
+            )
+
+    -- The proof: the same read the workflow uses now returns the
+    -- machine-written atoms alongside the human-curated lessons.
+    notes <- runCampaignStore store recallNotes
+    case notes of
+      Left err -> fail (show err)
+      Right ns -> do
+        putStrLn ("  recall after distillation — " <> show (length ns) <> " note(s) in memory:")
+        for_ ns \n -> TIO.putStrLn ("    - " <> n)
+
+  putStrLn "[distill] done — the campaign writes its own lessons from its own journal"

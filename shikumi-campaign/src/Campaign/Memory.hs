@@ -235,16 +235,20 @@ completeFixSession sid summary = do
 -- Reads (workflow side)
 -- ---------------------------------------------------------------------------
 
--- | Every active lesson's advice in the campaign namespace. Full-text recall
--- needs no embeddings; with pgvector installed a host would switch this to
--- hybrid recall without changing the call shape.
+-- | Every active memory's advice in the campaign namespace. Lessons are
+-- @lesson: @-prefixed (the prefix is stripped); any other content — such as
+-- atoms machine-written by kioku's L1 distiller — passes through verbatim.
+-- Full-text recall needs no embeddings; with pgvector installed a host would
+-- switch this to hybrid recall without changing the call shape.
 recallNotes :: (IOE :> es, Store :> es) => Eff es [Text]
 recallNotes = do
   r <- getActiveInNamespace campaignMemorySpace campaignNamespace
   pure $ case r of
     Left _ -> []
     Right records ->
-      [advice | MemoryRecord {content} <- records, Just advice <- [parseLesson content]]
+      [ maybe content id (parseLesson content)
+      | MemoryRecord {content} <- records
+      ]
 
 -- | Lessons whose advice mentions a keyword (@todo@, @unused@, …). The
 -- workflow derives keywords from the cell's own diagnostics, so the memory
