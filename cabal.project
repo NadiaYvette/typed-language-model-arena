@@ -12,6 +12,7 @@ packages: shikumi-hello
 
 packages: ../shikumi/shikumi
           ../shikumi/shikumi-testing
+          ../shikumi/shikumi-eval
 
 packages: ../baikai/baikai
           ../baikai/baikai-claude

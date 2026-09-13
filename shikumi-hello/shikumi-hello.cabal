@@ -1,19 +1,19 @@
 cabal-version:   3.4
 name:            shikumi-hello
 version:         0.1.0.0
-synopsis:        Hello world for shikumi — records in, records out, offline stub
+synopsis:        Shikumi playground: hello world and tutorial tiers
 description:
   A minimal standalone shikumi program: declare input/output records, derive
   the schema/decode/prompt contract, wrap a Signature in predict, and run it
   under the offline stub LM from shikumi-testing. No API key, no network.
+  Tier 2 adds composition, combinators, and evaluation examples.
 license:         BSD-3-Clause
 build-type:      Simple
 
-executable shikumi-hello
-  main-is:          Main.hs
-  hs-source-dirs:   .
+common common-all
   default-language: GHC2024
   ghc-options:      -Wall -threaded
+  hs-source-dirs:   . tier2
   build-depends:
     , aeson           ^>=2.2
     , baikai          >=0.7.0.0 && <0.8
@@ -25,3 +25,24 @@ executable shikumi-hello
     , shikumi         ^>=0.4.0.0
     , shikumi-testing ^>=0.1.0.0
     , text            ^>=2.1
+
+-- Tier 1: hello world — one program, offline stub + live provider modes.
+executable shikumi-hello
+  import:         common-all
+  main-is:        Main.hs
+
+-- Tier 2a: compose typed programs with (>>>); mismatches are compile errors.
+executable tier2-compose
+  import:         common-all
+  main-is:        Tier2Compose.hs
+
+-- Tier 2b: control flow as combinators — every one still a Program value.
+executable tier2-combinators
+  import:         common-all
+  main-is:        Tier2Combinators.hs
+
+-- Tier 2c: evaluate a program against a typed dataset with a typed metric.
+executable tier2-evaluate
+  import:         common-all
+  main-is:        Tier2Evaluate.hs
+  build-depends:  shikumi-eval ^>=0.3.0.0
