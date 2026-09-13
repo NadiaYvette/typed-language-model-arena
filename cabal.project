@@ -13,6 +13,10 @@ packages: shikumi-hello
 packages: ../shikumi/shikumi
           ../shikumi/shikumi-testing
           ../shikumi/shikumi-eval
+          ../shikumi/shikumi-compile
+          ../shikumi/shikumi-optimize
+          ../shikumi/shikumi-trace
+          ../shikumi/shikumi-cache
 
 packages: ../baikai/baikai
           ../baikai/baikai-claude

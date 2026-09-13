@@ -13,7 +13,7 @@ build-type:      Simple
 common common-all
   default-language: GHC2024
   ghc-options:      -Wall -threaded
-  hs-source-dirs:   . tier2
+  hs-source-dirs:   . tier2 tier3
   build-depends:
     , aeson           ^>=2.2
     , baikai          >=0.7.0.0 && <0.8
@@ -46,3 +46,12 @@ executable tier2-evaluate
   import:         common-all
   main-is:        Tier2Evaluate.hs
   build-depends:  shikumi-eval ^>=0.3.0.0
+
+-- Tier 3: optimize demos against data, then serialize/reload the params.
+executable tier3-optimize
+  import:         common-all
+  main-is:        Tier3Optimize.hs
+  build-depends:
+    , shikumi-compile ^>=0.2.1.0
+    , shikumi-eval    ^>=0.3.0.0
+    , shikumi-optimize ^>=0.3.0.0
