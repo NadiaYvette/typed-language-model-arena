@@ -13,18 +13,20 @@ build-type:      Simple
 common common-all
   default-language: GHC2024
   ghc-options:      -Wall -threaded
-  hs-source-dirs:   . tier2 tier3 tier4 tier5 tier6
+  hs-source-dirs:   . tier2 tier3 tier4 tier5 tier6 tier7
   build-depends:
     , aeson           ^>=2.2
     , baikai          >=0.7.0.0 && <0.8
     , baikai-openai   >=0.7.0.0 && <0.8
     , base            >=4.20    && <5
+    , bytestring
     , effectful       >=2.5     && <2.7
     , generic-lens    >=2.2     && <2.4
     , lens            ^>=5.3
     , shikumi         ^>=0.4.0.0
     , shikumi-testing ^>=0.1.0.0
     , text            ^>=2.1
+    , vector
 
 -- Tier 1: hello world — one program, offline stub + live provider modes.
 executable shikumi-hello
@@ -83,3 +85,21 @@ executable tier6-cli
     , shikumi-cli     ^>=0.1.0.0
     , shikumi-eval    ^>=0.3.0.0
     , shikumi-optimize ^>=0.3.0.0
+
+-- Side dish: program-level streaming.
+executable tier7-streaming
+  import:         common-all
+  main-is:        Tier7Streaming.hs
+
+-- Side dish: multimodal input — an Image field the model actually sees.
+executable tier7-multimodal
+  import:         common-all
+  main-is:        Tier7Multimodal.hs
+
+-- Side dish: code execution — programOfThought and codeAct over the sandbox.
+executable tier7-codeexec
+  import:         common-all
+  main-is:        Tier7CodeExec.hs
+  build-depends:
+    , shikumi-tools ^>=0.4.0.0
+    , vector        ^>=0.13

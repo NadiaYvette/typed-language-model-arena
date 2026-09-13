@@ -1,0 +1,112 @@
+{-# LANGUAGE GHC2024 #-}
+{-# LANGUAGE DeriveAnyClass #-}
+{-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE OverloadedLabels #-}
+{-# LANGUAGE OverloadedStrings #-}
+
+-- | Side dish: program-level streaming.
+--
+-- @streamProgram@ runs a program and hands a callback a sequence of
+-- 'StreamEvent's as execution proceeds — field chunks (pieces of an output
+-- field as the model writes it) and status messages (LM call started/finished,
+-- node boundaries) — and /still returns the fully-decoded typed output/,
+-- identical to what @runProgram@ would return. The blocking contract is
+-- untouched; streaming is additive surface.
+--
+-- Offline, a stub streaming interpreter scripts the wire deltas
+-- @["Hel", "lo"]@ followed by a terminal structured reply. A single-Predict
+-- program shows the callback receive, in order: an @LmStart@ status, two field
+-- chunks, an @LmEnd@ status — and the typed answer at the end.
+module Main (main) where
+
+import Baikai
+  ( AssistantContent (..),
+    AssistantMessageEvent (..),
+    BlockEndPayload (..),
+    DeltaPayload (..),
+    IndexPayload (..),
+    Message (AssistantMessage),
+    Response,
+    StartPayload (..),
+    StopReason (..),
+    TerminalPayload (..),
+    doneTerminal,
+    emptyResponse,
+    emptyTextContent,
+  )
+import Control.Lens ((&), (.~), (^.))
+import Data.Generics.Labels ()
+import Data.Text (Text)
+import Data.Text qualified as T
+import Data.Vector qualified as V
+import Effectful (Eff, IOE, liftIO, runEff, type (:>))
+import Effectful.Dispatch.Dynamic (interpret)
+import Effectful.Error.Static (runErrorNoCallStack)
+import GHC.Generics (Generic)
+
+import Shikumi.Adapter (ToPrompt)
+import Shikumi.Error (ShikumiError)
+import Shikumi.LLM (LLM (..))
+import Shikumi.Module (predict)
+import Shikumi.Program (Program)
+import Shikumi.Schema (FromModel, ToSchema, Validatable)
+import Shikumi.Signature (Signature, mkSignature)
+import Shikumi.Stream (StreamEvent, streamProgram)
+
+-- A single-text-field signature — the honest field-chunk case.
+newtype Question = Question {question :: Text}
+  deriving stock (Generic, Show, Eq)
+  deriving anyclass (ToSchema, FromModel, ToPrompt)
+
+newtype Answer = Answer {answer :: Text}
+  deriving stock (Generic, Show, Eq)
+  deriving anyclass (ToSchema, FromModel, ToPrompt, Validatable)
+
+prog :: Program Question Answer
+prog = predict (mkSignature "Answer the question." :: Signature Question Answer)
+
+-- ---------------------------------------------------------------------------
+-- A stub streaming LM: the deltas stream as text chunks; the terminal event
+-- carries the whole structured reply the fallback adapter parses.
+-- ---------------------------------------------------------------------------
+
+answerEvents :: [AssistantMessageEvent]
+answerEvents = streamEventsFor ["Hel", "lo"] markerBody
+  where
+    markerBody =
+      T.intercalate "\n" ["[[ ## answer ## ]]", "Hello", "[[ ## completed ## ]]"]
+
+streamEventsFor :: [Text] -> Text -> [AssistantMessageEvent]
+streamEventsFor deltas terminalText =
+  [ EventStart (StartPayload (AssistantMessage (emptyResponse ^. #message)) Nothing)
+  , TextStart (IndexPayload 0)
+  ]
+    ++ [TextDelta (DeltaPayload 0 d) | d <- deltas]
+    ++ [ TextEnd (BlockEndPayload 0 (T.concat deltas))
+       , EventDone (doneTerminal Nothing Nothing Stop (AssistantMessage (payloadWith terminalText)))
+       ]
+  where
+    payloadWith t =
+      (emptyResponse ^. #message)
+        & #content .~ V.singleton (AssistantText (emptyTextContent & #text .~ t))
+
+terminalResponse :: [AssistantMessageEvent] -> Response
+terminalResponse evs =
+  case [p | EventDone TerminalPayload {message = AssistantMessage p} <- evs] of
+    (p : _) -> emptyResponse & #message .~ p
+    [] -> emptyResponse
+
+runStreamingStub :: [AssistantMessageEvent] -> Eff (LLM : es) a -> Eff es a
+runStreamingStub evs = interpret $ \_ -> \case
+  Complete _ _ _ -> pure (terminalResponse evs)
+  Stream _ _ _ -> pure evs
+
+main :: IO ()
+main = do
+  putStrLn "tier7-streaming: field chunks + status, with the typed answer at the end\n"
+  let cb :: (IOE :> es) => StreamEvent -> Eff es ()
+      cb ev = liftIO (putStrLn ("  event: " <> show ev))
+  out <-
+    runEff . runErrorNoCallStack @ShikumiError . runStreamingStub answerEvents $
+      streamProgram prog (Question "say hello") cb
+  putStrLn $ "\nreturned (same value as runProgram) -> " <> show out
