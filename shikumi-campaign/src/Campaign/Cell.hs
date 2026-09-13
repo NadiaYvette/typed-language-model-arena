@@ -33,12 +33,11 @@ import Data.Aeson (FromJSON, ToJSON)
 import Data.List (find)
 import Data.Text (Text)
 import Data.Text qualified as T
-import Data.Time (UTCTime)
 import Data.UUID (UUID)
 import Data.UUID.V4 (nextRandom)
 import GHC.Generics (Generic)
 
-import Toy.Fixer.Domain (Source (..), SourcePath, checkSource, corpus, showDiagnostic, sourceText)
+import Toy.Fixer.Domain (Source (..), SourcePath, checkSource, corpus, showDiagnostic)
 
 -- | A cell identifier: campaign-local, opaque.
 newtype CellId = CellId Text
@@ -90,12 +89,14 @@ cellIsClean = null . cellDiagnostics
 -- | One LM fix attempt, journaled by the decision step. The repaired text
 -- rides along (the workflow journal is the campaign's audit trail), so a
 -- replayed workflow body continues from journaled attempts without re-asking
--- the model.
+-- the model. @faRecallNotes@ records the memory the attempt's prompt was
+-- informed by — prompt provenance, replayable.
 data FixAttempt = FixAttempt
   { faAttempt :: !Int,
     faSucceeded :: !Bool, -- ^ the no-regression guard accepted the repair
     faDiagnosticsBefore :: ![Text],
     faDiagnosticsAfter :: ![Text],
+    faRecallNotes :: ![Text],
     faRepaired :: !(Maybe Text)
   }
   deriving stock (Eq, Show, Generic)

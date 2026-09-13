@@ -3,7 +3,8 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 
--- | The one-cell campaign, act by act, on keiro's durable runtime.
+-- | The one-cell campaign, act by act, on keiro's durable runtime, now with
+-- kioku memory.
 --
 -- The cell is toy-fixer's @alpha.py@ corpus entry; the \"model\" is a stub
 -- responder (a live OmniRoute stack is the same call — swap the interpreters
@@ -18,9 +19,17 @@
 --      runs out, the workflow parks on a human awakeable, the demo answers
 --      the query through 'signalAwakeable', and the workflow completes with
 --      the human's verdict — the typed human seam, end to end.
---   3. /Restart proof/ (after each act): a fresh store connection — a new
+--   3. /Memory at work/: the campaign records lessons into kioku (from
+--      act 1's journal), then a fresh cell (@gamma.py@, needing BOTH the
+--      TODO and the unused-binding lesson) is fixed on the FIRST attempt by
+--      a responder that actually reads the recalled notes out of the
+--      rendered request — memory in, better decision out, all journaled.
+--   4. /Session evidence/: the campaign's fix session (one turn per
+--      journaled attempt) is recorded through kioku's session API — L0
+--      evidence kioku's distillers can promote to memory atoms later.
+--   5. /Restart proof/ (after each act): a fresh store connection — a new
 --      \"process\" — finds no unfinished work. The campaign state lives in
---      the journal, not in the process. Same proof jitsurei makes.
+--      the journal, not in the process.
 --
 -- Everything runs offline: the model is 'markerResponse' scripts, the
 -- checker is pure, and Postgres is the only external dependency.
@@ -33,7 +42,7 @@ import Control.Monad (unless, when)
 import Data.Aeson qualified as Aeson
 import Data.Aeson.Key qualified as Key
 import Data.Aeson.KeyMap qualified as KeyMap
-import Data.Foldable (traverse_)
+import Data.Foldable (for_, traverse_)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -51,7 +60,6 @@ import Keiro.Workflow
     defaultWorkflowRunOptions,
     findUnfinishedWorkflowIds,
     runWorkflowWith,
-    WorkflowJournalEvent (..),
     workflowJournalCodec,
   )
 import Keiro.Workflow.Awakeable (AwakeableId, awakeableIdText, signalAwakeable)
@@ -74,7 +82,16 @@ import Kiroku.Store.Types
   )
 import System.Environment (lookupEnv)
 
-import Campaign.Cell (Cell (..), CellId (..), cellForId, unCellId)
+import Kioku.ReadModel (registerKiokuReadModels)
+
+import Campaign.Cell (Cell (..), CellId (..), FixAttempt (..), cellForId, unCellId)
+import Campaign.Memory
+  ( completeFixSession,
+    recallNotes,
+    recordFixTurn,
+    recordLesson,
+    startFixSession,
+  )
 import Campaign.Workflow
   ( HumanVerdict (..),
     campaignRegistry,
@@ -89,9 +106,11 @@ import Toy.Fixer.Domain (sourceText)
 
 main :: IO ()
 main = do
-  putStrLn "[campaign] one verification cell on keiro's durable runtime (shikumi decides, keiro journals)"
+  putStrLn "[campaign] one verification cell on keiro's durable runtime (shikumi decides, keiro journals, kioku remembers)"
   runInformedRetryAct
   runEscalationAct
+  runMemoryAct
+  runSessionAct
 
 -- ---------------------------------------------------------------------------
 -- Store plumbing (jitsurei's shape; no projection schema — the journal is
@@ -119,11 +138,15 @@ withCampaignStore action = do
   putStrLn ("[campaign] connecting to " <> T.unpack connString)
   runEff $
     withKirokuStore (campaignConnectionSettings connString) $
-      withEffToIO SeqUnlift \unlift ->
-        action
-          ( CampaignStore
-              (unlift . runErrorNoCallStack . runStoreResource)
-          )
+      withEffToIO SeqUnlift \unlift -> do
+        let runIt :: Eff CampaignEffects a -> IO (Either StoreError a)
+            runIt = unlift . runErrorNoCallStack . runStoreResource
+        -- Host duty (kioku's library-api contract): kioku's read models must
+        -- be registered before serving queries. Idempotent; kioku-migrate's
+        -- reconcile normally covers it, this keeps the host self-sufficient.
+        reg <- runIt Kioku.ReadModel.registerKiokuReadModels
+        either (ioError . userError . show) pure reg
+        action (CampaignStore runIt)
 
 requireEither :: (Show err) => Either err a -> IO a
 requireEither = \case
@@ -161,7 +184,7 @@ printJournal = traverse_ printOne
 briefValue :: Aeson.Value -> Text
 briefValue = \case
   Aeson.Object o ->
-    T.take 140 $
+    T.take 150 $
       T.intercalate ", " [Key.toText k <> "=" <> briefAtom v | (k, v) <- KeyMap.toList o]
   other -> T.take 60 (T.pack (show other))
 
@@ -180,6 +203,19 @@ journalIsComplete = any isCompletion
     isCompletion = \case
       WorkflowCompleted {} -> True
       _ -> False
+
+-- | All journaled fix attempts (from @propose-fix-N@ steps) of a journal.
+journaledAttempts :: [WorkflowJournalEvent] -> [FixAttempt]
+journaledAttempts = mapMaybe extract
+  where
+    mapMaybe f xs = [y | Just y <- f <$> xs]
+    extract = \case
+      StepRecorded name result _
+        | "propose-fix-" `T.isPrefixOf` name ->
+            case Aeson.fromJSON result of
+              Aeson.Success fa -> Just fa
+              _ -> Nothing
+      _ -> Nothing
 
 ourUnfinished :: CampaignStore -> [Text] -> IO [(Text, Text)]
 ourUnfinished store ourIds = do
@@ -245,7 +281,7 @@ requireFreshJournal store streamName = do
           <> T.unpack streamName
           <> " already exists; reset the campaign DB first: dropdb campaign"
           <> " && createdb campaign && DATABASE_URL='host=/tmp dbname=campaign'"
-          <> " cabal run keiro-migrate -- up"
+          <> " cabal run kioku-migrate -- up"
       )
 
 requireCell :: Text -> IO Cell
@@ -256,6 +292,12 @@ requireCell path =
 
 wfIdText :: WorkflowId -> Text
 wfIdText (WorkflowId t) = t
+
+-- | Run one kioku write block against the campaign store, failing on error.
+runKiokuWrite :: (Show e) => CampaignStore -> Eff CampaignEffects (Either e a) -> IO a
+runKiokuWrite store block = do
+  r <- requireEither =<< runCampaignStore store block
+  requireEither r
 
 -- ---------------------------------------------------------------------------
 -- Act 1: informed retry to success
@@ -285,8 +327,8 @@ runInformedRetryAct = do
       -- Attempt 2 (the corrected strategy between passes): delete every TODO.
       pick2 = T.unlines (filter (not . isTodo) (T.lines current))
 
-      responder1 _n _ctx = markerResponse [("repaired", pick1)]
-      responder2 _n _ctx = markerResponse [("repaired", pick2)]
+      responder1 _n _notes _ctx = markerResponse [("repaired", pick1)]
+      responder2 _n _notes _ctx = markerResponse [("repaired", pick2)]
       -- A publisher that never publishes: act 1 never escalates. Typed at
       -- the plain store row; raised at the workflow call sites.
       noPublisher :: AwakeableId -> Eff CampaignEffects ()
@@ -348,10 +390,10 @@ runEscalationAct = do
       current = sourceText cell.cellCurrent
       -- A permanently confused model: every attempt returns the unchanged
       -- file, so diagnostics survive and the budget runs out.
-      confused _n _ctx = markerResponse [("repaired", current)]
+      confused _n _notes _ctx = markerResponse [("repaired", current)]
 
   sink <- newIORef []
-  let      -- The publisher lives at the plain store row (jitsurei's pattern); the
+  let -- The publisher lives at the plain store row (jitsurei's pattern); the
       -- workflow and the registry each raise it where they call it.
       publishHumanQuery :: AwakeableId -> Eff CampaignEffects ()
       publishHumanQuery aid = do
@@ -424,3 +466,121 @@ runEscalationAct = do
     remaining <- ourUnfinished store ourIds
     unless (null remaining) $ fail ("restart found unfinished workflows: " <> show remaining)
     putStrLn "  restart: escalation journal is complete — durability proven"
+
+-- ---------------------------------------------------------------------------
+-- Act 3: memory at work — lessons recorded, recalled, and used
+-- ---------------------------------------------------------------------------
+
+runMemoryAct :: IO ()
+runMemoryAct = do
+  putStrLn "\n=== act 3: kioku memory at work — lessons in, first-try fix out ==="
+  gamma <- requireCell "gamma.py"
+
+  -- 3a. Record lessons (as a real campaign would project them from act 1's
+  -- journal) into kioku. Idempotent writes: a driver replay cannot duplicate.
+  withCampaignStore $ \store -> do
+    putStrLn "[memory] recording lessons into kioku"
+    runKiokuWrite store $ recordLesson "alpha.py" "a line marked TODO must be deleted entirely, not commented out"
+    runKiokuWrite store $ recordLesson "beta.py" "a binding flagged unused must have its whole line deleted"
+    recorded <- runCampaignStore store recallNotes
+    case recorded of
+      Left err -> fail (show err)
+      Right notes -> do
+        putStrLn ("  kioku now holds " <> show (length notes) <> " lesson(s):")
+        for_ notes \n -> TIO.putStrLn ("    - " <> n)
+
+  -- 3b. The memory-informed model: READS the recalled notes out of the
+  -- rendered request and applies each matching lesson. A real model does this
+  -- because the notes ride the prompt; the stub does it textually. Each
+  -- deletion is conditioned on its lesson actually being recalled — no
+  -- memory, no deletion, failing cell.
+  let gammaText = sourceText gamma.cellCurrent
+      informed _n notes _ctx = markerResponse [("repaired", fixed)]
+        where
+          lowered = map T.toLower notes
+          dropUnused = any ("unused" `T.isInfixOf`) lowered
+          dropTodo = any ("todo" `T.isInfixOf`) lowered
+          keep l =
+            not (dropUnused && "-- unused" `T.isInfixOf` l)
+              && not (dropTodo && "TODO" `T.isInfixOf` l)
+          fixed = T.unlines (filter keep (T.lines gammaText))
+
+  let wfId = campaignWorkflowId gamma.cellId
+      wfName = cellCampaignWorkflowName
+      stream = campaignStreamNameText wfName wfId
+      ourIds = [wfIdText wfId]
+      noPublisher :: AwakeableId -> Eff CampaignEffects ()
+      noPublisher = const (pure ())
+
+  withCampaignStore $ \store -> do
+    requireFreshJournal store stream
+    putStrLn "[memory] running gamma.py through the campaign with a memory-informed model"
+    outcome <-
+      requireEither
+        =<< runCampaignStore
+          store
+          (runWorkflowWith defaultWorkflowRunOptions wfName wfId (cellCampaignWorkflow informed (raise . noPublisher) gamma defaultMaxAttempts))
+    putStrLn ("  first run outcome: " <> show outcome)
+
+    -- The single successful attempt still pauses on its settle sleep before
+    -- the workflow's success check, so fire and resume once.
+    fireTimerUntilJournaled store stream "sleep:settle-1"
+    driveResumeOnce store (campaignRegistry informed noPublisher)
+
+    journal <- readJournal store stream
+    let attempts = journaledAttempts (decodedJournal journal)
+    unless (journalIsComplete (decodedJournal journal)) $
+      fail "memory journal has no WorkflowCompleted"
+    putStrLn ("[memory] journal for " <> T.unpack stream <> ":")
+    printJournal journal
+    case attempts of
+      [fa] | fa.faAttempt == 1 && fa.faSucceeded ->
+        putStrLn "  first-try fix: ONE journaled attempt, informed by recalled memory, cleared the cell"
+      _ -> fail ("expected exactly one successful attempt, got " <> show attempts)
+
+  putStrLn "[memory] --- simulated restart: re-opening the store ---"
+  withCampaignStore $ \store -> do
+    remaining <- ourUnfinished store ourIds
+    unless (null remaining) $ fail ("restart found unfinished workflows: " <> show remaining)
+    putStrLn "  restart: memory journal is complete — durability proven"
+
+-- ---------------------------------------------------------------------------
+-- Act 4: the fix session as L0 evidence in kioku
+-- ---------------------------------------------------------------------------
+
+runSessionAct :: IO ()
+runSessionAct = do
+  putStrLn "\n=== act 4: the fix session as kioku L0 evidence ==="
+  cell <- requireCell "alpha.py"
+  withCampaignStore $ \store -> do
+    putStrLn "[session] starting a fix session for alpha.py"
+    sid <- runKiokuWrite store (startFixSession (unCellId cell.cellId))
+    putStrLn ("  session started: " <> show sid)
+
+    -- One turn per journaled attempt of act 1's journal — the campaign's
+    -- audit trail projected into kioku as session evidence.
+    journal <- readJournal store (campaignStreamNameText cellCampaignWorkflowName (campaignWorkflowId cell.cellId))
+    let attempts = journaledAttempts (decodedJournal journal)
+    for_ (zip [1 ..] attempts) \(idx, fa) -> do
+      let diagLine = T.intercalate " | " (fa.faDiagnosticsAfter)
+          turn =
+            "attempt " <> T.pack (show fa.faAttempt)
+              <> ": diagnostics before: " <> T.intercalate " | " (fa.faDiagnosticsBefore)
+              <> "; after: " <> (if T.null diagLine then "(clean)" else diagLine)
+              <> maybe "" (\r -> "; repair: " <> T.take 60 r) fa.faRepaired
+      _ <- runKiokuWrite store (recordFixTurn sid idx "assistant" turn)
+      putStrLn ("  turn " <> show idx <> " recorded")
+
+    runKiokuWrite store (completeFixSession sid "informed retry cleared the cell; lessons recorded for the next cells")
+    putStrLn "  session completed — L0 evidence ready for kioku's L1 distiller"
+
+    -- The recall path reads the memory back (the workflow's read, shown from
+    -- the driver for the demo).
+    notes <- runCampaignStore store recallNotes
+    case notes of
+      Left err -> fail (show err)
+      Right ns -> do
+        putStrLn ("  recall check — " <> show (length ns) <> " lesson(s) available to the next workflow:")
+        for_ ns \n -> TIO.putStrLn ("    - " <> n)
+
+  putStrLn "[session] done"

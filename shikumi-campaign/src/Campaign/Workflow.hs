@@ -57,6 +57,8 @@ import Effectful (Eff, IOE, liftIO, raise, (:>))
 import GHC.Generics (Generic)
 
 import Baikai (Context, Response)
+import Campaign.Memory (recallNotesForKeyword)
+import Kiroku.Store.Effect.Resource (KirokuStoreResource)
 import Shikumi.Error (ShikumiError)
 import Shikumi.Program (Program, runProgram)
 import Shikumi.Schema.Types (Field (..))
@@ -81,7 +83,7 @@ import Keiro.Workflow
     step,
     workflowStreamName,
   )
-import Keiro.Workflow.Awakeable (AwakeableId, awakeableIdText, awakeableNamed)
+import Keiro.Workflow.Awakeable (AwakeableId, awakeableNamed)
 import Keiro.Workflow.Resume (WorkflowDef (..), WorkflowRegistry)
 import Keiro.Workflow.Sleep (sleepNamed)
 import Keiro.Workflow.Types (WorkflowName (..))
@@ -129,11 +131,13 @@ humanQueryStepName = StepName "human-verdict"
 -- The decision step's configuration
 -- ---------------------------------------------------------------------------
 
--- | The scripted model, keyed by attempt number: lets the demo script a
--- failing first attempt and a good second one (the informed-retry story), or
--- a permanently confused model (the escalation story). A live stack swaps
--- this for the routing interpreters; the workflow body is untouched.
-type AttemptResponder = Int -> Context -> Response
+-- | The scripted model, keyed by attempt number and given the recalled
+-- memory notes the attempt step recalled (a live model would see them as
+-- prompt lines). Lets the demo script a failing first attempt and a good
+-- second one (the informed-retry story), or a permanently confused model
+-- (the escalation story). A live stack swaps this for the routing
+-- interpreters; the workflow body is untouched.
+type AttemptResponder = Int -> [Text] -> Context -> Response
 
 -- | Publish a human query's awakeable id to the outside world. Must be
 -- idempotent: like jitsurei's webhook publisher, its action has
@@ -148,13 +152,20 @@ defaultMaxAttempts = 3
 -- The decision step: run the shikumi fixer under an attempt-keyed responder
 -- ---------------------------------------------------------------------------
 
--- | Run one LM fix attempt against a cell. Step actions get full IOE, so the
--- stub-or-live interpreter stack runs right here. Returns the repaired
--- source when the model's proposal passed the no-regression guard (the
--- guard lives inside 'fixSource'; failures surface as typed 'ShikumiError's,
--- which this driver records as a failed attempt).
-runFixAttempt :: (IOE :> es) => Cell -> AttemptResponder -> Int -> Eff es (Maybe Source)
-runFixAttempt cell responder n = do
+-- | Run one LM fix attempt against a cell, with recalled memory as extra
+-- guidance. Step actions get full IOE, so the stub-or-live interpreter stack
+-- runs right here. Returns the repaired source when the model's proposal
+-- passed the no-regression guard (the guard lives inside 'fixSource';
+-- failures surface as typed 'ShikumiError's, recorded as failed attempts).
+runFixAttempt ::
+  (IOE :> es) =>
+  Cell ->
+  AttemptResponder ->
+  -- | recalled memory notes, already rendered as prompt lines
+  [Text] ->
+  Int ->
+  Eff es (Maybe Source)
+runFixAttempt cell responder notes n = do
   let orig = cellOriginal cell
       prog :: Program DiagnosticsIn RepairOut
       prog = fixSource orig
@@ -162,16 +173,21 @@ runFixAttempt cell responder n = do
         DiagnosticsIn
           (Field (cellPath cell))
           (Field (cellDiagnostics cell))
-  r <- liftIO $ runStubEval (responder n) (runProgram prog input)
+  r <- liftIO $ runStubEval (responder n notes) (runProgram prog input)
   case r of
     Right (RepairOut (Field txt)) -> pure (Just (Source txt))
     Left (_ :: ShikumiError) -> pure Nothing
 
--- | One attempt, as a step action: produce the journaled record.
-attemptRecord :: (IOE :> es) => Cell -> AttemptResponder -> Int -> Eff es FixAttempt
+-- | One attempt, as a step action: recall lessons (a kioku read, journaled
+-- into the record — replay never re-recalls), run the model, apply the guard.
+attemptRecord :: (IOE :> es, KirokuStoreResource :> es, Store :> es) => Cell -> AttemptResponder -> Int -> Eff es FixAttempt
 attemptRecord cell responder n = do
   let before = cellDiagnostics cell
-  mRepaired <- runFixAttempt cell responder n
+      -- The keywords the diagnostics themselves suggest: the memory consulted
+      -- is a function of the task, not of the caller.
+      diagKws = concat [keywordsOf d | d <- before]
+  notes <- if null diagKws then pure [] else concat <$> mapM recallNotesForKeyword diagKws
+  mRepaired <- runFixAttempt cell responder notes n
   case mRepaired of
     Nothing ->
       pure
@@ -180,6 +196,7 @@ attemptRecord cell responder n = do
             faSucceeded = False,
             faDiagnosticsBefore = before,
             faDiagnosticsAfter = before,
+            faRecallNotes = notes,
             faRepaired = Nothing
           }
     Just repaired -> do
@@ -191,8 +208,16 @@ attemptRecord cell responder n = do
             faSucceeded = ok,
             faDiagnosticsBefore = before,
             faDiagnosticsAfter = after,
+            faRecallNotes = notes,
             faRepaired = Just (sourceText repaired)
           }
+  where
+    -- Diagnostic-kind keywords to recall lessons for. The toy checker's codes
+    -- are the vocabulary; a real campaign would map its own diagnostics.
+    keywordsOf d
+      | "W-todo" `T.isInfixOf` d = ["todo"]
+      | "W-unused" `T.isInfixOf` d = ["unused"]
+      | otherwise = []
 
 -- ---------------------------------------------------------------------------
 -- The workflow
@@ -207,7 +232,7 @@ interAttemptDelay = 1
 -- responder supplies the "model"; the publisher hands human-query ids to the
 -- outside world. The final result is a verdict line.
 cellCampaignWorkflow ::
-  (Workflow :> es, Store :> es, IOE :> es) =>
+  (Workflow :> es, KirokuStoreResource :> es, Store :> es, IOE :> es) =>
   AttemptResponder ->
   HumanQueryPublisher es ->
   Cell ->
@@ -252,7 +277,7 @@ cellCampaignWorkflow responder publishHumanQuery cell maxAttempts = do
 -- corpus via its id, the responder and publisher are ambient. Both must be
 -- registered — here just the parent (no child workflows in the skeleton).
 campaignRegistry ::
-  (IOE :> es, Store :> es) =>
+  (IOE :> es, KirokuStoreResource :> es, Store :> es) =>
   AttemptResponder ->
   HumanQueryPublisher es ->
   WorkflowRegistry es

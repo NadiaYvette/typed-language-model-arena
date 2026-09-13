@@ -35,6 +35,7 @@ library
   import: warnings, shared
   exposed-modules:
     Campaign.Cell
+    Campaign.Memory
     Campaign.Workflow
   hs-source-dirs: src
   build-depends:
@@ -49,6 +50,8 @@ library
     keiki >=0.9 && <0.10,
     keiro,
     keiro-core,
+    kioku-api,
+    kioku-core,
     kiroku-store >=0.8 && <0.9,
     lens >=5.2,
     shikumi ^>=0.4.0.0,
@@ -78,6 +81,8 @@ executable campaign-demo
     keiki >=0.9 && <0.10,
     keiro,
     keiro-core,
+    kioku-api,
+    kioku-core,
     kiroku-store >=0.8 && <0.9,
     lens >=5.2,
     shikumi-campaign,

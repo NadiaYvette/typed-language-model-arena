@@ -61,6 +61,8 @@ packages: ../keiro/keiro
 
 packages: ../kioku/kioku-api
           ../kioku/kioku-core
+          ../kioku/kioku-migrations
+          ../kioku/kioku-migrate
 
 -- The keiro jitsurei worked example (the keiro hello world) and its pgmq
 -- client cohort. (shibuya-pgmq-adapter stays out: its 0.14 release pins the
