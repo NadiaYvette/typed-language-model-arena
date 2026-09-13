@@ -13,7 +13,7 @@ build-type:      Simple
 common common-all
   default-language: GHC2024
   ghc-options:      -Wall -threaded
-  hs-source-dirs:   . tier2 tier3 tier4
+  hs-source-dirs:   . tier2 tier3 tier4 tier5
   build-depends:
     , aeson           ^>=2.2
     , baikai          >=0.7.0.0 && <0.8
@@ -65,3 +65,11 @@ executable tier4-trace-replay
     , shikumi-cache ^>=0.2.0.0
     , shikumi-trace ^>=0.3.0.0
     , temporary
+
+-- Tier 5: a typed tool and a ReAct agent loop, driven by a scripted offline LM.
+executable tier5-react-agent
+  import:         common-all
+  main-is:        Tier5ReActAgent.hs
+  build-depends:
+    , shikumi-tools ^>=0.4.0.0
+    , vector        ^>=0.13

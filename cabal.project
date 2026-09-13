@@ -17,6 +17,7 @@ packages: ../shikumi/shikumi
           ../shikumi/shikumi-optimize
           ../shikumi/shikumi-trace
           ../shikumi/shikumi-cache
+          ../shikumi/shikumi-tools
 
 packages: ../baikai/baikai
           ../baikai/baikai-claude
