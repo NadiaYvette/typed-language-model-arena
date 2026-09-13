@@ -1,0 +1,26 @@
+-- Playground project: shikumi hello world against local checkouts.
+--
+-- shikumi and shikumi-testing come from the local shikumi repo; shikumi's
+-- baikai dependencies come from the local baikai repo — all in place of the
+-- Hackage releases, so the playground tracks exactly what you have built.
+
+-- The system `ghc` is 9.8.4, which predates the GHC2024 language the shikumi
+-- and baikai packages use; pin the ghcup-installed 9.12.4.
+with-compiler: ghc-9.12.4
+
+packages: shikumi-hello
+
+packages: ../shikumi/shikumi
+          ../shikumi/shikumi-testing
+
+packages: ../baikai/baikai
+          ../baikai/baikai-claude
+          ../baikai/baikai-openai
+          ../baikai/baikai-effectful
+
+-- We only want the libraries, not every test suite of the wired-in packages.
+tests: False
+
+-- …except shikumi's own suite, so its regression tests run from here too.
+package shikumi
+  tests: True

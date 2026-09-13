@@ -1,0 +1,27 @@
+cabal-version:   3.4
+name:            shikumi-hello
+version:         0.1.0.0
+synopsis:        Hello world for shikumi — records in, records out, offline stub
+description:
+  A minimal standalone shikumi program: declare input/output records, derive
+  the schema/decode/prompt contract, wrap a Signature in predict, and run it
+  under the offline stub LM from shikumi-testing. No API key, no network.
+license:         BSD-3-Clause
+build-type:      Simple
+
+executable shikumi-hello
+  main-is:          Main.hs
+  hs-source-dirs:   .
+  default-language: GHC2024
+  ghc-options:      -Wall -threaded
+  build-depends:
+    , aeson           ^>=2.2
+    , baikai          >=0.7.0.0 && <0.8
+    , baikai-openai   >=0.7.0.0 && <0.8
+    , base            >=4.20    && <5
+    , effectful       >=2.5     && <2.7
+    , generic-lens    >=2.2     && <2.4
+    , lens            ^>=5.3
+    , shikumi         ^>=0.4.0.0
+    , shikumi-testing ^>=0.1.0.0
+    , text            ^>=2.1
