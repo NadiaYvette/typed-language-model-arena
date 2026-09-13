@@ -10,6 +10,8 @@ with-compiler: ghc-9.12.4
 
 packages: shikumi-hello
 
+packages: shikumi-coder
+
 packages: toy-fixer
 
 packages: ../shikumi/shikumi
