@@ -53,9 +53,24 @@ packages: ../shibuya/shibuya-core
 
 packages: ../keiro/keiro
           ../keiro/keiro-core
+          ../keiro/keiro-pgmq
+          ../keiro/keiro-ops
+          ../keiro/keiro-migrations
 
 packages: ../kioku/kioku-api
           ../kioku/kioku-core
+
+-- The keiro jitsurei worked example (the keiro hello world) and its pgmq
+-- client cohort. (shibuya-pgmq-adapter stays out: its 0.14 release pins the
+-- pgmq 0.5 cohort while keiro-pgmq uses 0.6; only jitsurei's disabled test
+-- suite references it.)
+packages: ../pgmq-hs/pgmq-core
+          ../pgmq-hs/pgmq-config
+          ../pgmq-hs/pgmq-hasql
+          ../pgmq-hs/pgmq-effectful
+          ../pgmq-hs/pgmq-migration
+          ../shibuya-pgmq-adapter/shibuya-pgmq-adapter
+          ../keiro/jitsurei
 
 -- We only want the libraries, not every test suite of the wired-in packages.
 tests: False
@@ -87,6 +102,7 @@ source-repository-package
     propagators/w3c
     semantic-conventions
     exporters/in-memory
+    exporters/handle
 
 -- kiroku pins hasql-notifications from its (private) cohort repo for release
 -- prep; that repo is not publicly reachable, so we take the Hackage release
@@ -100,7 +116,14 @@ allow-newer:
   proto-lens-runtime:base,
   proto-lens-protobuf-types:base,
   proto-lens-protobuf-types:ghc-prim,
-  claude:http-client-tls
+  claude:http-client-tls,
+  -- Cohort transition: keiro-pgmq 0.16 already uses pgmq-hs 0.6, while the
+  -- shibuya-pgmq-adapter 0.14 bounds still say ^>=0.5. Compiles fine against
+  -- 0.6 (verified by this build); drop once the adapter rereleases.
+  shibuya-pgmq-adapter:pgmq-core,
+  shibuya-pgmq-adapter:pgmq-effectful,
+  shibuya-pgmq-adapter:pgmq-hasql,
+  shibuya-pgmq-adapter:pgmq-config
 
 -- kioku's cohort constraints (kept so wired-in packages agree with the
 -- versions kioku is developed against).
@@ -108,10 +131,10 @@ constraints:
   http-client-tls ^>=0.4.0,
   keiki-codec-json ^>=0.9.0.0,
   keiro-pgmq ^>=0.16.0.0,
-  pgmq-core ^>=0.5.0.0,
-  pgmq-effectful ^>=0.5.0.0,
-  pgmq-hasql ^>=0.5.0.0,
-  pgmq-migration ^>=0.5.0.0,
+  pgmq-core ^>=0.6.0.0,
+  pgmq-effectful ^>=0.6.0.0,
+  pgmq-hasql ^>=0.6.0.0,
+  pgmq-migration ^>=0.6.0.0,
   shibuya-pgmq-adapter ^>=0.14.0.0
 
 -- kioku's build flags for this machine: build blake3 without hand-tuned SIMD,
