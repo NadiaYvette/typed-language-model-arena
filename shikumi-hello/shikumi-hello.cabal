@@ -13,7 +13,7 @@ build-type:      Simple
 common common-all
   default-language: GHC2024
   ghc-options:      -Wall -threaded
-  hs-source-dirs:   . tier2 tier3 tier4 tier5
+  hs-source-dirs:   . tier2 tier3 tier4 tier5 tier6
   build-depends:
     , aeson           ^>=2.2
     , baikai          >=0.7.0.0 && <0.8
@@ -73,3 +73,13 @@ executable tier5-react-agent
   build-depends:
     , shikumi-tools ^>=0.4.0.0
     , vector        ^>=0.13
+
+-- Tier 6: the CLI — subcommand builders wired around our own task.
+executable tier6-cli
+  import:         common-all
+  main-is:        Tier6Cli.hs
+  build-depends:
+    , containers
+    , shikumi-cli     ^>=0.1.0.0
+    , shikumi-eval    ^>=0.3.0.0
+    , shikumi-optimize ^>=0.3.0.0

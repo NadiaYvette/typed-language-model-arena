@@ -18,6 +18,8 @@ packages: ../shikumi/shikumi
           ../shikumi/shikumi-trace
           ../shikumi/shikumi-cache
           ../shikumi/shikumi-tools
+          ../shikumi/shikumi-cli
+          ../shikumi/shikumi-trace-otel
 
 packages: ../baikai/baikai
           ../baikai/baikai-claude
