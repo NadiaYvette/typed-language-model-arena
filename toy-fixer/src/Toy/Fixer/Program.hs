@@ -55,7 +55,8 @@ import Shikumi.Schema.Types (Field (..), unField)
 import Shikumi.Signature (Signature, mkSignature)
 
 import Toy.Fixer.Domain
-  ( Source (..),
+  ( Diagnostic (..),
+    Source (..),
     checkSource,
     sourceText,
   )
@@ -66,8 +67,9 @@ import Effectful.Error.Static (throwError)
 -- The LM contract: diagnostics in, repaired source out
 -- ---------------------------------------------------------------------------
 
-newtype DiagnosticsIn = DiagnosticsIn
-  { diagnostics :: Field "Compiler diagnostics, one per line" [Text]
+data DiagnosticsIn = DiagnosticsIn
+  { filePath :: Field "The file being fixed" Text,
+    diagnostics :: Field "Compiler diagnostics, one per line" [Text]
   }
   deriving stock (Generic, Show, Eq)
   deriving anyclass (FromModel, ToPrompt)
@@ -146,10 +148,17 @@ fixesSource :: Metric FixResult
 fixesSource = customMetric (\_ p -> mkScore (rate (predictionPrimary p)))
   where
     rate (FixResult orig out) =
-      let before = count (sourceText orig)
-          after = count (unField (repaired out))
-       in if before == 0 then bool01 (after == 0) else fromIntegral (before - after) / fromIntegral before
-    count t = length (checkSource "input.py" (Source t))
+      let ds0 = diagsOf (sourceText orig)
+          ds1 = diagsOf (unField (repaired out))
+       in -- An error (@E-*@) voids the repair: however many warnings it
+          -- cleared, the file no longer compiles.
+          if any isError ds1
+            then 0
+            else case length ds0 of
+              0 -> bool01 (null ds1)
+              n0 -> fromIntegral (n0 - length ds1) / fromIntegral n0
+    diagsOf t = checkSource "input.py" (Source t)
+    isError d = "E-" `T.isPrefixOf` diagCode d
     bool01 True = 1
     bool01 False = 0
 
