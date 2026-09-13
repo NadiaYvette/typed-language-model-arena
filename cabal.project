@@ -3,6 +3,17 @@
 -- shikumi and shikumi-testing come from the local shikumi repo; shikumi's
 -- baikai dependencies come from the local baikai repo — all in place of the
 -- Hackage releases, so the playground tracks exactly what you have built.
+--
+-- Nadeem Bitar's orchestration stack (keiro ecosystem) is wired from local
+-- checkouts too, staged by layer:
+--   * keiki          — pure transducer core (no Postgres)
+--   * kiroku-store   — the Postgres event store (+ otel trace-context helpers)
+--   * shibuya-core   — supervised queue workers
+--   * shibuya-kiroku-adapter — exposes kiroku subscriptions to shibuya
+--   * keiro, keiro-core — the workflow runtime over one Postgres log
+--   * kioku-api, kioku-core — event-sourced agent memory (uses baikai)
+-- Excluded for now: example/jitsurei/bench/CLI/DSL/migration packages and
+-- pgmq integrations; they can be added per-need.
 
 -- The system `ghc` is 9.8.4, which predates the GHC2024 language the shikumi
 -- and baikai packages use; pin the ghcup-installed 9.12.4.
@@ -30,9 +41,84 @@ packages: ../baikai/baikai
           ../baikai/baikai-openai
           ../baikai/baikai-effectful
 
+-- The keiro ecosystem (local checkouts; see README there).
+packages: ../keiki
+          ../keiki/keiki-codec-json
+
+packages: ../kiroku/kiroku-store
+          ../kiroku/kiroku-otel
+          ../kiroku/shibuya-kiroku-adapter
+
+packages: ../shibuya/shibuya-core
+
+packages: ../keiro/keiro
+          ../keiro/keiro-core
+
+packages: ../kioku/kioku-api
+          ../kioku/kioku-core
+
 -- We only want the libraries, not every test suite of the wired-in packages.
 tests: False
+benchmarks: False
+
+-- Playground: unoptimized dependencies build far faster and we never ship
+-- these binaries; individual demos can still be rebuilt with -O if needed.
+optimization: False
 
 -- …except shikumi's own suite, so its regression tests run from here too.
 package shikumi
   tests: True
+
+-- ---------------------------------------------------------------------------
+-- Upstream pins these stacks need (copied from the respective cabal.projects).
+-- ---------------------------------------------------------------------------
+
+-- hs-opentelemetry 1.0 package set from GitHub (GHC 9.12 support); pinned by
+-- both shibuya and keiro.
+source-repository-package
+  type: git
+  location: https://github.com/iand675/hs-opentelemetry
+  tag: hs-opentelemetry-api-types-1.0.0.0
+  subdir:
+    api
+    api-types
+    sdk
+    otlp
+    propagators/w3c
+    semantic-conventions
+    exporters/in-memory
+
+-- kiroku pins hasql-notifications from its (private) cohort repo for release
+-- prep; that repo is not publicly reachable, so we take the Hackage release
+-- instead (kiroku-store's bound is >=0.2 && <0.3).
+-- Allow newer for proto-lens packages (GHC 9.12 support), per shibuya, and
+-- kioku's TLS 0.4 compatibility override for the claude client (kioku needs
+-- http-client-tls >= 0.4 while claude's bound predates it).
+allow-newer:
+  proto-lens:base,
+  proto-lens:ghc-prim,
+  proto-lens-runtime:base,
+  proto-lens-protobuf-types:base,
+  proto-lens-protobuf-types:ghc-prim,
+  claude:http-client-tls
+
+-- kioku's cohort constraints (kept so wired-in packages agree with the
+-- versions kioku is developed against).
+constraints:
+  http-client-tls ^>=0.4.0,
+  keiki-codec-json ^>=0.9.0.0,
+  keiro-pgmq ^>=0.16.0.0,
+  pgmq-core ^>=0.5.0.0,
+  pgmq-effectful ^>=0.5.0.0,
+  pgmq-hasql ^>=0.5.0.0,
+  pgmq-migration ^>=0.5.0.0,
+  shibuya-pgmq-adapter ^>=0.14.0.0
+
+-- kioku's build flags for this machine: build blake3 without hand-tuned SIMD,
+-- and let postgresql-libpq find libpq through pkg-config (libpq 18 installed).
+package blake3
+  flags: -avx512 -avx2 -sse41 -sse2
+  ghc-options: -optc-DBLAKE3_USE_NEON=0
+
+package postgresql-libpq
+  flags: +use-pkg-config
