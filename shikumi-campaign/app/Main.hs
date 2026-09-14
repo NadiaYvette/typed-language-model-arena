@@ -53,14 +53,14 @@ module Main
 where
 
 import Control.Applicative ((<|>))
-import Control.Monad (filterM, foldM_, unless, when)
+import Control.Monad (filterM, foldM_, forM, forM_, unless, when)
 import Data.List (find, nub, sort, sortOn)
 import Data.Aeson qualified as Aeson
 import Data.Aeson.Key qualified as Key
 import Data.Aeson.KeyMap qualified as KeyMap
 import Data.ByteString.Lazy qualified as BL
 import Data.Foldable (for_, traverse_)
-import Data.IORef (atomicModifyIORef', newIORef, readIORef, writeIORef)
+import Data.IORef (atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Maybe (catMaybes, isJust)
 import Data.Set qualified as SSet
 import Data.Text (Text)
@@ -137,6 +137,14 @@ import Shikumi.Schema.Types (Field (Field, unField), field)
 import Shikumi.Signature (Demo (..), Signature, getInstruction, mkSignature, setDemos, setInstruction)
 
 import Campaign.Cell (Cell (..), CellId (..), FixAttempt (..), corpusCells, cellForId, unCellId)
+import Campaign.Hands (campaignBranchFor, campaignWorktreePath, gitCapture, parentDirtyCount)
+import Campaign.Landing
+  ( LandingRecord (..),
+    landProjectCellWorkflow,
+    landingRecordOf,
+    landingWorkflowId,
+    landingWorkflowName,
+  )
 import Campaign.Memory
   ( campaignAccessContext,
     campaignMemorySpace,
@@ -177,13 +185,13 @@ import Data.Aeson (FromJSON, ToJSON)
 main :: IO ()
 main = do
   putStrLn "[campaign] verification cells on keiro's durable runtime (shikumi decides, keiro journals, kioku remembers)"
-  -- The demo runs all ten acts; a filter like ACTS=9 runs one act alone
+  -- The demo runs all eleven acts; a filter like ACTS=9 runs one act alone
   -- (against whatever journal state the database already has). The fix
   -- session is recorded exactly once per driver run: act 4 records it, act
   -- 5 distills it — or act 5 records it itself when act 4 was filtered out.
   acts <- lookupEnv "ACTS"
   let splitOnComma = T.splitOn "," . T.strip
-      wanted = maybe [1 .. 10] (map (read . T.unpack) . splitOnComma . T.pack) acts
+      wanted = maybe [1 .. 11] (map (read . T.unpack) . splitOnComma . T.pack) acts
       step mSid n
         | n `notElem` wanted = pure mSid
         | otherwise = case n of
@@ -196,8 +204,9 @@ main = do
             7 -> runProjectFleetAct >> pure mSid
             8 -> runL2L3Act >> pure mSid
             9 -> runLiveDecisionAct >> pure mSid
-            _ -> runPlannerAct >> pure mSid
-  foldM_ step Nothing [1 .. 10 :: Int]
+            10 -> runPlannerAct >> pure mSid
+            _ -> runLandingAct >> pure mSid
+  foldM_ step Nothing [1 .. 11 :: Int]
 
 -- ---------------------------------------------------------------------------
 -- Store plumbing (jitsurei's shape; no projection schema — the journal is
@@ -1476,3 +1485,97 @@ runPlannerAct = do
       putStrLn ("  the planner's choice ran the live campaign: " <> T.unpack (unCellId cell.cellId) <> " completed")
       let attempts = journaledAttempts (decodedJournal journal)
       putStrLn ("  journal: " <> show (length attempts) <> " attempt(s) journaled")
+
+-- ---------------------------------------------------------------------------
+-- Act 11: the campaign gets hands — accepted repairs land in git worktrees
+-- ---------------------------------------------------------------------------
+
+-- | Act 11 closes the loop on the world. So far every repair lived only in a
+-- keiro journal; this act makes each project cell's accepted repair real:
+--
+--   1. Read each fix journal and extract the accepted repair ('faRepaired').
+--   2. Run a @campaign-landing@ workflow per cell — journaled steps that
+--      ensure the worktree, write the repair, re-verify against the /real/
+--      file on disk, and commit on @campaign\/unused-imports@. Replay never
+--      re-writes or re-commits: the 'LandingRecord' is the durable decision.
+--   3. Prove the safety rule: the parent checkouts' dirty-entry counts are
+--      identical before and after — landings touch only worktrees.
+--   4. Show each campaign branch's log: the campaign's work, reviewable.
+--
+-- Re-runs are honest no-ops: the worktree is reused, HEAD already carries
+-- the repair, so the commit step reports the existing commit unchanged.
+runLandingAct :: IO ()
+runLandingAct = do
+  putStrLn "\n=== act 11: the campaign gets hands — repairs land in git worktrees ==="
+
+  pcs <- catMaybes <$> mapM readProjectCell projectCellSpecs
+  when (null pcs) $ fail "landing: no project cells found in the checkouts"
+
+  -- Read-only observation of the parents, before any landing.
+  dirtyBefore <- forM (nub (map pcProject pcs)) parentDirtyCount
+
+  -- The accepted repairs, read out of the fix journals (act 7's output —
+  -- the campaign decided; this act executes).
+  repairsRef <- newIORef []
+  withCampaignStore $ \store ->
+    forM_ pcs $ \pc -> do
+      journal <- readJournal store (campaignStreamNameText projectCampaignWorkflowName (projectWorkflowId (pcProject pc) (pcPath pc)))
+      let accepted = [r | FixAttempt{faRepaired = Just r} <- journaledAttempts (decodedJournal journal)]
+      case accepted of
+        [] -> fail ("landing: no accepted repair journaled for " <> T.unpack (pcProject pc <> ":" <> pcPath pc))
+        (r : _) -> modifyIORef' repairsRef ((pc, r) :)
+  cellsWithRepairs <- reverse <$> readIORef repairsRef
+
+  -- One landing workflow per cell, journaled like every other act. (The
+  -- landing steps never park, so no resume pass or registry is needed —
+  -- a crashed landing resumes through the registry in real deployments,
+  -- where registerLanding is what the host registers.) The journal is the
+  -- record: on a re-run the landing is reported from the existing journal
+  -- instead of re-executed — and the hands are idempotent either way.
+  let reportLanding recd
+        | lrVerified recd =
+            putStrLn
+              ( "  landed " <> T.unpack (lrProject recd <> ":" <> lrPath recd)
+                  <> " — commit " <> T.unpack (lrCommit recd)
+                  <> " on " <> T.unpack (lrBranch recd)
+                  <> " (" <> T.unpack (lrWorktree recd) <> ")"
+              )
+        | otherwise = do
+            putStrLn ("  NOT LANDED " <> T.unpack (lrProject recd <> ":" <> lrPath recd) <> " — on-disk verification failed:")
+            for_ (lrDiagnostics recd) (putStrLn . ("    " <>) . T.unpack)
+  withCampaignStore $ \store ->
+    forM_ cellsWithRepairs $ \(pc, repair) -> do
+      let wfId = landingWorkflowId (pcProject pc, pcPath pc)
+          stream = campaignStreamNameText landingWorkflowName wfId
+      existing <- readJournal store stream
+      case landingRecordOf (decodedJournal existing) of
+        (recd : _) -> reportLanding recd
+        [] -> do
+          _ <-
+            requireEither
+              =<< runCampaignStore
+                store
+                ( runWorkflowWith
+                    defaultWorkflowRunOptions
+                    landingWorkflowName
+                    wfId
+                    (landProjectCellWorkflow pc unusedImportOracle repair)
+                )
+          journal <- readJournal store stream
+          case landingRecordOf (decodedJournal journal) of
+            (recd : _) -> reportLanding recd
+            [] -> fail ("landing: journal has no landing record for " <> T.unpack (pcProject pc <> ":" <> pcPath pc))
+
+  -- The safety proof: the parents are byte-identical in git's eyes.
+  dirtyAfter <- forM (nub (map pcProject pcs)) parentDirtyCount
+  putStrLn ("  parent dirty-entry counts before: " <> show dirtyBefore)
+  putStrLn ("  parent dirty-entry counts after:  " <> show dirtyAfter)
+  when (dirtyBefore /= dirtyAfter) $ fail "landing: parent checkouts were modified — safety rule violated"
+
+  -- The campaign's work, as a human would review it: one branch per project.
+  for_ (nub (map pcProject pcs)) $ \proj -> do
+    let wt = campaignWorktreePath proj
+    log <- gitCapture wt ["log", "--oneline", T.unpack (campaignBranchFor proj)]
+    putStrLn ("  " <> T.unpack proj <> " branch log:")
+    for_ (T.lines log) (putStrLn . ("    " <>) . T.unpack)
+  putStrLn "[landing] done — the journals decided, the worktrees received, the parents untouched"

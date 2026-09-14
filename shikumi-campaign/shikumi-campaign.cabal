@@ -35,6 +35,8 @@ library
   import: warnings, shared
   exposed-modules:
     Campaign.Cell
+    Campaign.Hands
+    Campaign.Landing
     Campaign.Memory
     Campaign.Oracle
     Campaign.Workflow
@@ -57,11 +59,13 @@ library
     kioku-core,
     kiroku-store >=0.8 && <0.9,
     lens >=5.2,
+    process >=1.6,
     shikumi ^>=0.4.0.0,
     shikumi-testing ^>=0.1.0.0,
     text >=2.1,
     time >=1.12,
     toy-fixer,
+    typed-process >=0.2,
     uuid >=1.3,
     vector >=0.13,
 
@@ -99,5 +103,6 @@ executable campaign-demo
     text >=2.1,
     time >=1.12,
     toy-fixer,
+    typed-process >=0.2,
     uuid >=1.3,
     vector >=0.13,
