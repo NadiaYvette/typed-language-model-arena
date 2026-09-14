@@ -23,8 +23,10 @@ module Campaign.Memory
   ( -- * Configuration
     campaignMemorySpace,
     campaignNamespace,
+    projectNamespace,
     campaignAccessContext,
     cellScope,
+    cellScopeIn,
 
     -- * Lessons: content format
     lessonText,
@@ -32,6 +34,7 @@ module Campaign.Memory
 
     -- * Writes (driver side; full write effect row)
     recordLesson,
+    recordGlobalLesson,
     startFixSession,
     recordFixTurn,
     completeFixSession,
@@ -65,6 +68,7 @@ import Kioku.Api.Scope
     Namespace,
     mkNamespace,
     mkScopeKind,
+    scopeNamespaceText,
   )
 import Kioku.Api.Types (Confidence (..), MemoryRecord (..), MemoryType (..))
 import Kioku.Id (SessionId, genMemoryId, genSessionId)
@@ -83,15 +87,20 @@ import Kioku.Session.Domain (CompleteSessionData (..), RecordTurnData (..), Star
 -- Configuration
 -- ---------------------------------------------------------------------------
 
--- | One memory space for the whole campaign. A real multi-project host would
--- use one space per project; the skeleton is one campaign.
+-- | One memory space for the whole campaign driver. Projects are separated
+-- by /namespace/ below it: the toy corpus is @toy@, the real checkouts are
+-- @mowgli@ and @peirce@ — so namespace-wide recall reaches exactly one
+-- project's lessons and scopes stay (project, cell, path)-partitioned.
 campaignMemorySpace :: MemorySpaceId
 campaignMemorySpace = either (error . T.unpack) id (mkMemorySpaceId "shikumi-campaign")
 
--- | The campaign namespace. Cell lessons live in per-cell entity scopes under
--- it, so namespace-wide recall reaches every lesson while scopes stay tidy.
+-- | The namespace of one project: @"toy"@, @"mowgli"@, @"peirce"@, …
+projectNamespace :: Text -> Namespace
+projectNamespace name = either (error . T.unpack) id (mkNamespace name)
+
+-- | The toy corpus's namespace (the original single-project demo).
 campaignNamespace :: Namespace
-campaignNamespace = either (error . T.unpack) id (mkNamespace "campaign")
+campaignNamespace = projectNamespace "toy"
 
 -- | The embedded host mints its own context: full permissions on its space.
 campaignAccessContext :: MemoryAccessContext
@@ -101,9 +110,13 @@ campaignAccessContext =
     campaignActor =
       MemoryActor (either (error . T.unpack) id (mkPrincipalRef "campaign-driver"))
 
--- | Entity scope per cell: @(campaign, cell, \"alpha.py\")@.
+-- | Entity scope per cell: @(namespace, cell, \"alpha.py\")@.
+cellScopeIn :: Namespace -> Text -> MemoryScope
+cellScopeIn ns path = ScopeEntity ns (either (error . T.unpack) id (mkScopeKind "cell")) path
+
+-- | The toy namespace's per-cell scope.
 cellScope :: Text -> MemoryScope
-cellScope path = ScopeEntity campaignNamespace (either (error . T.unpack) id (mkScopeKind "cell")) path
+cellScope = cellScopeIn campaignNamespace
 
 -- ---------------------------------------------------------------------------
 -- Lesson content format
@@ -125,12 +138,14 @@ parseLesson = T.stripPrefix "lesson: "
 -- write-conflict rules), so a driver replay cannot duplicate lessons.
 recordLesson ::
   (IOE :> es, KirokuStoreResource :> es, Store :> es, Error StoreError :> es) =>
+  -- | the project namespace the lesson belongs to
+  Namespace ->
   -- | the cell path the lesson is anchored to
   Text ->
   -- | the advice text
   Text ->
   Eff es (Either MemoryWriteError ())
-recordLesson path advice = do
+recordLesson ns path advice = do
   mid <- genMemoryId
   now <- liftIO getCurrentTime
   let ctx = campaignAccessContext
@@ -143,12 +158,47 @@ recordLesson path advice = do
           ownerPrincipal = Nothing,
           agentId = "campaign-driver",
           sessionId = Nothing,
-          scope = cellScope path,
+          scope = cellScopeIn ns path,
           memoryType = MemoryPattern,
           content = lessonText advice,
           priority = 100,
           confidence = HighConfidence,
-          tags = Set.fromList ["fix-lesson", "cell:" <> path],
+          tags = Set.fromList ["fix-lesson", "cell:" <> path, "project:" <> scopeNamespaceText (ScopeGlobal ns)],
+          supersedes = Nothing,
+          recordedAt = now
+        }
+  pure (const () <$> result)
+
+-- | Record a project-level lesson at the namespace's /global/ scope — the
+-- scope kioku's L2 scenes and L3 personas distill over ('ScopeGlobal' ns).
+-- Cell lessons ('recordLesson') are entity-scoped, so a project's scene is
+-- fed by the lessons a host promotes to project level, not by every cell.
+recordGlobalLesson ::
+  (IOE :> es, KirokuStoreResource :> es, Store :> es, Error StoreError :> es) =>
+  -- | the project namespace
+  Namespace ->
+  -- | the advice text
+  Text ->
+  Eff es (Either MemoryWriteError ())
+recordGlobalLesson ns advice = do
+  mid <- genMemoryId
+  now <- liftIO getCurrentTime
+  let ctx = campaignAccessContext
+  result <-
+    recordWithContext ctx
+      RecordMemoryData
+        { memoryId = mid,
+          memorySpaceId = campaignMemorySpace,
+          actorPrincipal = memoryContextRecordedActor ctx,
+          ownerPrincipal = Nothing,
+          agentId = "campaign-driver",
+          sessionId = Nothing,
+          scope = ScopeGlobal ns,
+          memoryType = MemoryPattern,
+          content = lessonText advice,
+          priority = 100,
+          confidence = HighConfidence,
+          tags = Set.fromList ["fix-lesson", "project:" <> scopeNamespaceText (ScopeGlobal ns)],
           supersedes = Nothing,
           recordedAt = now
         }
@@ -157,10 +207,12 @@ recordLesson path advice = do
 -- | Start one fix session for a cell (L0 evidence container).
 startFixSession ::
   (IOE :> es, KirokuStoreResource :> es, Store :> es, Error StoreError :> es) =>
+  -- | the project namespace
+  Namespace ->
   -- | cell path (the session's focus and subject)
   Text ->
   Eff es (Either SessionWriteError SessionId)
-startFixSession path = do
+startFixSession ns path = do
   sid <- genSessionId
   now <- liftIO getCurrentTime
   let ctx = campaignAccessContext
@@ -172,7 +224,7 @@ startFixSession path = do
         ownerPrincipal = Nothing,
         agentId = "campaign-fixer",
         focus = "fix " <> path,
-        scope = cellScope path,
+        scope = cellScopeIn ns path,
         subjectRef = Just path,
         previousSessionId = Nothing,
         parentSessionId = Nothing,
@@ -235,14 +287,14 @@ completeFixSession sid summary = do
 -- Reads (workflow side)
 -- ---------------------------------------------------------------------------
 
--- | Every active memory's advice in the campaign namespace. Lessons are
+-- | Every active memory's advice in one project namespace. Lessons are
 -- @lesson: @-prefixed (the prefix is stripped); any other content — such as
 -- atoms machine-written by kioku's L1 distiller — passes through verbatim.
 -- Full-text recall needs no embeddings; with pgvector installed a host would
 -- switch this to hybrid recall without changing the call shape.
-recallNotes :: (IOE :> es, Store :> es) => Eff es [Text]
-recallNotes = do
-  r <- getActiveInNamespace campaignMemorySpace campaignNamespace
+recallNotes :: (IOE :> es, Store :> es) => Namespace -> Eff es [Text]
+recallNotes ns = do
+  r <- getActiveInNamespace campaignMemorySpace ns
   pure $ case r of
     Left _ -> []
     Right records ->
@@ -253,7 +305,7 @@ recallNotes = do
 -- | Lessons whose advice mentions a keyword (@todo@, @unused@, …). The
 -- workflow derives keywords from the cell's own diagnostics, so the memory
 -- consulted is a function of the task, not of the caller's mood.
-recallNotesForKeyword :: (IOE :> es, Store :> es) => Text -> Eff es [Text]
-recallNotesForKeyword kw = do
-  notes <- recallNotes
+recallNotesForKeyword :: (IOE :> es, Store :> es) => Namespace -> Text -> Eff es [Text]
+recallNotesForKeyword ns kw = do
+  notes <- recallNotes ns
   pure [n | n <- notes, kw `T.isInfixOf` T.toLower n]

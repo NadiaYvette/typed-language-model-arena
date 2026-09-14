@@ -29,6 +29,9 @@ module Campaign.Workflow
     campaignWorkflowId,
     campaignIdFromWf,
     campaignStreamNameText,
+    projectCampaignWorkflowName,
+    projectWorkflowId,
+    projectCellFromWf,
 
     -- * The human seam
     HumanVerdict (..),
@@ -36,6 +39,7 @@ module Campaign.Workflow
 
     -- * The decision step's configuration
     AttemptResponder,
+    ResponderFor,
     HumanQueryPublisher,
 
     -- * The workflow
@@ -57,22 +61,23 @@ import Effectful (Eff, IOE, liftIO, raise, (:>))
 import GHC.Generics (Generic)
 
 import Baikai (Context, Response)
-import Campaign.Memory (recallNotesForKeyword)
+import Campaign.Memory (campaignNamespace, projectNamespace, recallNotesForKeyword)
+import Campaign.Oracle (CellOracle (..), ProjectCell (..), markerOracle, unusedImportOracle)
+import Data.List (find)
+import Kioku.Api.Scope (Namespace)
 import Kiroku.Store.Effect.Resource (KirokuStoreResource)
 import Shikumi.Error (ShikumiError)
 import Shikumi.Program (Program, runProgram)
 import Shikumi.Schema.Types (Field (..))
 import Shikumi.Testing (runStubEval)
-import Toy.Fixer.Domain (Source (..), checkSource, showDiagnostic, sourceText)
+import Toy.Fixer.Domain (Source (..), SourcePath, showDiagnostic, sourceText)
 import Toy.Fixer.Program (DiagnosticsIn (..), RepairOut (..), fixSource)
 
 import Campaign.Cell
   ( Cell (..),
     CellId (..),
     FixAttempt (..),
-    cellDiagnostics,
     cellForId,
-    cellIsClean,
     unCellId,
   )
 
@@ -115,6 +120,23 @@ campaignStreamNameText :: WorkflowName -> WorkflowId -> Text
 campaignStreamNameText name wid =
   let StreamName s = workflowStreamName name wid in s
 
+-- | The project-cells workflow (real files, the real oracle, per-project
+-- memory namespaces).
+projectCampaignWorkflowName :: WorkflowName
+projectCampaignWorkflowName = WorkflowName "project-cell-campaign"
+
+-- | A project workflow id embeds @project:path@ under a @pcell-@ prefix.
+projectWorkflowId :: Text -> SourcePath -> WorkflowId
+projectWorkflowId proj path = WorkflowId ("pcell-" <> proj <> ":" <> path)
+
+-- | Round-trip 'projectWorkflowId'.
+projectCellFromWf :: WorkflowId -> Maybe (Text, SourcePath)
+projectCellFromWf (WorkflowId t) = do
+  rest <- T.stripPrefix "pcell-" t
+  (proj, pathRest) <- pure (T.breakOn ":" rest)
+  path <- T.stripPrefix ":" pathRest
+  pure (proj, path)
+
 -- ---------------------------------------------------------------------------
 -- The human seam: the typed third outcome
 -- ---------------------------------------------------------------------------
@@ -139,6 +161,13 @@ humanQueryStepName = StepName "human-verdict"
 -- interpreters; the workflow body is untouched.
 type AttemptResponder = Int -> [Text] -> Context -> Response
 
+-- | A responder /factory/: the honest type for a fleet. A rebuilt workflow
+-- body knows which oracle (and cell) it serves, so the caller supplies /how
+-- to respond given the task/ — a live model reads the task out of the
+-- rendered request; the scripted honest responder derives its repair from
+-- the oracle's own diagnostics.
+type ResponderFor = CellOracle -> Cell -> AttemptResponder
+
 -- | Publish a human query's awakeable id to the outside world. Must be
 -- idempotent: like jitsurei's webhook publisher, its action has
 -- at-least-once execution across the action-to-journal crash window.
@@ -154,25 +183,21 @@ defaultMaxAttempts = 3
 
 -- | Run one LM fix attempt against a cell, with recalled memory as extra
 -- guidance. Step actions get full IOE, so the stub-or-live interpreter stack
--- runs right here. Returns the repaired source when the model's proposal
+-- runs right here. The program and its input are supplied by the caller (the
+-- oracle decides both); returns the repaired source when the model's proposal
 -- passed the no-regression guard (the guard lives inside 'fixSource';
 -- failures surface as typed 'ShikumiError's, recorded as failed attempts).
 runFixAttempt ::
   (IOE :> es) =>
-  Cell ->
+  -- | the program with ground truth bound in
+  Program DiagnosticsIn RepairOut ->
+  DiagnosticsIn ->
   AttemptResponder ->
   -- | recalled memory notes, already rendered as prompt lines
   [Text] ->
   Int ->
   Eff es (Maybe Source)
-runFixAttempt cell responder notes n = do
-  let orig = cellOriginal cell
-      prog :: Program DiagnosticsIn RepairOut
-      prog = fixSource orig
-      input =
-        DiagnosticsIn
-          (Field (cellPath cell))
-          (Field (cellDiagnostics cell))
+runFixAttempt prog input responder notes n = do
   r <- liftIO $ runStubEval (responder n notes) (runProgram prog input)
   case r of
     Right (RepairOut (Field txt)) -> pure (Just (Source txt))
@@ -180,14 +205,27 @@ runFixAttempt cell responder notes n = do
 
 -- | One attempt, as a step action: recall lessons (a kioku read, journaled
 -- into the record — replay never re-recalls), run the model, apply the guard.
-attemptRecord :: (IOE :> es, KirokuStoreResource :> es, Store :> es) => Cell -> AttemptResponder -> Int -> Eff es FixAttempt
-attemptRecord cell responder n = do
-  let before = cellDiagnostics cell
+-- The oracle decides the diagnostics, the original, and hence the program.
+attemptRecord ::
+  (IOE :> es, KirokuStoreResource :> es, Store :> es) =>
+  Cell ->
+  CellOracle ->
+  Namespace ->
+  AttemptResponder ->
+  Int ->
+  Eff es FixAttempt
+attemptRecord cell oracle ns responder n = do
+  let before = map showDiagnostic (oracleCheck oracle (cellPath cell) (cellCurrent cell))
       -- The keywords the diagnostics themselves suggest: the memory consulted
       -- is a function of the task, not of the caller.
       diagKws = concat [keywordsOf d | d <- before]
-  notes <- if null diagKws then pure [] else concat <$> mapM recallNotesForKeyword diagKws
-  mRepaired <- runFixAttempt cell responder notes n
+  notes <- if null diagKws then pure [] else concat <$> mapM (recallNotesForKeyword ns) diagKws
+  let prog = fixSource (oracleOriginal oracle (cellPath cell) (cellCurrent cell))
+      input =
+        DiagnosticsIn
+          (Field (cellPath cell))
+          (Field before)
+  mRepaired <- runFixAttempt prog input responder notes n
   case mRepaired of
     Nothing ->
       pure
@@ -200,7 +238,7 @@ attemptRecord cell responder n = do
             faRepaired = Nothing
           }
     Just repaired -> do
-      let after = map showDiagnostic (checkSource (cellPath cell) repaired)
+      let after = map showDiagnostic (oracleCheck oracle (cellPath cell) repaired)
           ok = null after
       pure
         FixAttempt
@@ -212,10 +250,11 @@ attemptRecord cell responder n = do
             faRepaired = Just (sourceText repaired)
           }
   where
-    -- Diagnostic-kind keywords to recall lessons for. The toy checker's codes
-    -- are the vocabulary; a real campaign would map its own diagnostics.
+    -- Diagnostic-kind keywords to recall lessons for. The oracles' codes are
+    -- the vocabulary; a real campaign would map its own diagnostics.
     keywordsOf d
       | "W-todo" `T.isInfixOf` d = ["todo"]
+      | "W-unused-import" `T.isInfixOf` d = ["unused", "import"]
       | "W-unused" `T.isInfixOf` d = ["unused"]
       | otherwise = []
 
@@ -230,27 +269,31 @@ interAttemptDelay = 1
 
 -- | The one-cell campaign. @maxAttempts@ is the typed attempt budget; the
 -- responder supplies the "model"; the publisher hands human-query ids to the
--- outside world. The final result is a verdict line.
+-- outside world; the oracle owns ground truth; @ns@ is the project's memory
+-- namespace. The final result is a verdict line.
 cellCampaignWorkflow ::
   (Workflow :> es, KirokuStoreResource :> es, Store :> es, IOE :> es) =>
   AttemptResponder ->
   HumanQueryPublisher es ->
   Cell ->
+  CellOracle ->
+  Namespace ->
   Int ->
   Eff es Text
-cellCampaignWorkflow responder publishHumanQuery cell maxAttempts = do
+cellCampaignWorkflow responder publishHumanQuery cell oracle ns maxAttempts = do
   -- 1) Journal the oracle's initial verdict for the cell as received.
-  _initial <- step (StepName "verify-initial") (pure (cellDiagnostics cell))
-  if cellIsClean cell
+  _initial <- step (StepName "verify-initial") (pure initialDiags)
+  if null initialDiags
     then pure "passed: cell was already clean"
     else go 1
   where
+    initialDiags = map showDiagnostic (oracleCheck oracle (cellPath cell) (cellCurrent cell))
     go n
       | n > maxAttempts = budgetExhausted
       | otherwise = do
           -- 2) One durable LM attempt, journaled with its repair...
           attempt <-
-            step (StepName ("propose-fix-" <> T.pack (show n))) (attemptRecord cell responder n)
+            step (StepName ("propose-fix-" <> T.pack (show n))) (attemptRecord cell oracle ns responder n)
           -- 3) ...paced by a durable timer...
           sleepNamed (StepName ("settle-" <> T.pack (show n))) interAttemptDelay
           -- 4) ...then the oracle decides: done, or another attempt.
@@ -273,15 +316,19 @@ cellCampaignWorkflow responder publishHumanQuery cell maxAttempts = do
 -- ---------------------------------------------------------------------------
 
 -- | The application-supplied registry the resume worker re-invokes through.
--- It rebuilds the workflow body from the id alone: the cell comes from the
--- corpus via its id, the responder and publisher are ambient. Both must be
--- registered — here just the parent (no child workflows in the skeleton).
+-- Two workflow names: the toy corpus's cells (marker oracle, @toy@ namespace)
+-- and the real project cells (unused-import oracle, per-project namespace).
+-- The project cells are supplied at construction; both rebuild bodies from
+-- the id alone.
 campaignRegistry ::
   (IOE :> es, KirokuStoreResource :> es, Store :> es) =>
-  AttemptResponder ->
+  -- | the real project cells, read from the checkouts
+  [ProjectCell] ->
+  -- | how to respond given a task (oracle + cell)
+  ResponderFor ->
   HumanQueryPublisher es ->
   WorkflowRegistry es
-campaignRegistry responder publishHumanQuery =
+campaignRegistry projectCells responderFor publishHumanQuery =
   Map.fromList
     [ ( cellCampaignWorkflowName,
         WorkflowDef $ \wid ->
@@ -289,9 +336,34 @@ campaignRegistry responder publishHumanQuery =
             Nothing -> error ("campaignRegistry: unknown cell " <> T.unpack (unCellId (campaignIdFromWf wid)))
             Just cell ->
               cellCampaignWorkflow
-                responder
+                (responderFor markerOracle cell)
                 (raise . publishHumanQuery)
                 cell
+                markerOracle
+                campaignNamespace
                 defaultMaxAttempts
+      ),
+      ( projectCampaignWorkflowName,
+        WorkflowDef $ \wid ->
+          case projectCellFromWf wid of
+            Nothing -> error ("campaignRegistry: malformed project workflow id")
+            Just (proj, path) ->
+              case find (\pc -> pcProject pc == proj && pcPath pc == path) projectCells of
+                Nothing -> error ("campaignRegistry: unknown project cell " <> T.unpack (proj <> ":" <> path))
+                Just pc ->
+                  let pcell =
+                        Cell
+                          { cellId = CellId (proj <> ":" <> pcPath pc),
+                            cellPath = pcPath pc,
+                            cellOriginal = pcSource pc,
+                            cellCurrent = pcSource pc
+                          }
+                   in cellCampaignWorkflow
+                        (responderFor unusedImportOracle pcell)
+                        (raise . publishHumanQuery)
+                        pcell
+                        unusedImportOracle
+                        (projectNamespace proj)
+                        defaultMaxAttempts
       )
     ]
