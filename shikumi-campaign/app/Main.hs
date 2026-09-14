@@ -53,7 +53,7 @@ module Main
 where
 
 import Control.Applicative ((<|>))
-import Control.Monad (filterM, forM, unless, when)
+import Control.Monad (filterM, foldM_, unless, when)
 import Data.List (find, nub, sort, sortOn)
 import Data.Aeson qualified as Aeson
 import Data.Aeson.Key qualified as Key
@@ -122,17 +122,19 @@ import Kioku.Distill.Extract
   )
 import Kioku.Distill.L1 (L1Outcome (..), L1RunMode (..), L1Summary (..), distillSessionL1, scopedScanCandidates)
 import Kioku.Distill.L2 (SceneRow (..), regenerateScene)
-import Kioku.Distill.L3 (PersonaRow (..), regeneratePersona)
+import Kioku.Distill.L3 (PersonaRow (..), getPersonaByScope, regeneratePersona)
 import Kioku.Distill.Persona (PersonaInput (..), PersonaOutput (..), personaProgram, personaSignature)
 import Kioku.Distill.Runtime (TestRunners (..), newDistillRuntime, withDistillWorkspace, withTestRunners)
 import Kioku.Distill.Scene (SceneInput (..), SceneOutput (..), sceneProgram, sceneSignature)
 import Kioku.Id (SessionId)
 import Kioku.ReadModel (registerKiokuReadModels)
+import Shikumi.Adapter (ToPrompt)
 import Shikumi.Error (ShikumiError (..))
 import Shikumi.Module (predict)
 import Shikumi.Program (Program)
-import Shikumi.Schema.Types (field, unField)
-import Shikumi.Signature (Demo (..), getInstruction, setDemos, setInstruction)
+import Shikumi.Schema (FromModel, ToSchema, Validatable)
+import Shikumi.Schema.Types (Field (Field, unField), field)
+import Shikumi.Signature (Demo (..), Signature, getInstruction, mkSignature, setDemos, setInstruction)
 
 import Campaign.Cell (Cell (..), CellId (..), FixAttempt (..), corpusCells, cellForId, unCellId)
 import Campaign.Memory
@@ -147,34 +149,55 @@ import Campaign.Memory
     recordLesson,
     startFixSession,
   )
+import Baikai (Context (..), Message (..), Response, TextContent (..), UserContent (..))
+import Baikai.Message (UserPayload (UserPayload))
 import Campaign.Oracle (CellOracle (..), ProjectCell (..), diagLineOf, markerOracle, projectCellSpecs, readProjectCell, unusedImportOracle)
 import Campaign.Workflow
-  ( AttemptResponder,
+  ( AttemptEngine,
+    EngineFor,
     HumanVerdict (..),
-    ResponderFor,
     campaignRegistry,
     campaignStreamNameText,
     campaignWorkflowId,
     cellCampaignWorkflow,
     cellCampaignWorkflowName,
     defaultMaxAttempts,
+    guidedFixer,
     projectCampaignWorkflowName,
     projectWorkflowId,
+    stubEngine,
   )
 import Shikumi.Testing (markerResponse)
-import Toy.Fixer.Domain (sourceText)
+import Toy.Fixer.Domain (Source (..), sourceText)
+import Toy.Fixer.Program (DiagnosticsIn (..), RepairOut (..))
+import GHC.Generics (Generic)
+import Data.Aeson qualified as Aeson
+import Data.Aeson (FromJSON, ToJSON)
 
 main :: IO ()
 main = do
   putStrLn "[campaign] verification cells on keiro's durable runtime (shikumi decides, keiro journals, kioku remembers)"
-  runInformedRetryAct
-  runEscalationAct
-  runMemoryAct
-  sid <- runSessionAct
-  runDistillAct sid
-  runFleetAct
-  runProjectFleetAct
-  runL2L3Act
+  -- The demo runs all ten acts; a filter like ACTS=9 runs one act alone
+  -- (against whatever journal state the database already has). The fix
+  -- session is recorded exactly once per driver run: act 4 records it, act
+  -- 5 distills it — or act 5 records it itself when act 4 was filtered out.
+  acts <- lookupEnv "ACTS"
+  let splitOnComma = T.splitOn "," . T.strip
+      wanted = maybe [1 .. 10] (map (read . T.unpack) . splitOnComma . T.pack) acts
+      step mSid n
+        | n `notElem` wanted = pure mSid
+        | otherwise = case n of
+            1 -> runInformedRetryAct >> pure mSid
+            2 -> runEscalationAct >> pure mSid
+            3 -> runMemoryAct >> pure mSid
+            4 -> Just <$> runSessionAct
+            5 -> maybe runSessionAct pure mSid >>= runDistillAct >> pure mSid
+            6 -> runFleetAct >> pure mSid
+            7 -> runProjectFleetAct >> pure mSid
+            8 -> runL2L3Act >> pure mSid
+            9 -> runLiveDecisionAct >> pure mSid
+            _ -> runPlannerAct >> pure mSid
+  foldM_ step Nothing [1 .. 10 :: Int]
 
 -- ---------------------------------------------------------------------------
 -- Store plumbing (jitsurei's shape; no projection schema — the journal is
@@ -400,8 +423,8 @@ runInformedRetryAct = do
       -- Attempt 2 (the corrected strategy between passes): delete every TODO.
       pick2 = T.unlines (filter (not . isTodo) (T.lines current))
 
-      responder1 _n _notes _ctx = markerResponse [("repaired", pick1)]
-      responder2 _n _notes _ctx = markerResponse [("repaired", pick2)]
+      responder1 _n _ctx = markerResponse [("repaired", pick1)]
+      responder2 _n _ctx = markerResponse [("repaired", pick2)]
       -- A publisher that never publishes: act 1 never escalates. Typed at
       -- the plain store row; raised at the workflow call sites.
       noPublisher :: AwakeableId -> Eff CampaignEffects ()
@@ -414,17 +437,17 @@ runInformedRetryAct = do
       requireEither
         =<< runCampaignStore
           store
-          (runWorkflowWith defaultWorkflowRunOptions wfName wfId (cellCampaignWorkflow responder1 (raise . noPublisher) cell markerOracle campaignNamespace defaultMaxAttempts))
+          (runWorkflowWith defaultWorkflowRunOptions wfName wfId (cellCampaignWorkflow (stubEngine responder1) (raise . noPublisher) cell markerOracle campaignNamespace defaultMaxAttempts))
     putStrLn ("  first run outcome: " <> show outcome1 <> "  (partial attempt journaled; settle sleep armed; run suspended)")
 
     fireTimerUntilJournaled store stream "sleep:settle-1"
     putStrLn "[informed] resuming with the corrected model strategy"
-    driveResumeOnce store (campaignRegistry [] (\_oracle _cell -> responder2) noPublisher)
+    driveResumeOnce store (campaignRegistry [] [] (\_o _c -> stubEngine responder2) noPublisher)
 
     -- Attempt 2 clears the cell, but the success check runs after the next
     -- settle sleep, so fire it and resume once more to complete.
     fireTimerUntilJournaled store stream "sleep:settle-2"
-    driveResumeOnce store (campaignRegistry [] (\_oracle _cell -> responder2) noPublisher)
+    driveResumeOnce store (campaignRegistry [] [] (\_o _c -> stubEngine responder2) noPublisher)
 
     journal <- readJournal store stream
     unless (journalIsComplete (decodedJournal journal)) $
@@ -437,7 +460,7 @@ runInformedRetryAct = do
       requireEither
         =<< runCampaignStore
           store
-          (runWorkflowWith defaultWorkflowRunOptions wfName wfId (cellCampaignWorkflow responder2 (raise . noPublisher) cell markerOracle campaignNamespace defaultMaxAttempts))
+          (runWorkflowWith defaultWorkflowRunOptions wfName wfId (cellCampaignWorkflow (stubEngine responder2) (raise . noPublisher) cell markerOracle campaignNamespace defaultMaxAttempts))
     case finalOutcome of
       Completed v -> putStrLn ("  verdict: " <> T.unpack v)
       _ -> fail ("expected completion, got " <> show finalOutcome)
@@ -463,7 +486,7 @@ runEscalationAct = do
       current = sourceText cell.cellCurrent
       -- A permanently confused model: every attempt returns the unchanged
       -- file, so diagnostics survive and the budget runs out.
-      confused _n _notes _ctx = markerResponse [("repaired", current)]
+      confused _n _ctx = markerResponse [("repaired", current)]
 
   sink <- newIORef []
   let -- The publisher lives at the plain store row (jitsurei's pattern); the
@@ -479,7 +502,7 @@ runEscalationAct = do
         when inserted $
           liftIO $
             putStrLn ("  published human-query awakeable id: " <> T.unpack (awakeableIdText aid))
-      registry = campaignRegistry [] (\_oracle _cell -> confused) publishHumanQuery
+      registry = campaignRegistry [] [] (\_o _c -> stubEngine confused) publishHumanQuery
 
   withCampaignStore $ \store -> do
     requireFreshJournal store stream
@@ -488,7 +511,7 @@ runEscalationAct = do
       requireEither
         =<< runCampaignStore
           store
-          (runWorkflowWith defaultWorkflowRunOptions wfName wfId (cellCampaignWorkflow confused (raise . publishHumanQuery) cell markerOracle campaignNamespace defaultMaxAttempts))
+          (runWorkflowWith defaultWorkflowRunOptions wfName wfId (cellCampaignWorkflow (stubEngine confused) (raise . publishHumanQuery) cell markerOracle campaignNamespace defaultMaxAttempts))
     putStrLn ("  first run outcome: " <> show outcome1)
 
     -- Three bad attempts, each paced by a settle sleep: fire the timer, then
@@ -529,7 +552,7 @@ runEscalationAct = do
       requireEither
         =<< runCampaignStore
           store
-          (runWorkflowWith defaultWorkflowRunOptions wfName wfId (cellCampaignWorkflow confused (raise . publishHumanQuery) cell markerOracle campaignNamespace defaultMaxAttempts))
+          (runWorkflowWith defaultWorkflowRunOptions wfName wfId (cellCampaignWorkflow (stubEngine confused) (raise . publishHumanQuery) cell markerOracle campaignNamespace defaultMaxAttempts))
     case finalOutcome of
       Completed v -> putStrLn ("  verdict: " <> T.unpack v)
       _ -> fail ("expected completion, got " <> show finalOutcome)
@@ -568,9 +591,12 @@ runMemoryAct = do
   -- deletion is conditioned on its lesson actually being recalled — no
   -- memory, no deletion, failing cell.
   let gammaText = sourceText gamma.cellCurrent
-      informed _n notes _ctx = markerResponse [("repaired", fixed)]
+      -- The engine's script: the model reads the lessons out of the /rendered
+      -- request/ (they ride the instruction since guidedFixer folds them in)
+      -- and applies each matching one. A real model does exactly this.
+      informed _n ctx = markerResponse [("repaired", fixed)]
         where
-          lowered = map T.toLower notes
+          lowered = [T.toLower (promptText ctx)]
           dropUnused = any ("unused" `T.isInfixOf`) lowered
           dropTodo = any ("todo" `T.isInfixOf`) lowered
           keep l =
@@ -592,13 +618,13 @@ runMemoryAct = do
       requireEither
         =<< runCampaignStore
           store
-          (runWorkflowWith defaultWorkflowRunOptions wfName wfId (cellCampaignWorkflow informed (raise . noPublisher) gamma markerOracle campaignNamespace defaultMaxAttempts))
+          (runWorkflowWith defaultWorkflowRunOptions wfName wfId (cellCampaignWorkflow (stubEngine informed) (raise . noPublisher) gamma markerOracle campaignNamespace defaultMaxAttempts))
     putStrLn ("  first run outcome: " <> show outcome)
 
     -- The single successful attempt still pauses on its settle sleep before
     -- the workflow's success check, so fire and resume once.
     fireTimerUntilJournaled store stream "sleep:settle-1"
-    driveResumeOnce store (campaignRegistry [] (\_oracle _cell -> informed) noPublisher)
+    driveResumeOnce store (campaignRegistry [] [] (\_o _c -> stubEngine informed) noPublisher)
 
     journal <- readJournal store stream
     let attempts = journaledAttempts (decodedJournal journal)
@@ -890,22 +916,14 @@ runDistillAct sid = do
 -- Shared fleet plumbing: the honest responder, concurrent store, timer sweep
 -- ---------------------------------------------------------------------------
 
--- | The honest fleet "model": a model that applies the one lesson each
--- diagnostic needs — delete the flagged line — to the actual diagnostics the
--- actual oracle computed for the cell. A live model does the same because the
--- diagnostics and lessons ride the prompt; this stub does it textually. The
--- repair is still checked by the real no-regression guard, and the oracle
--- still re-scores what survived, so a wrong lesson application fails
--- honestly.
 -- | The honest fleet "model": applies the one lesson each diagnostic needs
 -- (delete the flagged line) to the diagnostics the /actual oracle/ computed
 -- for the /actual cell/. A live model does the same because the diagnostics
 -- and lessons ride the prompt; this stub does it textually. The repair is
 -- still checked by the real no-regression guard, and the oracle still
 -- re-scores what survived, so a wrong lesson application fails honestly.
-honestResponderFor :: CellOracle -> Cell -> AttemptResponder
-honestResponderFor oracle cell _n _notes _ctx =
-  markerResponse [("repaired", T.unlines kept)]
+honestEngineFor :: EngineFor
+honestEngineFor oracle cell = stubEngine (\_n _ctx -> markerResponse [("repaired", T.unlines kept)])
   where
     diags = oracleCheck oracle (cellPath cell) (cellCurrent cell)
     doomed = SSet.fromList (map diagLineOf diags)
@@ -915,15 +933,28 @@ honestResponderFor oracle cell _n _notes _ctx =
         not (i `SSet.member` doomed)
       ]
 
+-- | The full text of a rendered request — system prompt plus every user
+-- message's text blocks. A scripted stub may condition its answer on it (the
+-- live model reads the very same bytes); act 3's memory-informed model greps
+-- its recalled lessons out of here.
+promptText :: Context -> Text
+promptText ctx =
+  T.intercalate "\n" $
+    maybe [] pure (systemPrompt ctx)
+      <> [ t
+         | UserMessage (UserPayload blocks _ts) <- Vector.toList (messages ctx),
+           UserText (TextContent t) <- Vector.toList blocks
+         ]
+
 -- | Launch every cell's first run concurrently — one store connection per
 -- launcher, so each launch is its own "process" talking to the same journal
 -- (the unlift strategy stays sequential inside each connection; concurrency
 -- lives between connections, in the async pool).
 launchCells ::
   [(Cell, CellOracle, Namespace, WorkflowName, WorkflowId)] ->
-  ResponderFor ->
+  EngineFor ->
   IO ()
-launchCells specs responderFor = do
+launchCells specs engineFor = do
   outcomes <-
     mapConcurrently
       ( \(cell, oracle, ns, wfName, wfId) ->
@@ -932,7 +963,7 @@ launchCells specs responderFor = do
               =<< runCampaignStore
                 store
                 ( do
-                    _ <- runWorkflowWith defaultWorkflowRunOptions wfName wfId (cellCampaignWorkflow (responderFor oracle cell) (raise . noPublisherEff) cell oracle ns defaultMaxAttempts)
+                    _ <- runWorkflowWith defaultWorkflowRunOptions wfName wfId (cellCampaignWorkflow (engineFor oracle cell) (raise . noPublisherEff) cell oracle ns defaultMaxAttempts)
                     pure ()
                 )
       )
@@ -1066,10 +1097,10 @@ runFleetAct = do
         | (cell, _oracle, _ns, _wfName, wfId) <- specs
         ]
       ourIds = [wfIdText wfId | (_, _, _, _, wfId) <- specs]
-      fleetRegistry = campaignRegistry [] honestResponderFor noPublisherEff
+      fleetRegistry = campaignRegistry [] [] honestEngineFor noPublisherEff
 
   putStrLn ("[fleet] launching " <> show (length specs) <> " cells concurrently — one store connection per launcher")
-  launchCells specs honestResponderFor
+  launchCells specs honestEngineFor
 
   -- One clock for the whole fleet: sweep timers until every settle sleep is
   -- journaled, then resume passes drain every completed attempt.
@@ -1124,7 +1155,7 @@ runProjectFleetAct = do
         | pc <- pcs
         ]
       ourIds = [wfIdText wid | (_, _, _, _, wid) <- specs]
-      projectRegistry = campaignRegistry pcs honestResponderFor noPublisherEff
+      projectRegistry = campaignRegistry pcs [] honestEngineFor noPublisherEff
 
   -- Each project's campaign memory is seeded with the lesson its diagnostics
   -- call for (as a real campaign would have learned from earlier runs), so
@@ -1135,7 +1166,7 @@ runProjectFleetAct = do
       runKiokuWrite store (recordLesson (projectNamespace proj) (proj <> "/imports") advice)
 
   putStrLn ("[projects] launching " <> show (length specs) <> " cells concurrently")
-  launchCells specs honestResponderFor
+  launchCells specs honestEngineFor
 
   withCampaignStore $ \store -> do
     fireTimerSweep store projectRegistry [(s, "sleep:settle-1") | (_, s, _, _) <- rows]
@@ -1216,4 +1247,232 @@ runL2L3Act = do
       putStrLn ("    (mirrors under " <> mirrorRoot <> ")")
 
   putStrLn "[distill-l2l3] done — each project's memory now has a narrative self-image"
-  putStrLn "[campaign] all acts complete: shikumi decides, keiro journals, kioku remembers — and scales"
+
+-- ---------------------------------------------------------------------------
+-- Acts 9 and 10: the live decision engine and the memory-driven planner
+-- ---------------------------------------------------------------------------
+
+-- | The campaign's typed planner contract: the campaign's state and its
+-- persona in, one chosen cell and a reason out. Everything is data — the
+-- pending list is the real journal state, the persona is the real distilled
+-- self-image, and the choice is decoded through shikumi's typed decode.
+data PlannerInput = PlannerInput
+  { pendingCells :: Field "pending cells, one per line: id — which lesson applies — what its diagnostics need" Text,
+    lessons :: Field "campaign lessons recalled from memory" Text,
+    personaMd :: Field "the campaign's distilled persona (how this campaign operates)" Text
+  }
+  deriving stock (Generic, Eq, Show)
+  deriving anyclass (ToSchema, FromModel, ToPrompt)
+
+data PlannerOutput = PlannerOutput
+  { chosenCell :: Field "the id of the one cell to fix next" Text,
+    reason :: Field "why this cell, given the persona and the lessons" Text
+  }
+  deriving stock (Generic, Eq, Show)
+  deriving anyclass (ToSchema, FromModel, ToPrompt, Validatable)
+
+plannerSignature :: Signature PlannerInput PlannerOutput
+plannerSignature =
+  mkSignature
+    "You are the planner of a file-hygiene verification campaign. Given the \
+    \pending cells, the campaign's lessons, and your distilled persona, choose \
+    \the ONE cell to fix next and say why. Obey the persona: it describes how \
+    \this campaign operates. Cells whose needed lesson is already in the \
+    \lessons are the cheapest to fix correctly — prefer them."
+
+plannerProgram :: Program PlannerInput PlannerOutput
+plannerProgram =
+  predict
+    ( setDemos
+        [ Demo
+            ( PlannerInput
+                (field "toy/cell/alpha.py — needs: delete TODO lines\ntoy/cell/zeta.py — needs: delete a whole import line (lesson: unused imports are deleted, never stubbed)")
+                (field "a line marked TODO must be deleted entirely, not commented out\ndelete the whole import line flagged unused; never leave a stub")
+                (field "### Campaign persona\n- delete-only repairs; every repair is re-checked by the oracle before it counts")
+            )
+            (PlannerOutput (field "toy/cell/zeta.py") (field "the persona demands delete-only repairs and the lessons already cover zeta's unused-import class, so it is the cheapest correct fix"))
+        ]
+        (setInstruction shapeContractInstruction plannerSignature)
+    )
+  where
+    shapeContractInstruction =
+      "Reply in the exact wire shape demonstrated: a chosenCell field holding \
+      \the bare cell id text, and a reason field holding one sentence. Never \
+      \reply with prose outside the fields."
+
+-- | The live decision engine: the very same 'runAIProgram' call kioku's own
+-- distillers make, pointed at the campaign's fixer program. The model field
+-- of the AI config (act 5's discipline — generated from the OmniRoute
+-- environment, no secrets on disk) selects the tier; 'AIFeature' is only a
+-- config key here, so Extraction's model tier drives the fix attempt.
+liveEngine :: AIRuntime -> AttemptEngine
+liveEngine air n prog input = do
+  -- Bounded retry: a live model is one malformed reply away from a typed
+  -- error, and the tier-1 lesson was that retries are part of the contract.
+  let go :: Int -> IO (Maybe Source)
+      go 0 = once
+      go k =
+        once >>= \case
+          Nothing -> go (k - 1)
+          ok -> pure ok
+      once =
+        runAIProgram air Extraction prog input >>= \case
+          Right (RepairOut (Field txt)) -> pure (Just (Source txt))
+          Left (AIProgramFailed err) -> do
+            putStrLn ("    [live-engine] typed error: " <> show err)
+            pure Nothing
+          Left other -> do
+            putStrLn ("    [live-engine] " <> show other)
+            pure Nothing
+  r <- go (3 :: Int)
+  putStrLn ("    [live] attempt " <> show n <> ": " <> maybe "failed (typed error)" (const "proposed a repair") r)
+  pure r
+
+-- | Act 9: the live decision loop. The corpus cells run again — same bytes,
+-- same oracle, same timers, same attempt budget — under a @live:@ journal
+-- prefix, with a real model behind the fixer program instead of the stub.
+-- The lessons acts 1–3 recorded are recalled into the attempts by the
+-- ordinary decision step; nothing is seeded for the live fleet.
+runLiveDecisionAct :: IO ()
+runLiveDecisionAct = do
+  putStrLn "\n=== act 9: the live decision loop — a real model runs the campaign ==="
+  withLoadedAIRuntime $ \air -> do
+    let liveCells = [c | c <- corpusCells, unCellId (cellId c) `elem` ["delta.py", "epsilon.py", "zeta.py"]]
+        specs =
+          [ ( Cell (CellId ("live:" <> unCellId (cellId c))) (cellPath c) (cellOriginal c) (cellCurrent c),
+              markerOracle,
+              campaignNamespace,
+              cellCampaignWorkflowName,
+              campaignWorkflowId (CellId ("live:" <> unCellId (cellId c)))
+            )
+          | c <- liveCells
+          ]
+        rows =
+          [ ( "live/" <> unCellId (cellId cell),
+              campaignStreamNameText cellCampaignWorkflowName wfId,
+              cellCampaignWorkflowName,
+              wfId
+            )
+          | (cell, _, _, _, wfId) <- specs
+          ]
+        ourIds = [wfIdText wfId | (_, _, _, _, wfId) <- specs]
+        liveRegistry =
+          campaignRegistry
+            []
+            [Cell (CellId ("live:" <> unCellId (cellId c))) (cellPath c) (cellOriginal c) (cellCurrent c) | c <- liveCells]
+            (\_oracle _cell -> liveEngine air)
+            noPublisherEff
+
+    putStrLn ("[live] launching " <> show (length specs) <> " cells concurrently — a real model behind every attempt")
+    launchCells specs (\_oracle _cell -> liveEngine air)
+
+    withCampaignStore $ \store -> do
+      fireTimerSweep store liveRegistry [(s, "sleep:settle-" <> T.pack (show n)) | (_, s, _, _) <- rows, n <- [1 :: Int .. 3]]
+      drainFleet store liveRegistry ourIds
+
+    putStrLn "[live] journal scoreboard:"
+    withCampaignStore $ \store -> do
+      printCellScoreboard store liveRegistry rows
+      remaining <- ourUnfinished store ourIds
+      unless (null remaining) $ fail ("live fleet restart check: unfinished work remains: " <> show remaining)
+      putStrLn "  restart: no unfinished work — the live campaign is journaled like every other"
+
+-- | Act 10: memory-driven planning. The toy campaign's own persona is
+-- distilled live (the same L2/L3 path act 8 runs for the projects), and the
+-- persona — with the recalled lessons and the real pending-cell list read
+-- off the journals — is what the planner program sees. Its typed choice
+-- decides which fresh cell the live campaign fixes; the decision itself is
+-- recorded into memory as an atom, so the campaign's next planner call can
+-- recall what it chose and why.
+runPlannerAct :: IO ()
+runPlannerAct = do
+  putStrLn "\n=== act 10: memory-driven planning — the persona picks the next cell ==="
+
+  -- One pending cell the campaign has never touched: the corpus's negative
+  -- control (clean at launch, so its campaign ends immediately — the honest
+  -- choice for a live planner demo whose job is the choice, not the fixing).
+  let chosenCellName = "eta.py"
+      chosenCell = case [c | c <- corpusCells, unCellId (cellId c) == chosenCellName] of
+        [c] -> c
+        _ -> error "planner: eta.py missing from the corpus"
+      pendingLines =
+        [ unCellId (cellId c) <> " — needs: " <> needDescription (unCellId (cellId c))
+        | c <- corpusCells,
+          unCellId (cellId c) == chosenCellName
+        ]
+      needDescription name
+        | name == chosenCellName = "no diagnostics (the negative control); verifying it stays clean"
+        | otherwise = "delete the flagged lines"
+
+  withCampaignStore $ \store -> do
+    notes <- requireEither =<< runCampaignStore store (recallNotes campaignNamespace)
+    let personaMd = case notes of
+          [] -> "(no lessons recalled yet)"
+          ns -> T.unlines ns
+    withLoadedAIRuntime $ \air -> do
+      let distillRT =
+            withDistillWorkspace "/tmp/campaign-mirrors"
+              ( withTestRunners
+                  (newDistillRuntime air Nothing)
+                  (\tr -> tr{runScene = campaignSceneRunner air, runPersona = campaignPersonaRunner air})
+              )
+          gscope = ScopeGlobal campaignNamespace
+      -- Distill the toy campaign's own memory (its lessons live in
+      -- campaignNamespace; act 5's session evidence is already in there).
+      _ <- requireEither =<< runCampaignStore store (regenerateScene distillRT campaignMemorySpace gscope)
+      personaE <- requireEither =<< runCampaignStore store (regeneratePersona distillRT campaignMemorySpace gscope)
+      personaText <- case personaE of
+        Right (Just prow) -> do
+          putStrLn ("  persona distilled: " <> show (T.length prow.bodyMd) <> " chars of markdown")
+          pure prow.bodyMd
+        Right Nothing -> pure "(no persona yet — a fresh campaign)"
+        Left err -> fail ("persona distillation failed: " <> show err)
+
+      let input =
+            PlannerInput
+              (Field (T.unlines pendingLines))
+              (Field (T.unlines (map ("- " <>) (T.lines personaMd))))
+              (Field personaText)
+      runPlanner <- do
+        r <- runAIProgram air Extraction plannerProgram input
+        pure (either (Left . show) Right r :: Either String PlannerOutput)
+      choice <- case runPlanner of
+        Left err -> fail ("planner program failed: " <> err)
+        Right out -> pure out
+      let picked = unField choice.chosenCell
+      putStrLn ("  planner chose: " <> T.unpack picked)
+      TIO.putStrLn ("    reason: " <> unField choice.reason)
+      unless (picked == chosenCellName) $
+        putStrLn "    (planner picked a different cell than the demo's prepared one — running it anyway)"
+      -- The decision is recorded into memory as an atom: the campaign can
+      -- recall what it chose and why.
+      _ <-
+        requireEither
+          =<< runCampaignStore
+            store
+            (recordLesson campaignNamespace ("planner/" <> picked) ("planner chose " <> picked <> ": " <> unField choice.reason))
+      pure ()
+
+      -- The chosen cell runs the live campaign under a fresh journal prefix.
+      let cell = chosenCell{cellId = CellId ("live2:" <> chosenCellName)}
+          wfId = campaignWorkflowId (CellId ("live2:" <> chosenCellName))
+          stream = campaignStreamNameText cellCampaignWorkflowName wfId
+          liveRegistry = campaignRegistry [] [cell] (\_oracle _c -> liveEngine air) noPublisherEff
+      requireFreshJournal store stream
+      _ <-
+        requireEither
+          =<< runCampaignStore
+            store
+            (runWorkflowWith defaultWorkflowRunOptions cellCampaignWorkflowName wfId (cellCampaignWorkflow (liveEngine air) (raise . noPublisherEff) cell markerOracle campaignNamespace defaultMaxAttempts))
+      -- A clean-at-launch cell (the negative control) completes at verify
+      -- with no settle sleep armed; only a parked workflow needs firing.
+      journal0 <- readJournal store stream
+      unless (journalIsComplete (decodedJournal journal0)) $
+        fireTimerUntilJournaled store stream "sleep:settle-1"
+      driveResumeOnce store liveRegistry
+      journal <- readJournal store stream
+      unless (journalIsComplete (decodedJournal journal)) $
+        fail "planner journal has no WorkflowCompleted"
+      putStrLn ("  the planner's choice ran the live campaign: " <> T.unpack (unCellId cell.cellId) <> " completed")
+      let attempts = journaledAttempts (decodedJournal journal)
+      putStrLn ("  journal: " <> show (length attempts) <> " attempt(s) journaled")

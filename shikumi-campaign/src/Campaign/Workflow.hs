@@ -38,8 +38,10 @@ module Campaign.Workflow
     humanQueryStepName,
 
     -- * The decision step's configuration
-    AttemptResponder,
-    ResponderFor,
+    AttemptEngine,
+    EngineFor,
+    stubEngine,
+    guidedFixer,
     HumanQueryPublisher,
 
     -- * The workflow
@@ -57,7 +59,9 @@ import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Time.Clock (NominalDiffTime)
+import Control.Applicative ((<|>))
 import Effectful (Eff, IOE, liftIO, raise, (:>))
+import Effectful.Error.Static (throwError)
 import GHC.Generics (Generic)
 
 import Baikai (Context, Response)
@@ -66,12 +70,15 @@ import Campaign.Oracle (CellOracle (..), ProjectCell (..), markerOracle, unusedI
 import Data.List (find)
 import Kioku.Api.Scope (Namespace)
 import Kiroku.Store.Effect.Resource (KirokuStoreResource)
+import Shikumi.Combinator ((>>>))
 import Shikumi.Error (ShikumiError)
-import Shikumi.Program (Program, runProgram)
+import Shikumi.Module (predict)
+import Shikumi.Program (Program, embed, runProgram)
 import Shikumi.Schema.Types (Field (..))
+import Shikumi.Signature (Demo (..), Signature, getInstruction, setDemos, setInstruction)
 import Shikumi.Testing (runStubEval)
 import Toy.Fixer.Domain (Source (..), SourcePath, showDiagnostic, sourceText)
-import Toy.Fixer.Program (DiagnosticsIn (..), RepairOut (..), fixSource)
+import Toy.Fixer.Program (DiagnosticsIn (..), RepairOut (..), applyRepair, repairSignature)
 
 import Campaign.Cell
   ( Cell (..),
@@ -80,6 +87,7 @@ import Campaign.Cell
     cellForId,
     unCellId,
   )
+import Data.List (find)
 
 import Keiro.Workflow
   ( StepName (..),
@@ -153,20 +161,72 @@ humanQueryStepName = StepName "human-verdict"
 -- The decision step's configuration
 -- ---------------------------------------------------------------------------
 
--- | The scripted model, keyed by attempt number and given the recalled
--- memory notes the attempt step recalled (a live model would see them as
--- prompt lines). Lets the demo script a failing first attempt and a good
--- second one (the informed-retry story), or a permanently confused model
--- (the escalation story). A live stack swaps this for the routing
--- interpreters; the workflow body is untouched.
-type AttemptResponder = Int -> [Text] -> Context -> Response
+-- | The decision engine: run one attempt (keyed by its number, so a scripted
+-- stub can fail early attempts) of the fixer program — ground truth and
+-- recalled memory already bound in — on its input, returning the proposed
+-- repair; 'Nothing' on any typed 'ShikumiError' (a guard rejection, a
+-- malformed reply). The workflow body is agnostic to what executes the
+-- program: the /stub/ engine replays a scripted responder through shikumi's
+-- stub LM ('stubEngine'); the /live/ engine runs the very same program
+-- through kioku's 'runAIProgram' — the exact call kioku's own distillers
+-- make. Swapping engines changes nothing else: same oracle, same journal,
+-- same timers, same attempt budget.
+type AttemptEngine = Int -> Program DiagnosticsIn RepairOut -> DiagnosticsIn -> IO (Maybe Source)
 
--- | A responder /factory/: the honest type for a fleet. A rebuilt workflow
--- body knows which oracle (and cell) it serves, so the caller supplies /how
--- to respond given the task/ — a live model reads the task out of the
--- rendered request; the scripted honest responder derives its repair from
--- the oracle's own diagnostics.
-type ResponderFor = CellOracle -> Cell -> AttemptResponder
+-- | An engine /factory/: the honest type for a fleet. A rebuilt workflow body
+-- knows which oracle (and cell) it serves; the caller supplies /how attempts
+-- run given that task/.
+type EngineFor = CellOracle -> Cell -> AttemptEngine
+
+-- | The stub engine: the workflow's original interpreter, kept as an engine so
+-- the offline acts and the live acts are the same code with a different
+-- bottom. The scripted responder is keyed by attempt number; the recalled
+-- lessons already ride the rendered request (folded into the instruction),
+-- exactly as a live model would see them.
+stubEngine :: (Int -> Context -> Response) -> AttemptEngine
+stubEngine responder n prog input = do
+  r <- runStubEval (responder n) (runProgram prog input)
+  pure $ case r of
+    Right (RepairOut (Field txt)) -> Just (Source txt)
+    Left (_ :: ShikumiError) -> Nothing
+
+-- | The fixer program with the campaign's recalled lessons folded into its
+-- instruction — /memory steers the prompt/ — while the wire shape (diagnostics
+-- in, whole repaired file out) and the no-regression guard stay untouched.
+-- With no lessons this is exactly 'fixSource'; either way the guard is
+-- composed back on, so invented lines are typed errors under every engine.
+guidedFixer :: Source -> [Text] -> Program DiagnosticsIn RepairOut
+guidedFixer orig notes =
+  predict (liveInstruction orig notes)
+    >>> embed (\out -> either throwError (\_ -> pure out) (applyRepair orig out))
+
+-- | 'repairSignature' with the file content and the recalled lessons folded
+-- into its instruction. A live model must /see the file/ to repair it — the
+-- stub engines never needed this (they are scripted per cell), but a real
+-- model asked to "return the complete repaired file" while blind to the file
+-- can only hallucinate. The worked demo pins the wire contract: whole file
+-- back, deletions only.
+liveInstruction :: Source -> [Text] -> Signature DiagnosticsIn RepairOut
+liveInstruction orig notes =
+  setDemos [Demo exampleIn exampleOut] $
+    setInstruction
+      ( getInstruction repairSignature
+          <> "\n\nThe current content of the file being fixed:\n"
+          <> sourceText orig
+          <> "\nReply with the repaired field holding the complete file after "
+          <> "deleting the flagged lines. No commentary, no fences — the field "
+          <> "is the file."
+          <> (if null notes then "" else "\n\nLessons learned earlier in this campaign (obey them):\n" <> T.unlines (map ("- " <>) notes))
+      )
+      repairSignature
+  where
+    exampleIn =
+      DiagnosticsIn
+        (Field "widget.py")
+        (Field ["W-unused-import unused import 'os' at line 2"])
+    exampleOut =
+      RepairOut
+        (Field "import sys\n\n\ndef size(w):\n    return len(w)\n")
 
 -- | Publish a human query's awakeable id to the outside world. Must be
 -- idempotent: like jitsurei's webhook publisher, its action has
@@ -178,54 +238,49 @@ defaultMaxAttempts :: Int
 defaultMaxAttempts = 3
 
 -- ---------------------------------------------------------------------------
--- The decision step: run the shikumi fixer under an attempt-keyed responder
+-- The decision step: run the shikumi fixer under the supplied engine
 -- ---------------------------------------------------------------------------
 
 -- | Run one LM fix attempt against a cell, with recalled memory as extra
--- guidance. Step actions get full IOE, so the stub-or-live interpreter stack
--- runs right here. The program and its input are supplied by the caller (the
--- oracle decides both); returns the repaired source when the model's proposal
--- passed the no-regression guard (the guard lives inside 'fixSource';
--- failures surface as typed 'ShikumiError's, recorded as failed attempts).
+-- guidance. Step actions get full IOE, so the stub-or-live engine stack runs
+-- right here. The program is 'guidedFixer' — the original bound in as the
+-- guard's ground truth, the lessons folded into the instruction — and the
+-- engine supplies the model behind it. Returns the repaired source when the
+-- proposal passed the no-regression guard; failures surface as typed
+-- 'ShikumiError's inside the engine, recorded as failed attempts.
 runFixAttempt ::
   (IOE :> es) =>
-  -- | the program with ground truth bound in
-  Program DiagnosticsIn RepairOut ->
+  AttemptEngine ->
+  Source ->
   DiagnosticsIn ->
-  AttemptResponder ->
-  -- | recalled memory notes, already rendered as prompt lines
   [Text] ->
   Int ->
   Eff es (Maybe Source)
-runFixAttempt prog input responder notes n = do
-  r <- liftIO $ runStubEval (responder n notes) (runProgram prog input)
-  case r of
-    Right (RepairOut (Field txt)) -> pure (Just (Source txt))
-    Left (_ :: ShikumiError) -> pure Nothing
+runFixAttempt engine orig input notes n = liftIO (engine n (guidedFixer orig notes) input)
 
 -- | One attempt, as a step action: recall lessons (a kioku read, journaled
--- into the record — replay never re-recalls), run the model, apply the guard.
+-- into the record — replay never re-recalls), run the engine, apply the guard.
 -- The oracle decides the diagnostics, the original, and hence the program.
 attemptRecord ::
   (IOE :> es, KirokuStoreResource :> es, Store :> es) =>
   Cell ->
   CellOracle ->
   Namespace ->
-  AttemptResponder ->
+  AttemptEngine ->
   Int ->
   Eff es FixAttempt
-attemptRecord cell oracle ns responder n = do
-  let before = map showDiagnostic (oracleCheck oracle (cellPath cell) (cellCurrent cell))
+attemptRecord cell oracle ns engine n = do
+  let orig = oracleOriginal oracle (cellPath cell) (cellCurrent cell)
+      before = map showDiagnostic (oracleCheck oracle (cellPath cell) (cellCurrent cell))
       -- The keywords the diagnostics themselves suggest: the memory consulted
       -- is a function of the task, not of the caller.
       diagKws = concat [keywordsOf d | d <- before]
   notes <- if null diagKws then pure [] else concat <$> mapM (recallNotesForKeyword ns) diagKws
-  let prog = fixSource (oracleOriginal oracle (cellPath cell) (cellCurrent cell))
-      input =
+  let input =
         DiagnosticsIn
           (Field (cellPath cell))
           (Field before)
-  mRepaired <- runFixAttempt prog input responder notes n
+  mRepaired <- runFixAttempt engine orig input notes n
   case mRepaired of
     Nothing ->
       pure
@@ -273,14 +328,14 @@ interAttemptDelay = 1
 -- namespace. The final result is a verdict line.
 cellCampaignWorkflow ::
   (Workflow :> es, KirokuStoreResource :> es, Store :> es, IOE :> es) =>
-  AttemptResponder ->
+  AttemptEngine ->
   HumanQueryPublisher es ->
   Cell ->
   CellOracle ->
   Namespace ->
   Int ->
   Eff es Text
-cellCampaignWorkflow responder publishHumanQuery cell oracle ns maxAttempts = do
+cellCampaignWorkflow engine publishHumanQuery cell oracle ns maxAttempts = do
   -- 1) Journal the oracle's initial verdict for the cell as received.
   _initial <- step (StepName "verify-initial") (pure initialDiags)
   if null initialDiags
@@ -293,7 +348,7 @@ cellCampaignWorkflow responder publishHumanQuery cell oracle ns maxAttempts = do
       | otherwise = do
           -- 2) One durable LM attempt, journaled with its repair...
           attempt <-
-            step (StepName ("propose-fix-" <> T.pack (show n))) (attemptRecord cell oracle ns responder n)
+            step (StepName ("propose-fix-" <> T.pack (show n))) (attemptRecord cell oracle ns engine n)
           -- 3) ...paced by a durable timer...
           sleepNamed (StepName ("settle-" <> T.pack (show n))) interAttemptDelay
           -- 4) ...then the oracle decides: done, or another attempt.
@@ -324,19 +379,23 @@ campaignRegistry ::
   (IOE :> es, KirokuStoreResource :> es, Store :> es) =>
   -- | the real project cells, read from the checkouts
   [ProjectCell] ->
-  -- | how to respond given a task (oracle + cell)
-  ResponderFor ->
+  -- | extra toy cells beyond the corpus (the live acts' @live:@-prefixed
+  -- instances of the same corpus)
+  [Cell] ->
+  -- | how attempts run given a task (oracle + cell): a stub factory or a
+  -- live engine that ignores both (the program carries the task)
+  EngineFor ->
   HumanQueryPublisher es ->
   WorkflowRegistry es
-campaignRegistry projectCells responderFor publishHumanQuery =
+campaignRegistry projectCells extraCells engine publishHumanQuery =
   Map.fromList
     [ ( cellCampaignWorkflowName,
         WorkflowDef $ \wid ->
-          case cellForId (campaignIdFromWf wid) of
+          case lookupCell (campaignIdFromWf wid) of
             Nothing -> error ("campaignRegistry: unknown cell " <> T.unpack (unCellId (campaignIdFromWf wid)))
             Just cell ->
               cellCampaignWorkflow
-                (responderFor markerOracle cell)
+                (engine markerOracle cell)
                 (raise . publishHumanQuery)
                 cell
                 markerOracle
@@ -359,7 +418,7 @@ campaignRegistry projectCells responderFor publishHumanQuery =
                             cellCurrent = pcSource pc
                           }
                    in cellCampaignWorkflow
-                        (responderFor unusedImportOracle pcell)
+                        (engine unusedImportOracle pcell)
                         (raise . publishHumanQuery)
                         pcell
                         unusedImportOracle
@@ -367,3 +426,8 @@ campaignRegistry projectCells responderFor publishHumanQuery =
                         defaultMaxAttempts
       )
     ]
+  where
+    -- Corpus cells by id, plus the caller's extra cells (the live acts run
+    -- the same corpus under a @live:@ journal prefix — same bytes, fresh
+    -- campaign, no replay collision with the offline acts).
+    lookupCell cid = cellForId cid <|> find ((== unCellId cid) . unCellId . cellId) extraCells
