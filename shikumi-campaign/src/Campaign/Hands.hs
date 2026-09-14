@@ -74,9 +74,12 @@ data Landing = Landing
 campaignBranchFor :: Text -> Text
 campaignBranchFor _proj = "campaign/unused-imports"
 
--- | Where the project's worktree lives.
-campaignWorktreePath :: Text -> FilePath
-campaignWorktreePath proj = "/tmp/campaign-worktrees" </> T.unpack proj
+-- | Where a project's worktree for one campaign branch lives: one worktree
+-- per (project, branch), so each campaign concept lands on its own isolated
+-- working copy and no branch switching is ever needed.
+campaignWorktreePath :: Text -> Text -> FilePath
+campaignWorktreePath proj branch =
+  "/tmp/campaign-worktrees" </> T.unpack proj </> T.unpack (T.replace "/" "-" branch)
 
 worktreeExists :: FilePath -> IO Bool
 worktreeExists = doesDirectoryExist
@@ -100,19 +103,28 @@ gitCapture dir args = do
         "git " <> unwords args <> " failed in " <> dir <> ": "
           <> T.unpack (TL.toStrict (TLE.decodeUtf8 err))
 
--- | Idempotently ensure the project's campaign worktree exists on its
--- campaign branch. First call adds it; later calls reuse it. Git refuses to
--- re-add an existing worktree path, so the happy path on re-run is the
--- exists-check — same observable state, no error.
-ensureCampaignWorktree :: Text -> IO FilePath
-ensureCampaignWorktree proj = do
-  let wt = campaignWorktreePath proj
-      branch = campaignBranchFor proj
+-- | Idempotently ensure the project's worktree for one campaign branch
+-- exists. First call adds it (creating the branch from the parent's HEAD if
+-- the branch doesn't exist yet); later calls reuse it. Git refuses to re-add
+-- an existing worktree path, so the happy path on re-run is the exists-check
+-- — same observable state, no error.
+ensureCampaignWorktree :: Text -> Text -> IO FilePath
+ensureCampaignWorktree proj branch = do
+  let wt = campaignWorktreePath proj branch
       parent = parentRepoPath proj
   createDirectoryIfMissing True (takeDirectory wt)
+  -- Stale registrations (a deleted worktree directory leaves the branch
+  -- "checked out" in git's metadata) would block re-adding; prune first —
+  -- it only removes registrations whose directories are gone.
+  git_ parent ["worktree", "prune"]
   exists <- worktreeExists wt
-  unless' exists $
-    git_ parent ["worktree", "add", wt, "-b", T.unpack branch]
+  unless' exists $ do
+    branchExists <- do
+      (ec, _, _) <- readProcess (proc "git" ["-C", parent, "rev-parse", "--verify", "--quiet", T.unpack branch])
+      pure (ec == ExitSuccess)
+    if branchExists
+      then git_ parent ["worktree", "add", wt, T.unpack branch]
+      else git_ parent ["worktree", "add", wt, "-b", T.unpack branch]
   pure wt
   where
     unless' b act = if b then pure () else act

@@ -139,11 +139,21 @@ projectWorkflowId proj path = WorkflowId ("pcell-" <> proj <> ":" <> path)
 
 -- | Round-trip 'projectWorkflowId'.
 projectCellFromWf :: WorkflowId -> Maybe (Text, SourcePath)
-projectCellFromWf (WorkflowId t) = do
-  rest <- T.stripPrefix "pcell-" t
-  (proj, pathRest) <- pure (T.breakOn ":" rest)
-  path <- T.stripPrefix ":" pathRest
-  pure (proj, path)
+projectCellFromWf (WorkflowId t0) = do
+  -- "pcell-<proj>:<path>" or "pcell-<prefixes><proj>:<path>" where <prefixes>
+  -- is any run of the fresh-campaign instance prefixes ("react-", "live-")
+  -- the acts put in front of the same cells.
+  t <- T.stripPrefix "pcell-" t0
+  let t1 = stripInstancePrefixes t
+      (proj, pathRest) = T.breakOn ":" t1
+  case T.stripPrefix ":" pathRest of
+    Nothing -> fail "projectCellFromWf: malformed path part"
+    Just path -> pure (proj, path)
+  where
+    stripInstancePrefixes u =
+      case T.stripPrefix "react-" u <|> T.stripPrefix "live-" u of
+        Just u' -> stripInstancePrefixes u'
+        Nothing -> u
 
 -- ---------------------------------------------------------------------------
 -- The human seam: the typed third outcome
@@ -171,7 +181,16 @@ humanQueryStepName = StepName "human-verdict"
 -- through kioku's 'runAIProgram' — the exact call kioku's own distillers
 -- make. Swapping engines changes nothing else: same oracle, same journal,
 -- same timers, same attempt budget.
-type AttemptEngine = Int -> Program DiagnosticsIn RepairOut -> DiagnosticsIn -> IO (Maybe Source)
+type AttemptEngine =
+  -- | the attempt number (scripted engines key demos on it)
+  Int ->
+  -- | the whole-file fixer program (the whole-file engines run it)
+  Program DiagnosticsIn RepairOut ->
+  -- | the task, as the decision step saw it
+  DiagnosticsIn ->
+  -- | the recalled campaign lessons for this attempt
+  [Text] ->
+  IO (Maybe Source)
 
 -- | An engine /factory/: the honest type for a fleet. A rebuilt workflow body
 -- knows which oracle (and cell) it serves; the caller supplies /how attempts
@@ -184,7 +203,7 @@ type EngineFor = CellOracle -> Cell -> AttemptEngine
 -- lessons already ride the rendered request (folded into the instruction),
 -- exactly as a live model would see them.
 stubEngine :: (Int -> Context -> Response) -> AttemptEngine
-stubEngine responder n prog input = do
+stubEngine responder n prog input _notes = do
   r <- runStubEval (responder n) (runProgram prog input)
   pure $ case r of
     Right (RepairOut (Field txt)) -> Just (Source txt)
@@ -256,7 +275,8 @@ runFixAttempt ::
   [Text] ->
   Int ->
   Eff es (Maybe Source)
-runFixAttempt engine orig input notes n = liftIO (engine n (guidedFixer orig notes) input)
+runFixAttempt engine orig input@(DiagnosticsIn _ (Field _)) notes n =
+  liftIO (engine n (guidedFixer orig notes) input notes)
 
 -- | One attempt, as a step action: recall lessons (a kioku read, journaled
 -- into the record — replay never re-recalls), run the engine, apply the guard.

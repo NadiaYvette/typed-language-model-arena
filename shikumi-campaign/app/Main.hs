@@ -143,6 +143,7 @@ import Campaign.Landing
     landProjectCellWorkflow,
     landingRecordOf,
     landingWorkflowId,
+    landingWorkflowIdFor,
     landingWorkflowName,
   )
 import Campaign.Memory
@@ -160,6 +161,7 @@ import Campaign.Memory
 import Baikai (Context (..), Message (..), Response, TextContent (..), UserContent (..))
 import Baikai.Message (UserPayload (UserPayload))
 import Campaign.Oracle (CellOracle (..), ProjectCell (..), diagLineOf, markerOracle, projectCellSpecs, readProjectCell, unusedImportOracle)
+import Campaign.ReactFixer (renderSteps, reactEngineFor, scriptedReactEngine)
 import Campaign.Workflow
   ( AttemptEngine,
     EngineFor,
@@ -191,7 +193,7 @@ main = do
   -- 5 distills it — or act 5 records it itself when act 4 was filtered out.
   acts <- lookupEnv "ACTS"
   let splitOnComma = T.splitOn "," . T.strip
-      wanted = maybe [1 .. 11] (map (read . T.unpack) . splitOnComma . T.pack) acts
+      wanted = maybe [1 .. 12] (map (read . T.unpack) . splitOnComma . T.pack) acts
       step mSid n
         | n `notElem` wanted = pure mSid
         | otherwise = case n of
@@ -205,8 +207,9 @@ main = do
             8 -> runL2L3Act >> pure mSid
             9 -> runLiveDecisionAct >> pure mSid
             10 -> runPlannerAct >> pure mSid
-            _ -> runLandingAct >> pure mSid
-  foldM_ step Nothing [1 .. 11 :: Int]
+            11 -> runLandingAct >> pure mSid
+            _ -> runReactAct >> pure mSid
+  foldM_ step Nothing [1 .. 12 :: Int]
 
 -- ---------------------------------------------------------------------------
 -- Store plumbing (jitsurei's shape; no projection schema — the journal is
@@ -1315,7 +1318,7 @@ plannerProgram =
 -- environment, no secrets on disk) selects the tier; 'AIFeature' is only a
 -- config key here, so Extraction's model tier drives the fix attempt.
 liveEngine :: AIRuntime -> AttemptEngine
-liveEngine air n prog input = do
+liveEngine air n prog input _notes = do
   -- Bounded retry: a live model is one malformed reply away from a typed
   -- error, and the tier-1 lesson was that retries are part of the contract.
   let go :: Int -> IO (Maybe Source)
@@ -1559,7 +1562,7 @@ runLandingAct = do
                     defaultWorkflowRunOptions
                     landingWorkflowName
                     wfId
-                    (landProjectCellWorkflow pc unusedImportOracle repair)
+                    (landProjectCellWorkflow pc unusedImportOracle "campaign/unused-imports" repair)
                 )
           journal <- readJournal store stream
           case landingRecordOf (decodedJournal journal) of
@@ -1574,8 +1577,182 @@ runLandingAct = do
 
   -- The campaign's work, as a human would review it: one branch per project.
   for_ (nub (map pcProject pcs)) $ \proj -> do
-    let wt = campaignWorktreePath proj
+    let wt = campaignWorktreePath proj (campaignBranchFor proj)
     log <- gitCapture wt ["log", "--oneline", T.unpack (campaignBranchFor proj)]
     putStrLn ("  " <> T.unpack proj <> " branch log:")
     for_ (T.lines log) (putStrLn . ("    " <>) . T.unpack)
   putStrLn "[landing] done — the journals decided, the worktrees received, the parents untouched"
+
+-- ---------------------------------------------------------------------------
+-- Act 12: the ReAct fixer — the same cells, fixed by an agent with tools
+-- ---------------------------------------------------------------------------
+
+-- | Act 12 runs the project cells again — same oracles, same attempt
+-- budgets, same journals — but the attempts are now a /ReAct agent with
+-- typed tools/ (read_file, delete_lines, check_diagnostics) instead of the
+-- whole-file fixer. The delete-only policy becomes structural: the only
+-- mutation tool there is is a deletion. The engine's success is the real
+-- oracle on the agent's final state; the model's done claim is never
+-- trusted.
+--
+-- Two runs:
+--
+--   * @react:@ — the /scripted/ agent (deterministic, offline): the loop's
+--     shape, the tools, the trajectory, and the landing all real.
+--   * @react-live:@ — the same agent driven by the real model through
+--     'runAIProgram' (a live stack is the same call). Trajectories show the
+--     agent actually reading the file, deleting, checking, and finishing.
+--
+-- Both are landed through the act-11 worktree machinery onto
+-- @campaign\/react-fixes@ branches — the campaign's new hands handle a new
+-- kind of repair without change.
+runReactAct :: IO ()
+runReactAct = do
+  putStrLn "\n=== act 12: the ReAct fixer — an agent with typed tools ==="
+  pcs <- catMaybes <$> mapM readProjectCell projectCellSpecs
+  when (null pcs) $ fail "react act: no project cells found in the checkouts"
+
+  let prefix = "react-"
+      -- The registry's project-id parser accepts the react- prefix (fresh
+      -- campaign instances of the same cells).
+      rcell pc =
+        Cell
+          { cellId = CellId ("pcell-" <> prefix <> pcProject pc <> ":" <> pcPath pc),
+            cellPath = pcPath pc,
+            cellOriginal = pcSource pc,
+            cellCurrent = pcSource pc
+          }
+      specs =
+        [ ( rcell pc,
+            unusedImportOracle,
+            projectNamespace (pcProject pc),
+            projectCampaignWorkflowName,
+            projectWorkflowId2 prefix (pcProject pc) (pcPath pc)
+          )
+        | pc <- pcs
+        ]
+      rows =
+        [ ( "react/" <> pcProject pc <> "/" <> pcPath pc,
+            campaignStreamNameText projectCampaignWorkflowName (projectWorkflowId2 prefix (pcProject pc) (pcPath pc)),
+            projectCampaignWorkflowName,
+            projectWorkflowId2 prefix (pcProject pc) (pcPath pc)
+          )
+        | pc <- pcs
+        ]
+      ourIds = [wfIdText wid | (_, _, _, _, wid) <- specs]
+
+  -- Scripted run: offline, journaled.
+  putStrLn "[react] scripted agent over the project cells"
+  let scriptedRegistry = campaignRegistry pcs [] (\o c -> scriptedReactEngine o c) noPublisherEff
+  launchCells specs (\o c -> scriptedReactEngine o c)
+  withCampaignStore $ \store -> do
+    fireTimerSweep store scriptedRegistry [(s, "sleep:settle-" <> T.pack (show n)) | (_, s, _, _) <- rows, n <- [1 :: Int .. 3]]
+    drainFleet store scriptedRegistry ourIds
+  putStrLn "[react] journal scoreboard:"
+  withCampaignStore $ \store -> printCellScoreboard store scriptedRegistry rows
+
+  -- Live run: the same agent, real model.
+  withLoadedAIRuntime $ \air -> do
+    putStrLn "[react-live] launching the same cells under the live agent"
+    let livePrefix = "react-live-"
+        lspecs =
+          [ ( rcell' pc
+            , unusedImportOracle
+            , projectNamespace (pcProject pc)
+            , projectCampaignWorkflowName
+            , projectWorkflowId2 livePrefix (pcProject pc) (pcPath pc)
+            )
+          | pc <- pcs
+          ]
+        lrows =
+          [ ( "react-live/" <> pcProject pc <> "/" <> pcPath pc,
+              campaignStreamNameText projectCampaignWorkflowName (projectWorkflowId2 livePrefix (pcProject pc) (pcPath pc)),
+              projectCampaignWorkflowName,
+              projectWorkflowId2 livePrefix (pcProject pc) (pcPath pc)
+            )
+          | pc <- pcs
+          ]
+        ourLIds = [wfIdText wid | (_, _, _, _, wid) <- lspecs]
+        rcell' pc =
+          (rcell pc)
+            { cellId = CellId ("pcell-" <> livePrefix <> pcProject pc <> ":" <> pcPath pc)
+            }
+        liveRegistry = campaignRegistry pcs [] (\o c -> reactEngineFor air o c) noPublisherEff
+    launchCells lspecs (\o c -> reactEngineFor air o c)
+    withCampaignStore $ \store -> do
+      fireTimerSweep store liveRegistry [(s, "sleep:settle-" <> T.pack (show n)) | (_, s, _, _) <- lrows, n <- [1 :: Int .. 3]]
+      drainFleet store liveRegistry ourLIds
+    putStrLn "[react-live] journal scoreboard:"
+    withCampaignStore $ \store -> do
+      printCellScoreboard store liveRegistry lrows
+      remaining <- ourUnfinished store ourLIds
+      unless (null remaining) $
+        putStrLn
+          ( "  [react-live] " <> show (length remaining)
+              <> " workflow(s) still suspended \8212 live-model budget or provider"
+              <> " rate limits ran out; the journals hold every partial attempt and"
+              <> " a later resume pass continues exactly where they stopped"
+          )
+
+    -- Land the live run's accepted repairs on campaign/react-fixes.
+    landRun livePrefix
+
+  -- Land the scripted run's repairs too (its own journal prefix, same
+  -- branch). The landing machinery is repair-agnostic: it cannot tell which
+  -- engine proposed what it is committing.
+  landRun prefix
+  putStrLn "[react] done — the agent decides with tools; the journals record; the branches receive"
+  where
+    projectWorkflowId2 pfx proj path =
+      let WorkflowId t = projectWorkflowId proj path
+       in WorkflowId (T.replace "pcell-" ("pcell-" <> pfx) t)
+    -- One landing pass: read each project cell's accepted repair out of the
+    -- prefix's fix journal, run the journaled landing workflow (or report the
+    -- existing record on a re-run), and print the branch log at the end.
+    landRun pfx = do
+      let branch = "campaign/react-fixes"
+      pcs' <- catMaybes <$> mapM readProjectCell projectCellSpecs
+      withCampaignStore $ \store ->
+        forM_ pcs' $ \pc -> do
+          let proj = pcProject pc
+              path = pcPath pc
+          journal <- readJournal store (campaignStreamNameText projectCampaignWorkflowName (projectWorkflowId2 pfx proj path))
+          let accepted = [r | FixAttempt{faRepaired = Just r} <- journaledAttempts (decodedJournal journal)]
+          case accepted of
+            [] -> putStrLn ("  [" <> labelOf pfx <> "] no accepted repair for " <> T.unpack (proj <> ":" <> path) <> " — nothing to land")
+            (repair : _) -> do
+              let wfId = landingWorkflowIdFor pfx (proj, path)
+                  stream = campaignStreamNameText landingWorkflowName wfId
+              existing <- readJournal store stream
+              recd <- case landingRecordOf (decodedJournal existing) of
+                (r : _) -> pure r
+                [] -> do
+                  _ <-
+                    requireEither
+                      =<< runCampaignStore
+                        store
+                        ( runWorkflowWith
+                            defaultWorkflowRunOptions
+                            landingWorkflowName
+                            wfId
+                            (landProjectCellWorkflow pc unusedImportOracle branch repair)
+                        )
+                  journal2 <- readJournal store stream
+                  case landingRecordOf (decodedJournal journal2) of
+                    (r : _) -> pure r
+                    [] -> fail ("landing: no record for " <> T.unpack (proj <> ":" <> path))
+              if lrVerified recd
+                then
+                  putStrLn
+                    ( "  [" <> labelOf pfx <> "] landed " <> T.unpack (lrProject recd <> ":" <> lrPath recd)
+                        <> " — commit " <> T.unpack (lrCommit recd)
+                        <> " on " <> T.unpack (lrBranch recd)
+                    )
+                else do
+                  putStrLn ("  [" <> labelOf pfx <> "] NOT LANDED " <> T.unpack (lrProject recd <> ":" <> lrPath recd) <> " — on-disk verification failed:")
+                  for_ (lrDiagnostics recd) (putStrLn . ("    " <>) . T.unpack)
+      forM_ (nub (map pcProject pcs')) $ \proj -> do
+        logTxt <- gitCapture (campaignWorktreePath proj branch) ["log", "--oneline", T.unpack branch]
+        putStrLn ("  " <> T.unpack proj <> " " <> T.unpack branch <> ":")
+        for_ (T.lines logTxt) (putStrLn . ("    " <>) . T.unpack)
+    labelOf pfx = if "live" `T.isInfixOf` pfx then "react-live" else "react"

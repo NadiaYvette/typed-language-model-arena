@@ -24,6 +24,7 @@ module Campaign.Landing
     landProjectCellWorkflow,
     landingWorkflowName,
     landingWorkflowId,
+    landingWorkflowIdFor,
     landingStreamNameText,
 
     -- * Registry and journal readback
@@ -77,11 +78,13 @@ landProjectCellWorkflow ::
   (Workflow :> es, IOE :> es) =>
   ProjectCell ->
   CellOracle ->
+  -- | the branch to commit on (one campaign concept, one branch)
+  Text ->
   -- | the accepted repair, as read from the fix journal
   Text ->
   Eff es Text
-landProjectCellWorkflow pc oracle repair = do
-  recd <- step (StepName "land-repair") (landAction pc oracle repair)
+landProjectCellWorkflow pc oracle branch repair = do
+  recd <- step (StepName "land-repair") (landAction pc oracle branch repair)
   pure $
     if lrVerified recd
       then "landed: " <> lrCommit recd <> " on " <> lrBranch recd <> " (" <> lrWorktree recd <> ")"
@@ -92,12 +95,12 @@ landAction ::
   ProjectCell ->
   CellOracle ->
   Text ->
+  Text ->
   Eff es LandingRecord
-landAction pc oracle repair = liftIO $ do
+landAction pc oracle branch repair = liftIO $ do
   let proj = pcProject pc
       path = pcPath pc
-      branch = "campaign/unused-imports"
-  wt <- ensureCampaignWorktree proj
+  wt <- ensureCampaignWorktree proj branch
   applyRepairInWorktree wt path repair
   diags <- verifyInWorktree oracle wt path
   if not (null diags)
@@ -135,6 +138,12 @@ landingWorkflowId :: (Text, SourcePath) -> WorkflowId
 landingWorkflowId (proj, path) =
   WorkflowId ("land-" <> proj <> ":" <> path)
 
+-- | A landing id under a fresh-campaign prefix (@"react-"@ and friends), so
+-- a second act's landings journal under their own streams.
+landingWorkflowIdFor :: Text -> (Text, SourcePath) -> WorkflowId
+landingWorkflowIdFor pfx (proj, path) =
+  WorkflowId ("land-" <> pfx <> proj <> ":" <> path)
+
 landingStreamNameText :: (Text, SourcePath) -> Text
 landingStreamNameText spec =
   campaignStreamNameText landingWorkflowName (landingWorkflowId spec)
@@ -153,7 +162,7 @@ registerLanding cellsWithRepairs =
     [ ( landingWorkflowName,
         WorkflowDef $ \wid ->
           case [ (pc, r) | (pc, r) <- cellsWithRepairs, unWorkflowId (landingWorkflowId (pcProject pc, pcPath pc)) == unWorkflowId wid ] of
-            [(pc, repair)] -> landProjectCellWorkflow pc unusedImportOracle repair
+            [(pc, repair)] -> landProjectCellWorkflow pc unusedImportOracle "campaign/unused-imports" repair
             _ -> error ("registerLanding: no cell for workflow " <> show wid)
       )
     ]
