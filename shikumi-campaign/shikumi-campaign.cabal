@@ -34,7 +34,9 @@ common shared
 library
   import: warnings, shared
   exposed-modules:
+    Campaign.Aggregate
     Campaign.Cell
+    Campaign.Fanout
     Campaign.Hands
     Campaign.Landing
     Campaign.Memory
@@ -61,6 +63,8 @@ library
     kiroku-store >=0.8 && <0.9,
     lens >=5.2,
     process >=1.6,
+    shibuya-core >=0.9,
+    shibuya-kiroku-adapter >=0.5,
     shikumi ^>=0.4.0.0,
     shikumi-testing ^>=0.1.0.0,
     shikumi-tools ^>=0.4.0.0,

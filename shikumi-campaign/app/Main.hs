@@ -137,6 +137,7 @@ import Shikumi.Schema.Types (Field (Field, unField), field)
 import Shikumi.Signature (Demo (..), Signature, getInstruction, mkSignature, setDemos, setInstruction)
 
 import Campaign.Cell (Cell (..), CellId (..), FixAttempt (..), corpusCells, cellForId, unCellId)
+import Campaign.Fanout (runCellFanout)
 import Campaign.Hands (campaignBranchFor, campaignWorktreePath, gitCapture, parentDirtyCount)
 import Campaign.Landing
   ( LandingRecord (..),
@@ -187,13 +188,13 @@ import Data.Aeson (FromJSON, ToJSON)
 main :: IO ()
 main = do
   putStrLn "[campaign] verification cells on keiro's durable runtime (shikumi decides, keiro journals, kioku remembers)"
-  -- The demo runs all eleven acts; a filter like ACTS=9 runs one act alone
+  -- The demo runs all thirteen acts; a filter like ACTS=9 runs one act alone
   -- (against whatever journal state the database already has). The fix
   -- session is recorded exactly once per driver run: act 4 records it, act
   -- 5 distills it — or act 5 records it itself when act 4 was filtered out.
   acts <- lookupEnv "ACTS"
   let splitOnComma = T.splitOn "," . T.strip
-      wanted = maybe [1 .. 12] (map (read . T.unpack) . splitOnComma . T.pack) acts
+      wanted = maybe [1 .. 13] (map (read . T.unpack) . splitOnComma . T.pack) acts
       step mSid n
         | n `notElem` wanted = pure mSid
         | otherwise = case n of
@@ -208,8 +209,9 @@ main = do
             9 -> runLiveDecisionAct >> pure mSid
             10 -> runPlannerAct >> pure mSid
             11 -> runLandingAct >> pure mSid
-            _ -> runReactAct >> pure mSid
-  foldM_ step Nothing [1 .. 12 :: Int]
+            12 -> runReactAct >> pure mSid
+            _ -> runFanoutAct >> pure mSid
+  foldM_ step Nothing [1 .. 13 :: Int]
 
 -- ---------------------------------------------------------------------------
 -- Store plumbing (jitsurei's shape; no projection schema — the journal is
@@ -1756,3 +1758,15 @@ runReactAct = do
         putStrLn ("  " <> T.unpack proj <> " " <> T.unpack branch <> ":")
         for_ (T.lines logTxt) (putStrLn . ("    " <>) . T.unpack)
     labelOf pfx = if "live" `T.isInfixOf` pfx then "react-live" else "react"
+
+-- ---------------------------------------------------------------------------
+-- Act 13: the read model — one keiki aggregate, replayed offline and fed
+-- live through a shibuya app over the kiroku adapter. The live and offline
+-- read models must agree, stream by stream; the act fails if they don't.
+runFanoutAct :: IO ()
+runFanoutAct = do
+  connString <- do
+    configured <- lookupEnv "PG_CONNECTION_STRING"
+    pure (maybe "host=/tmp dbname=campaign" T.pack configured)
+  putStrLn "=== act 13: keiki aggregate + shibuya fan-out (live-vs-offline) ==="
+  runCellFanout connString
