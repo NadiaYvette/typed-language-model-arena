@@ -106,7 +106,7 @@ import Kiroku.Store.Types
     StreamName (..),
     StreamVersion (..),
   )
-import System.Directory (createDirectoryIfMissing, listDirectory, removeFile)
+import System.Directory (createDirectoryIfMissing, doesFileExist, listDirectory, removeFile)
 import System.Environment (lookupEnv)
 
 import Campaign.Bootstrap
@@ -150,11 +150,18 @@ import Shikumi.Program (Program)
 import Shikumi.Schema (FromModel, ToSchema, Validatable)
 import Shikumi.Schema.Types (Field (Field, unField), field)
 import Shikumi.Signature (Demo (..), Signature, getInstruction, mkSignature, setDemos, setInstruction)
+import Shikumi.Coder.Pipeline (ProposeIn (..))
+import Shikumi.Coder.Task (PatchPlan (..), applyPlan)
 
 import Campaign.Aggregate (CellSummary (..), CellVertex (..), cellSummaryOf, replayCellJournal)
 import Campaign.Cell (Cell (..), CellId (..), FixAttempt (..), corpusCells, cellForId, unCellId)
 import Campaign.Fanout (runCellFanout)
-import Campaign.Hands (campaignBranchFor, campaignWorktreePath, gitCapture, parentDirtyCount)
+import Campaign.Hands  ( campaignBranchFor,
+    campaignWorktreePath,
+    ensureCampaignWorktree,
+    gitCapture,
+    parentDirtyCount
+  )
 import Campaign.Landing
   ( LandingRecord (..),
     landProjectCellWorkflow,
@@ -192,6 +199,27 @@ import Campaign.Matrix
     matrixWorkflowIdTagged,
     matrixWorkflowName,
   )
+import Campaign.Mercury
+  ( MercuryAttempt (..),
+    MercuryCell (..),
+    MercuryFact (..),
+    mercuryAttemptsOf,
+    mercuryBranchFor,
+    mercuryCellFor,
+    mercuryCellSpecs,
+    mercuryCellWorkflow,
+    mercuryCellKeyFromWf,
+    mercuryOptionsPath,
+    mercuryPrivCount,
+    mercuryRegistry,
+    mercuryScriptedEngine,
+    mercuryWorkflowIdTagged,
+    mercuryWorkflowName,
+    OracleVerdict (..),
+    oracleDumpProbe,
+    oracleFactProbe,
+    readMercuryFacts,
+  )
 import Baikai (Context (..), Message (..), Response, TextContent (..), UserContent (..))
 import Baikai.Message (UserPayload (UserPayload))
 import Campaign.Oracle (CellOracle (..), ProjectCell (..), diagLineOf, markerOracle, projectCellSpecs, readProjectCell, unusedImportOracle)
@@ -227,7 +255,7 @@ main = do
   -- 5 distills it — or act 5 records it itself when act 4 was filtered out.
   acts <- lookupEnv "ACTS"
   let splitOnComma = T.splitOn "," . T.strip
-      wanted = maybe [1 .. 17] (map (read . T.unpack) . splitOnComma . T.pack) acts
+      wanted = maybe [1 .. 18] (map (read . T.unpack) . splitOnComma . T.pack) acts
       step mSid n
         | n `notElem` wanted = pure mSid
         | otherwise = case n of
@@ -247,8 +275,10 @@ main = do
             14 -> runScratchAct >> pure mSid
             15 -> runInfraMemoryAct >> pure mSid
             16 -> runMatrixAct >> pure mSid
-            _ -> runCrossPlanAct >> pure mSid
-  foldM_ step Nothing [1 .. 17 :: Int]
+            17 -> runCrossPlanAct >> pure mSid
+            18 -> runMercuryAct >> pure mSid
+            n -> fail ("unknown act: " <> show n)
+  foldM_ step Nothing [1 .. 18 :: Int]
 
 -- ---------------------------------------------------------------------------
 -- Store plumbing (jitsurei's shape; no projection schema — the journal is
@@ -2471,3 +2501,258 @@ portfolioStateText rows matrixHealthy =
     (moDone, moOpen) = splitDone (projectLabel "mowgli")
     (peDone, peOpen) = splitDone (projectLabel "peirce")
     splitDone rs = partition ((\v -> v == "cleared" || v == "escalated") . prVertex) rs
+
+
+-- ===========================================================================
+-- Act 18: the Mercury promotion campaign — the codegen pipeline on a real
+-- compiler change
+-- ===========================================================================
+
+-- | Act 18 points the analyze → propose → guard → test → land pipeline at a
+-- real, finished change in a real codebase: promoting Mercury's private
+-- @--dump-mlds@ option family to public, so IR dumps are selectable by CLI
+-- options (the project goal) instead of demanding a special compiler build.
+--
+-- The replayable-campaign property: every stage is journaled data. The
+-- analyze stage reads the real options.m (facts, not guesses); the propose
+-- stage runs the coder's real patch program through the stub LM (a live
+-- model is the same call — swap the engine); the guard is the exact-once
+-- PatchPlan application; the test stage is the compiler oracle (the fact
+-- probe plus the grade-pinned MLDS dump probe against the installed mmc);
+-- the landing is a real commit on the cell's own worktree/branch — one per
+-- run, so every run replays the whole drama reviewably.
+--
+-- Acts, one per pipeline stage:
+--
+--   1. @analyze@ — extract the facts from the real options.m (offline, no
+--      model), print the cell roster.
+--   2. @oracle probes@ — the dump probe (the installed mmc, hlc.gc) must
+--      pass, and the fact probe against the pristine tree must FAIL: the
+--      oracle detects the defect it exists to catch.
+--   3. @campaign@ — the three promotion cells, one per option: propose →
+--      guard → apply → probe → land. Cell 1 proposes a stale edit first (a
+--      typed guard rejection), then recovers via the informed retry.
+--   4. @scoreboard@ — every cell's journaled attempts and the landed
+--      commits, with the parent checkout proven untouched.
+--   5. @memory@ — the promotion recipe recorded as infra evidence, the
+--      promoted lessons, planner-shaped recall.
+runMercuryAct :: IO ()
+runMercuryAct = do
+  putStrLn "\n=== act 18: the Mercury promotion — the codegen pipeline on a real compiler change ==="
+
+  -- The campaign works on per-run worktrees off the campaign clone
+  -- (/home/nyc/src/mercury-campaign — the clean checkout with the dump
+  -- family still private).
+  runTag <- T.pack . show . floor . utcTimeToPOSIXSeconds <$> getCurrentTime
+  sink <- newIORef []
+  let campaignTree = "/home/nyc/src/mercury-campaign"
+      publishHumanQuery :: AwakeableId -> Eff CampaignEffects ()
+      publishHumanQuery aid = do
+        inserted <-
+          liftIO $
+            atomicModifyIORef' sink $ \published ->
+              if aid `elem` published
+                then (published, False)
+                else (published <> [aid], True)
+        when inserted $
+          liftIO $ putStrLn ("  published human-query awakeable id: " <> T.unpack (awakeableIdText aid))
+      streamOf opt = campaignStreamNameText mercuryWorkflowName (mercuryWorkflowIdTagged opt runTag)
+
+      -- The GOOD responder builds the marker sections from the TYPED
+      -- ProposeIn the engine call carries: the fact's line verbatim
+      -- (first-line indentation stripped — the wire strips section edge
+      -- whitespace and the applier re-indents), constructor swapped. That
+      -- is exactly what a good model emits.
+      factOldLine :: ProposeIn -> Text
+      factOldLine pin = snd (T.breakOnEnd ": " (head (T.lines (unField (piFact pin)))))
+      swapCtor :: Text -> Text
+      swapCtor = T.replace "priv_alt_arg_help" "alt_arg_help" . T.replace "priv_arg_help" "arg_help"
+      goodPlan :: ProposeIn -> Response
+      goodPlan pin =
+        markerResponse
+          [ ("ppOld", T.stripStart (factOldLine pin)),
+            ("ppNew", T.stripStart (swapCtor (factOldLine pin))),
+            ("ppWhy", "the private constructor hides the option from --help and the manual; the public one is the established registration for user-visible options"),
+            ("ppNote", "Promotes the option to a public, documented registration.")
+          ]
+      -- The STALE responder: a real model's honest mistake — it misremembers
+      -- which private constructor the line uses, so the old block matches
+      -- nothing and the exact-once guard rejects it, typed.
+      stalePlan :: ProposeIn -> Response
+      stalePlan pin =
+        markerResponse
+          [ ("ppOld", T.stripStart (T.replace "priv_alt_arg_help" "priv_arg_help" (factOldLine pin))),
+            ("ppNew", T.stripStart (T.replace "priv_alt_arg_help" "alt_arg_help" (factOldLine pin))),
+            ("ppWhy", "same edit from a stale memory of the constructor's name"),
+            ("ppNote", "A stale first attempt.")
+          ]
+      -- The script: attempt 1 of the dump-mlds cell proposes the stale
+      -- constructor (the informed retry's raw material); every other
+      -- attempt is correct.
+      scriptFor :: Text -> Int -> ProposeIn -> [Text] -> Maybe Response
+      scriptFor "dump-mlds" 1 pin _notes = Just (stalePlan pin)
+      scriptFor _ _n pin _notes = Just (goodPlan pin)
+
+  -- ------------------------------------------------------------------ (1)
+  putStrLn "[mercury] analyze — facts from the real options.m (no model in sight)"
+  optsExists <- doesFileExist (mercuryOptionsPath campaignTree)
+  unless optsExists $ fail ("act 18: the campaign clone is missing at " <> campaignTree)
+  facts <- readMercuryFacts campaignTree
+  for_ facts $ \f ->
+    putStrLn
+      ( "  fact: --" <> T.unpack (mfOption f) <> " at options.m:" <> show (mfLineNo f)
+          <> " (" <> T.unpack (mfConstructor f) <> " -> " <> T.unpack (mfPublicConstructor f) <> ")"
+      )
+  when (null facts) $ putStrLn "  (the family is already promoted — nothing to do)"
+  priv0 <- mercuryPrivCount campaignTree
+  putStrLn ("  private registrations in the tree: " <> show priv0)
+
+  -- The per-run cells: one worktree + branch per (option, run).
+  cells <- mercuryCellSpecs campaignTree runTag
+  for_ cells $ \c ->
+    putStrLn ("  cell: --" <> T.unpack (mcOption c) <> " on branch " <> T.unpack (mcBranch c))
+
+  -- ------------------------------------------------------------------ (2)
+  putStrLn "[mercury] oracle — the dump probe (installed mmc, MLDS grade hlc.gc)"
+  dumpV0 <- oracleDumpProbe ("pristine-" <> runTag)
+  putStrLn ("  dump probe: " <> (if ovOk dumpV0 then "ok — " else "FAILED — ") <> T.unpack (ovDetail dumpV0))
+  unless (ovOk dumpV0) $ fail "act 18: the dump oracle must pass on the installed compiler"
+  putStrLn "[mercury] oracle — the fact probe must FAIL on the pristine tree"
+  case cells of
+    [] -> putStrLn "  (no cells — skipping the negative control)"
+    (c0 : _) -> do
+      _ <- ensureCampaignWorktree "mercury" (mcBranch c0)
+      negV <- oracleFactProbe (mcWorktree c0) (mcFact c0)
+      putStrLn
+        ( "  fact probe on pristine tree: "
+            <> (if ovOk negV then "UNEXPECTEDLY ok" else "correctly rejects")
+            <> " — " <> T.unpack (ovDetail negV)
+        )
+      when (ovOk negV) $ fail "act 18: the fact probe accepted the pristine tree — the oracle is broken"
+
+  -- ------------------------------------------------------------------ (3)
+  putStrLn "[mercury] campaign — the promotion cells (propose → guard → test → land)"
+  for_ cells $ \cell -> do
+    let engine = mercuryScriptedEngine (scriptFor (mcOption cell))
+        wid = mercuryWorkflowIdTagged (mcOption cell) runTag
+    withCampaignStore $ \store -> do
+      requireFreshJournal store (streamOf (mcOption cell))
+      outcome <-
+        requireEither
+          =<< runCampaignStore
+            store
+            (runWorkflowWith defaultWorkflowRunOptions mercuryWorkflowName wid (mercuryCellWorkflow engine (raise . publishHumanQuery) cell (projectNamespace "mercury") 3))
+      putStrLn ("  launch --" <> T.unpack (mcOption cell) <> ": " <> show outcome)
+
+  -- The driver loop: cells retry on their own durable cool-downs. The
+  -- second cool-down exists only where a cell actually reaches attempt 2 —
+  -- the dump-mlds cell (its attempt 1 is the stale rejection); demanding a
+  -- timer a cell never arms spins the sweep forever (act 16's lesson).
+  let registry = mercuryRegistry (mercuryScriptedEngine (\_n pin _notes -> Just (goodPlan pin))) publishHumanQuery
+      retryingOpts = ["dump-mlds" | any ((== "dump-mlds") . mcOption) cells]
+  withCampaignStore $ \store -> do
+    for_ (map mcOption cells) $ \opt ->
+      fireTimerSweep store registry [(streamOf opt, "sleep:cool-down-1")]
+    for_ retryingOpts $ \opt ->
+      fireTimerSweep store registry [(streamOf opt, "sleep:cool-down-2")]
+    driveResumeOnce store registry
+    driveResumeOnce store registry
+    published <- readIORef sink
+    for_ published $ \aid -> do
+      _ <- requireEither =<< runCampaignStore store (signalAwakeable aid VerdictApproved)
+      pure ()
+    driveResumeOnce store registry
+    driveResumeOnce store registry
+
+  -- ------------------------------------------------------------------ (4)
+  putStrLn "[mercury] scoreboard — journaled attempts and the landed state"
+  for_ cells $ \cell -> do
+    let opt = mcOption cell
+    withCampaignStore $ \store -> do
+      journal <- readJournal store (streamOf opt)
+      let attempts = mercuryAttemptsOf (decodedJournal journal)
+      putStrLn ("  --" <> T.unpack opt <> ":")
+      for_ attempts $ \ma ->
+        putStrLn
+          ( "    attempt " <> show (meAttempt ma) <> ": " <> T.unpack (meVerdict ma)
+              <> (if T.null (meOld ma) then "" else "  [old: " <> T.unpack (T.take 46 (T.strip (meOld ma))) <> "…]")
+          )
+      remaining <- ourUnfinished store [wfIdText (mercuryWorkflowIdTagged opt runTag)]
+      unless (null remaining) $ fail ("mercury: unfinished cell remains: " <> show remaining)
+
+  -- The landings: real commits, one per cell, on per-run branches — and
+  -- the parent tree untouched.
+  putStrLn "[mercury] landings:"
+  for_ cells $ \cell -> do
+    _ <- ensureCampaignWorktree "mercury" (mcBranch cell)
+    commit <- gitCapture (mcWorktree cell) ["rev-parse", "--short", "HEAD"]
+    stat <- gitCapture (mcWorktree cell) ["show", "--stat", "--oneline", "HEAD"]
+    let statLine = case drop 1 (T.lines stat) of
+          (l : _) -> T.strip l
+          [] -> "(no stat)"
+    putStrLn ("  " <> T.unpack (mcBranch cell) <> " @ " <> T.unpack commit <> " — " <> T.unpack statLine)
+  parentDirty <- parentDirtyCount "mercury"
+  putStrLn ("  parent checkout dirty entries after the campaign: " <> show parentDirty)
+
+  -- ------------------------------------------------------------------ (5)
+  putStrLn "[mercury] memory — the promotion recipe enters the campaign's own memory"
+  withCampaignStore $ \store -> do
+    sid <- runKiokuWrite store (startInfraSession "mercury promotion campaign recipe")
+    for_ (zip [1 ..] mercuryEvidence) $ \(idx, (topic, body)) -> do
+      _ <- runKiokuWrite store (recordFixTurn sid idx "assistant" ("[" <> topic <> "] " <> body))
+      pure ()
+    _ <- runKiokuWrite store (completeFixSession sid "the promotion pipeline is replayable: facts in, guarded edits, a compiler oracle, landings as commits")
+    putStrLn ("  infra session recorded (" <> show (length mercuryEvidence) <> " evidence turns)")
+    withLoadedAIRuntime $ \air -> do
+      let distillRT =
+            withTestRunners
+              (newDistillRuntime air Nothing)
+              ( \tr ->
+                  tr
+                    { runExtract = campaignExtractRunner air,
+                      runConsolidate = campaignConsolidateRunner air
+                    }
+              )
+      result <-
+        runCampaignStore store $
+          distillSessionL1
+            campaignAccessContext
+            IgnoreWatermark
+            distillRT
+            (scopedScanCandidates 8)
+            sid
+      case result of
+        Left err -> putStrLn ("  [warn] store error during L1 distillation (continuing): " <> show err)
+        Right inner -> case inner of
+          Left err -> putStrLn ("  [warn] L1 distillation unavailable (continuing): " <> show err)
+          Right L1SkippedUpToDate -> putStrLn "  distiller: session already up to date"
+          Right (L1Distilled summary) ->
+            putStrLn
+              ( "  distilled: " <> show summary.extracted <> " candidate(s) extracted, "
+                  <> show summary.stored <> " stored"
+              )
+    for_
+      [ "mercury promotion = one cell per private option: propose ONE verbatim-line edit,"
+          <> " exact-once guard, then the two-probe oracle (fact probe: private gone, public in,"
+          <> " priv-count -1; dump probe: mmc --grade hlc.gc --dump-mlds 99 emits .c_dump.099-final)"
+      ,
+        "mercury cells land on per-run branches (campaign/mercury-<option>-<tag>) so every"
+          <> " campaign run replays reviewably; the parent checkout is never touched"
+      ]
+      $ \advice -> do
+        _ <- runKiokuWrite store (recordGlobalLesson (projectNamespace "mercury") advice)
+        pure ()
+    for_ ["dump-mlds", "promotion"] $ \kw -> do
+      hits <- runCampaignStore store (recallNotesForKeyword (projectNamespace "mercury") kw)
+      putStrLn ("  recall for \"" <> T.unpack kw <> "\": " <> show (length hits) <> " hit(s)")
+
+  putStrLn "[mercury] done — facts in, guarded edits, a compiler oracle, real commits"
+  where
+    -- The infra evidence, straight from what this act earned.
+    mercuryEvidence =
+      [ ("oracle", "the promotion oracle is two probes: the fact probe (private registration gone, expected public line verbatim, private-registration count fallen by exactly one vs the branch point) and the dump probe (mmc --grade hlc.gc --dump-mlds 99 on a probe module emits hello.c_dump.099-final)"),
+        ("grades", "MLDS dumps exist only in MLDS grades that target C (hlc.gc); the default asm_fast grade silently produces no dump, so the oracle pins the grade"),
+        ("worktrees", "each cell works in its own worktree on its own per-run branch off the clean campaign clone at /home/nyc/src/mercury-campaign; the parent checkout is never touched"),
+        ("engine", "propose is the coder patch program (PatchPlan: one exact-match replacement); guard failures and no-decode replies are typed rejections that feed the informed retry"),
+        ("guard", "the no-regression denominator is the options.m private-registration count (368 in the campaign clone); promoting one option must lower it by exactly one")
+      ]

@@ -73,7 +73,7 @@ import Kioku.Api.Scope
     scopeNamespaceText,
   )
 import Kioku.Api.Types (Confidence (..), MemoryRecord (..), MemoryType (..))
-import Kioku.Id (SessionId, genMemoryId, genSessionId)
+import Kioku.Id (SessionId, genMemoryId, genSessionId, idText)
 import Kioku.Memory (MemoryWriteError, recordWithContext)
 import Kioku.Memory.Domain (RecordMemoryData (..))
 import Kioku.Recall (getActiveInNamespace)
@@ -288,7 +288,10 @@ recordFixTurn sid idx role content = do
       { sessionId = sid,
         memorySpaceId = campaignMemorySpace,
         actorPrincipal = memoryContextRecordedActor ctx,
-        turnId = "turn-" <> T.pack (show idx),
+        -- kioku_turns.turn_id is a GLOBAL primary key, so the id must be
+        -- unique across every session the store has ever recorded — derive
+        -- it from the session id, not the turn index alone.
+        turnId = "turn-" <> idText sid <> "-" <> T.pack (show idx),
         turnIndex = idx,
         role = role,
         content = content,

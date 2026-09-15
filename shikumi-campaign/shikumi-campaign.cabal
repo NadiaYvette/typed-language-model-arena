@@ -42,6 +42,7 @@ library
     Campaign.Landing
     Campaign.Memory
     Campaign.Matrix
+    Campaign.Mercury
     Campaign.Oracle
     Campaign.ReactFixer
     Campaign.Workflow
@@ -70,6 +71,7 @@ library
     shibuya-core >=0.9,
     shibuya-kiroku-adapter >=0.5,
     shikumi ^>=0.4.0.0,
+    shikumi-coder,
     shikumi-testing ^>=0.1.0.0,
     shikumi-tools ^>=0.4.0.0,
     text >=2.1,
@@ -109,6 +111,7 @@ executable campaign-demo
     lens >=5.2,
     shikumi-campaign,
     shikumi ^>=0.4.0.0,
+    shikumi-coder,
     shikumi-testing ^>=0.1.0.0,
     shikumi-tools ^>=0.4.0.0,
     text >=2.1,
