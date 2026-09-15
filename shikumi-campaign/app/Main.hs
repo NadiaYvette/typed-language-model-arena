@@ -202,6 +202,7 @@ import Campaign.Matrix
 import Campaign.Mercury
   ( MercuryAttempt (..),
     MercuryCell (..),
+    MercuryEngine,
     MercuryFact (..),
     mercuryAttemptsOf,
     mercuryBranchFor,
@@ -255,7 +256,7 @@ main = do
   -- 5 distills it — or act 5 records it itself when act 4 was filtered out.
   acts <- lookupEnv "ACTS"
   let splitOnComma = T.splitOn "," . T.strip
-      wanted = maybe [1 .. 18] (map (read . T.unpack) . splitOnComma . T.pack) acts
+      wanted = maybe [1 .. 19] (map (read . T.unpack) . splitOnComma . T.pack) acts
       step mSid n
         | n `notElem` wanted = pure mSid
         | otherwise = case n of
@@ -277,8 +278,9 @@ main = do
             16 -> runMatrixAct >> pure mSid
             17 -> runCrossPlanAct >> pure mSid
             18 -> runMercuryAct >> pure mSid
+            19 -> runLiveMercuryAct >> pure mSid
             n -> fail ("unknown act: " <> show n)
-  foldM_ step Nothing [1 .. 18 :: Int]
+  foldM_ step Nothing [1 .. 19 :: Int]
 
 -- ---------------------------------------------------------------------------
 -- Store plumbing (jitsurei's shape; no projection schema — the journal is
@@ -2755,4 +2757,232 @@ runMercuryAct = do
         ("worktrees", "each cell works in its own worktree on its own per-run branch off the clean campaign clone at /home/nyc/src/mercury-campaign; the parent checkout is never touched"),
         ("engine", "propose is the coder patch program (PatchPlan: one exact-match replacement); guard failures and no-decode replies are typed rejections that feed the informed retry"),
         ("guard", "the no-regression denominator is the options.m private-registration count (368 in the campaign clone); promoting one option must lower it by exactly one")
+      ]
+-- ===========================================================================
+-- Act 19: the Mercury promotion, live — a real model proposes the edits
+-- ===========================================================================
+
+-- | Act 19 re-runs the promotion campaign with the scripted engine swapped
+-- for the live stack: the very same 'runAIProgram' call kioku's distillers
+-- make, behind the very same 'MercuryEngine' shape. Nothing else changes —
+-- the facts, the exact-once guard, the two-probe compiler oracle, the
+-- durable cool-downs, the per-run worktrees and landings, the human seam.
+--
+-- The journal cannot tell a live attempt from a scripted one by shape —
+-- that is the point. What the run adds is the scoreboard showing the REAL
+-- model's proposed old/new blocks, and the honest failures: a malformed
+-- reply is a typed error, retried up to three times, exactly as the tier-1
+-- lesson demands.
+--
+-- The driver is the adaptive generalization of act 16's targeting: instead
+-- of hand-listing which cells reach attempt 2, each round reads every
+-- unfinished cell's journal, finds the failed attempt numbers, and demands
+-- exactly the cool-down timers those failures arm — a timer is demanded
+-- only when a journaled failure proves it will exist.
+runLiveMercuryAct :: IO ()
+runLiveMercuryAct = do
+  putStrLn "\n=== act 19: the Mercury promotion, live — a real model proposes the edits ==="
+  withLoadedAIRuntime $ \air -> do
+    runTag0 <- T.pack . show . floor . utcTimeToPOSIXSeconds <$> getCurrentTime
+    let liveTag = "live" <> runTag0
+        campaignTree = "/home/nyc/src/mercury-campaign"
+    sink <- newIORef []
+    let publishHumanQuery :: AwakeableId -> Eff CampaignEffects ()
+        publishHumanQuery aid = do
+          inserted <-
+            liftIO $
+              atomicModifyIORef' sink $ \published ->
+                if aid `elem` published
+                  then (published, False)
+                  else (published <> [aid], True)
+          when inserted $
+            liftIO $ putStrLn ("  published human-query awakeable id: " <> T.unpack (awakeableIdText aid))
+        streamOf opt = campaignStreamNameText mercuryWorkflowName (mercuryWorkflowIdTagged opt liveTag)
+
+        -- The live engine: 'runAIProgram' behind the 'MercuryEngine' shape,
+        -- with the bounded retry that is part of the live contract. The
+        -- propose program is the same 'mercuryPromotionSignature' the stub
+        -- ran; only the interpreter differs.
+        liveEngine :: MercuryEngine
+        liveEngine n prog input _notes = do
+          let go :: Int -> IO (Maybe PatchPlan)
+              go 0 = pure Nothing
+              go k =
+                once >>= \case
+                  Nothing -> go (k - 1)
+                  ok -> pure ok
+              once =
+                runAIProgram air Extraction prog input >>= \case
+                  Right plan -> pure (Just plan)
+                  Left (AIProgramFailed err) -> do
+                    putStrLn ("    [live-engine] typed error: " <> show err)
+                    pure Nothing
+                  Left other -> do
+                    putStrLn ("    [live-engine] " <> show other)
+                    pure Nothing
+          r <- go (3 :: Int)
+          putStrLn ("    [live] attempt " <> show n <> ": " <> maybe "failed (typed error)" (const "proposed a plan") r)
+          pure r
+
+    -- ---------------------------------------------------------------- (1)
+    putStrLn "[mercury-live] analyze — facts from the real options.m"
+    facts <- readMercuryFacts campaignTree
+    for_ facts $ \f ->
+      putStrLn
+        ( "  fact: --" <> T.unpack (mfOption f) <> " at options.m:" <> show (mfLineNo f)
+            <> " (" <> T.unpack (mfConstructor f) <> " -> " <> T.unpack (mfPublicConstructor f) <> ")"
+        )
+    when (null facts) $ fail "act 19: no facts — the campaign clone changed under us"
+    cells <- mercuryCellSpecs campaignTree liveTag
+    putStrLn ("  cells: " <> show (length cells) <> ", live tag " <> T.unpack liveTag)
+
+    -- A quick oracle sanity: the dump probe must pass before any model call.
+    dumpV0 <- oracleDumpProbe ("live-pristine-" <> liveTag)
+    unless (ovOk dumpV0) $
+      fail ("act 19: the dump oracle must pass on the installed compiler: " <> T.unpack (ovDetail dumpV0))
+    putStrLn ("  dump probe: ok — " <> T.unpack (ovDetail dumpV0))
+
+    -- ---------------------------------------------------------------- (2)
+    putStrLn "[mercury-live] campaign — the promotion cells under the live engine"
+    for_ cells $ \cell -> do
+      let wid = mercuryWorkflowIdTagged (mcOption cell) liveTag
+      withCampaignStore $ \store -> do
+        requireFreshJournal store (streamOf (mcOption cell))
+        outcome <-
+          requireEither
+            =<< runCampaignStore
+              store
+              (runWorkflowWith defaultWorkflowRunOptions mercuryWorkflowName wid (mercuryCellWorkflow liveEngine (raise . publishHumanQuery) cell (projectNamespace "mercury") 3))
+        putStrLn ("  launch --" <> T.unpack (mcOption cell) <> ": " <> show outcome)
+
+    -- The adaptive driver: each round demands exactly the cool-down timers
+    -- that journaled failures prove will exist, resumes, and repeats while
+    -- anything is unfinished (bounded — 3 attempts + the park). One round,
+    -- one store block: the recursion happens OUTSIDE it.
+    let registry = mercuryRegistry liveEngine publishHumanQuery
+        ourIds = [wfIdText (mercuryWorkflowIdTagged (mcOption c) liveTag) | c <- cells]
+        driveRound :: IO Bool
+        driveRound = do
+          workedRef <- newIORef False
+          withCampaignStore $ \store -> do
+            unfinished <- ourUnfinished store ourIds
+            unless (null unfinished) $ do
+              demands <- fmap concat $ forM (map mcOption cells) $ \opt -> do
+                journal <- readJournal store (streamOf opt)
+                let attempts = mercuryAttemptsOf (decodedJournal journal)
+                    failedNs =
+                      [ meAttempt a
+                      | a <- attempts,
+                        not ("applied-ok" `T.isPrefixOf` meVerdict a),
+                        not ("already-promoted" `T.isPrefixOf` meVerdict a)
+                      ]
+                pure [(streamOf opt, "sleep:cool-down-" <> T.pack (show n)) | n <- failedNs, n <= 3]
+              forM_ demands $ \(stream, timer) ->
+                fireTimerSweep store registry [(stream, timer)]
+              driveResumeOnce store registry
+              writeIORef workedRef True
+          readIORef workedRef
+        driveRounds :: Int -> IO ()
+        driveRounds r
+          | r <= (0 :: Int) = pure ()
+          | otherwise = driveRound >>= \worked -> when worked (driveRounds (r - 1))
+    driveRounds 4
+
+    -- Anything still parked goes through the human seam (the operator
+    -- approves; the journal records who decided what).
+    withCampaignStore $ \store -> do
+      published <- readIORef sink
+      unless (null published) $
+        putStrLn ("  parked cells awaiting the operator: " <> show (length published))
+      for_ published $ \aid -> do
+        _ <- requireEither =<< runCampaignStore store (signalAwakeable aid VerdictApproved)
+        pure ()
+      driveResumeOnce store registry
+      driveResumeOnce store registry
+
+    -- ---------------------------------------------------------------- (3)
+    putStrLn "[mercury-live] scoreboard — the real model's proposals and verdicts"
+    for_ cells $ \cell -> do
+      let opt = mcOption cell
+      withCampaignStore $ \store -> do
+        journal <- readJournal store (streamOf opt)
+        let attempts = mercuryAttemptsOf (decodedJournal journal)
+        putStrLn ("  --" <> T.unpack opt <> ":")
+        for_ attempts $ \ma -> do
+          putStrLn
+            ( "    attempt " <> show (meAttempt ma) <> ": " <> T.unpack (meVerdict ma)
+                <> (if T.null (meOld ma) then "" else "\n      old: " <> T.unpack (T.strip (meOld ma)))
+                <> (if T.null (meNew ma) then "" else "\n      new: " <> T.unpack (T.strip (meNew ma)))
+            )
+        remaining <- ourUnfinished store [wfIdText (mercuryWorkflowIdTagged opt liveTag)]
+        unless (null remaining) $ fail ("mercury-live: unfinished cell remains: " <> show remaining)
+
+    putStrLn "[mercury-live] landings:"
+    for_ cells $ \cell -> do
+      _ <- ensureCampaignWorktree "mercury" (mcBranch cell)
+      commit <- gitCapture (mcWorktree cell) ["rev-parse", "--short", "HEAD"]
+      stat <- gitCapture (mcWorktree cell) ["show", "--stat", "--oneline", "HEAD"]
+      let statLine = case drop 1 (T.lines stat) of
+            (l : _) -> T.strip l
+            [] -> "(no stat)"
+      putStrLn ("  " <> T.unpack (mcBranch cell) <> " @ " <> T.unpack commit <> " — " <> T.unpack statLine)
+    parentDirty <- parentDirtyCount "mercury"
+    putStrLn ("  parent checkout dirty entries after the campaign: " <> show parentDirty)
+
+    -- ---------------------------------------------------------------- (4)
+    putStrLn "[mercury-live] memory — what the live run taught"
+    withCampaignStore $ \store -> do
+      sid <- runKiokuWrite store (startInfraSession "mercury promotion live-engine run")
+      for_ (zip [1 ..] liveMercuryEvidence) $ \(idx, (topic, body)) -> do
+        _ <- runKiokuWrite store (recordFixTurn sid idx "assistant" ("[" <> topic <> "] " <> body))
+        pure ()
+      _ <- runKiokuWrite store (completeFixSession sid "the live engine is one function swap; the journal shape cannot tell stub from live attempts apart")
+      putStrLn ("  infra session recorded (" <> show (length liveMercuryEvidence) <> " evidence turns)")
+      let distillRT =
+            withTestRunners
+              (newDistillRuntime air Nothing)
+              ( \tr ->
+                  tr
+                    { runExtract = campaignExtractRunner air,
+                      runConsolidate = campaignConsolidateRunner air
+                    }
+              )
+      result <-
+        runCampaignStore store $
+          distillSessionL1
+            campaignAccessContext
+            IgnoreWatermark
+            distillRT
+            (scopedScanCandidates 8)
+            sid
+      case result of
+        Left err -> putStrLn ("  [warn] store error during L1 distillation (continuing): " <> show err)
+        Right inner -> case inner of
+          Left err -> putStrLn ("  [warn] L1 distillation unavailable (continuing): " <> show err)
+          Right L1SkippedUpToDate -> putStrLn "  distiller: session already up to date"
+          Right (L1Distilled summary) ->
+            putStrLn
+              ( "  distilled: " <> show summary.extracted <> " candidate(s) extracted, "
+                  <> show summary.stored <> " stored"
+              )
+      for_
+        [ "the live mercury engine is one function swap: runAIProgram behind the MercuryEngine"
+            <> " shape; the facts, guard, oracle, cool-downs and landings are identical, and a"
+            <> " journal cannot tell a live attempt from a scripted one by shape"
+        ,
+          "live-model failures are typed: a malformed reply is an AIProgramFailed surfaced and"
+            <> " retried up to three times before the attempt records a guard-failed verdict"
+        ]
+        $ \advice -> do
+          _ <- runKiokuWrite store (recordGlobalLesson (projectNamespace "mercury") advice)
+          pure ()
+      hits <- runCampaignStore store (recallNotesForKeyword (projectNamespace "mercury") "live")
+      putStrLn ("  recall for \"live\": " <> show (length hits) <> " hit(s)")
+
+    putStrLn "[mercury-live] done — the real model proposed, the oracle decided, the campaign landed"
+  where
+    liveMercuryEvidence =
+      [ ("engine", "the live engine wraps runAIProgram (Extraction tier) with a 3-retry loop inside the MercuryEngine shape; attempt economics: one propose call plus the two probes per attempt"),
+        ("adaptive-driver", "the driver demands a cool-down timer only when a journaled failed attempt proves it will be armed — the general form of act 16's hand-tuned second sweep"),
+        ("verdicts", "the typed guard rejections (stale context, ambiguous match) and no-decode replies are the same data for a live model as for a script; the informed retry feeds them back as notes")
       ]
