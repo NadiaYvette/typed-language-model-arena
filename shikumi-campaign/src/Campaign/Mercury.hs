@@ -69,9 +69,28 @@ module Campaign.Mercury
     MercuryAttempt (..),
     mercuryAttemptsOf,
     mercuryCoolDown,
+    -- * The help-check cell (the paced compiler build)
+    HelpCheckCell (..),
+    mercuryPromotionBranches,
+    mercuryIntegrationTag,
+    integrationBranchName,
+    helpCheckBranchFor,
+    helpCheckCellFor,
+    mercuryHelpCheckWorkflow,
+    installedHelpCheckProbe,
+    helpCheckWorkflowName,
+    helpCheckWorkflowIdTagged,
+    helpCheckCellKeyFromWf,
+    helpCheckRegistry,
+    HelpStageVerdict (..),
+    HelpCheckVerdict (..),
+    mercuryBootstrapStages,
+    helpCheckProbe,
   )
 where
 
+import Control.Exception (catch, SomeException, try)
+import Control.Monad (forM, forM_, unless, void, when)
 import Data.Aeson (FromJSON, ToJSON)
 import Data.Aeson qualified as Aeson
 import Data.Function ((&))
@@ -85,7 +104,7 @@ import Data.Text.Lazy.Encoding qualified as TLE
 import Data.Time.Clock (NominalDiffTime)
 import Effectful (Eff, IOE, liftIO, raise, (:>))
 import GHC.Generics (Generic)
-import System.Directory (createDirectoryIfMissing, doesFileExist, findExecutable)
+import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesFileExist, findExecutable, listDirectory)
 import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
 import System.Process.Typed (proc, readProcess, setWorkingDir)
@@ -685,3 +704,506 @@ placeholderFact opt =
       mfLine = "",
       mfPublicLine = ""
     }
+-- ---------------------------------------------------------------------------
+-- The help-check cell: the paced compiler build
+-- ---------------------------------------------------------------------------
+--
+-- The third oracle probe, deliberately deferred from the first Mercury rung:
+-- @mercury_compile --help@ shows the promoted options only in a compiler
+-- BUILT from a promoted tree. That is an hours-long, resumable, paced
+-- process — the matrix rung's slow-cell pattern applied to a compiler
+-- bootstrap:
+--
+--   * one integration worktree per run tag, in which every promotion landing
+--     found in the parent repo is merged, so ONE compiler build carries every
+--     promotion (the parent checkout's own working tree is never touched),
+--   * one help-check worktree per tag, branched from the integration branch,
+--     shared by all three cells of the tag (three @--help@ assertions, one
+--     build),
+--   * configure and the canonical mmake stages (util → runtime → library →
+--     mdbcomp → browser → ssdb → compiler), each stage probed under a
+--     wall-clock timeout one round at a time: @completed@ advances,
+--     @still-running@ (timeout 124/143) suspends on a durable timer and the
+--     next round re-probes — mmake is idempotent, so no work is ever lost.
+--     The keiro determinism rule shapes the loop: a recorded step never
+--     re-executes, so every probe round gets its OWN step name
+--     (@bootstrap-<n>-<stage>-r<k>@); a resume pass replays the recorded
+--     rounds cheaply, executes exactly one new bounded probe, and suspends.
+--   * @failed@ parks on the shared human seam,
+--   * after the compiler stage, the artifact probe: the fresh binary's
+--     @--help@ must mention each promoted option. The negative control is
+--     real — the installed compiler shows zero.
+--
+-- The run tag is the newest landing's tip hash: same landings mean the same
+-- tag, so a second act run RESUMES the same worktree, journal, and build
+-- instead of discarding hours of progress.
+
+-- | One bounded probe of one bootstrap stage (or configure).
+data HelpStageVerdict = HelpStageVerdict
+  { hsStage :: !Text,
+    hsOutcome :: !Text, -- "completed" | "still-running" | "failed"
+    hsDetail :: !Text
+  }
+  deriving stock (Eq, Show, Generic)
+  deriving anyclass (ToJSON, FromJSON)
+
+-- | The artifact check: does the freshly built compiler's --help show the
+-- promoted option?
+data HelpCheckVerdict = HelpCheckVerdict
+  { hvShows :: !Bool,
+    hvHits :: !Int,
+    hvDetail :: !Text
+  }
+  deriving stock (Eq, Show, Generic)
+  deriving anyclass (ToJSON, FromJSON)
+
+-- | One help-check cell: the promotions to prove and the tag naming the
+-- build. Deliberately ONE cell for ALL options — one compiler build, three
+-- artifact assertions — because three concurrent mmake builds in one
+-- worktree would race.
+data HelpCheckCell = HelpCheckCell
+  { hcOptions :: ![Text],
+    hcTag :: !Text
+  }
+  deriving stock (Eq, Show)
+
+helpCheckWorkflowName :: WorkflowName
+helpCheckWorkflowName = WorkflowName "mercury-help-check"
+
+helpCheckWorkflowIdTagged :: Text -> WorkflowId
+helpCheckWorkflowIdTagged tag = WorkflowId ("mercury-help:" <> tag)
+
+helpCheckCellKeyFromWf :: WorkflowId -> Maybe Text
+helpCheckCellKeyFromWf (WorkflowId t) = case T.splitOn ":" t of
+  ["mercury-help", tag] -> Just tag
+  _ -> Nothing
+
+-- | The help-check branch (and with 'campaignWorktreePath', the worktree)
+-- for one tag. Keyed on the LANDING tip only — the recipe revision is
+-- deliberately NOT part of it — so a fixed recipe reuses the existing build
+-- (mmake is idempotent and every probe re-verifies for real) instead of
+-- discarding hours of work. Only the JOURNAL id carries the revision, so a
+-- fixed recipe still gets a fresh journal and stale recorded verdicts never
+-- replay.
+helpCheckBranchFor :: Text -> Text
+helpCheckBranchFor tag =
+  "campaign/mercury-help-" <> case T.breakOnEnd "-r" tag of
+    (prefix, rev)
+      | T.all isDigit rev && not (T.null rev) -> T.dropEnd 2 prefix
+    _ -> tag
+  where
+    isDigit c = c >= '0' && c <= '9'
+
+helpCheckCellFor :: [Text] -> Text -> HelpCheckCell
+helpCheckCellFor opts tag =
+  HelpCheckCell {hcOptions = opts, hcTag = tag}
+
+-- | Every @campaign/mercury-...@ landing in the parent repo (worktrees
+-- share refs), as @(option, branch)@ pairs, newest first.
+mercuryPromotionBranches :: FilePath -> IO [(Text, Text)]
+mercuryPromotionBranches parent = do
+  out <-
+    gitCapture
+      parent
+      [ "for-each-ref",
+        "--sort=-committerdate",
+        "--format=%(refname:short)",
+        "refs/heads/campaign"
+      ]
+  -- The pattern is a ref DIRECTORY; the landings are flat files under it
+  -- (campaign/mercury-dump-mlds-… is ONE name, not a mercury/ directory),
+  -- so filter by the exact prefix here.
+  let branches =
+        [ T.strip l
+        | l <- T.lines out,
+          T.isPrefixOf "campaign/mercury-" (T.strip l),
+          not (T.null (T.strip l))
+        ]
+  pure
+    [ (opt, b)
+    | b <- branches,
+      Just rest <- [T.stripPrefix "campaign/mercury-" b],
+      -- Option names contain hyphens (dump-mlds-pred-name), so match the
+      -- known targets rather than splitting on the first hyphen.
+      opt <- [t | (t, _, _) <- mercuryPromotionTargets, (t <> "-") `T.isPrefixOf` rest],
+      not (T.null opt)
+    ]
+
+-- | The recipe revision: bumped whenever the cell's own procedure changes
+-- (like fixing the configure execute bit), so the fixed recipe runs under a
+-- FRESH journal while an unchanged recipe keeps resuming its build.
+helpCheckRecipeRevision :: Int
+helpCheckRecipeRevision = 10
+
+-- | The stable run tag for a set of landings: the newest landing's tip
+-- hash plus the recipe revision. Same landings and the same recipe mean the
+-- same tag, so the same worktree and journal are resumed across act runs;
+-- new landings or a fixed recipe mean a new tag, a fresh build.
+mercuryIntegrationTag :: FilePath -> [(Text, Text)] -> IO Text
+mercuryIntegrationTag _parent [] = pure "nolandings"
+mercuryIntegrationTag parent ((_, newest) : _) = do
+  out <- gitCapture parent ["rev-parse", "--short", T.unpack newest]
+  pure ("h" <> T.strip out <> "-r" <> T.pack (show helpCheckRecipeRevision))
+
+integrationBranchName :: Text
+integrationBranchName = "campaign/mercury-integration"
+
+-- | The integration worktree: a worktree on 'integrationBranchName' (from
+-- the parent's HEAD) in which every promotion landing is merged, so one
+-- compiler build carries every promotion. The parent checkout's own working
+-- tree is never touched. Idempotent: an existing worktree is reused and the
+-- merges are no-ops once applied; a landing that cannot auto-merge is
+-- skipped and reported, and the artifact check then honestly reflects the
+-- tree that was actually built.
+ensureIntegrationWorktree :: FilePath -> IO (Text, [Text])
+ensureIntegrationWorktree parent = do
+  landings <- mercuryPromotionBranches parent
+  let wt = campaignWorktreePath "mercury" integrationBranchName
+  _ <- gitCapture parent ["worktree", "prune"]
+  registered <- doesDirectoryExist wt
+  unless registered $
+    tryAddWorktree parent wt integrationBranchName
+  integrated <- forM landings $ \(opt, b) -> do
+    ok <- tryIsAncestor wt b
+    if ok
+      then pure (Just opt) -- already merged: the no-op re-merge
+      else do
+        r <- try (gitCapture wt ["merge", "--no-edit", "-q", T.unpack b])
+        case r of
+          Right _ -> pure (Just opt)
+          Left (_ :: SomeException) -> do
+            _ <- try (gitCapture wt ["merge", "--abort"]) :: IO (Either SomeException Text)
+            pure Nothing -- cannot auto-merge; skipped, reported honestly
+  pure (integrationBranchName, [opt | Just opt <- integrated])
+
+-- | Is @b@ already an ancestor of HEAD in the repo at @dir@? (git exits 0
+-- silently when it is, 1 when it is not.)
+tryIsAncestor :: FilePath -> Text -> IO Bool
+tryIsAncestor dir b = do
+  r <- try (gitCapture dir ["merge-base", "--is-ancestor", T.unpack b, "HEAD"])
+  pure $ case r of
+    Right _ -> True
+    Left (_ :: SomeException) -> False
+
+-- | @git worktree add@ with a new branch, falling back to checking out the
+-- existing branch when the directory was wiped but the branch lives on.
+tryAddWorktree :: FilePath -> FilePath -> Text -> IO ()
+tryAddWorktree parent wt branch = do
+  _ <-
+    gitCapture parent ["worktree", "add", wt, "-b", T.unpack branch]
+      `catchAny` \_ ->
+        gitCapture parent ["worktree", "add", wt, T.unpack branch]
+  pure ()
+
+-- | The help-check worktree, branched FROM the integration branch (the
+-- promotions must be in the tree being built). Idempotent: an existing
+-- worktree is resumed, not recreated.
+ensureHelpCheckWorktree :: FilePath -> Text -> Text -> IO FilePath
+ensureHelpCheckWorktree parent integrationBranch helpBranch = do
+  let wt = campaignWorktreePath "mercury" helpBranch
+  _ <- gitCapture parent ["worktree", "prune"]
+  registered <- doesDirectoryExist wt
+  if registered
+    then wt <$ ensureBoehmGc parent wt
+    else do
+      -- The integration worktree must EXIST (not just the ref) before the
+      -- help worktree branches from it.
+      let integrationWt = campaignWorktreePath "mercury" integrationBranch
+      haveIntegration <- doesDirectoryExist integrationWt
+      unless haveIntegration $ void (ensureIntegrationWorktree parent)
+      -- git refuses to check out a branch that is already checked out in
+      -- another worktree (the integration worktree holds its branch), so
+      -- the help worktree gets its OWN branch, pre-created at the
+      -- integration tip. The branch name carries the tag, so an existing
+      -- branch was created by a previous run of the SAME tag and points at
+      -- the same tree.
+      haveBranch <-
+        try (gitCapture parent ["rev-parse", "--verify", "refs/heads/" <> T.unpack helpBranch])
+      case haveBranch of
+        Right _ -> pure ()
+        Left (_ :: SomeException) ->
+          void (gitCapture parent ["branch", T.unpack helpBranch, T.unpack integrationBranch])
+      _ <- gitCapture parent ["worktree", "add", wt, T.unpack helpBranch]
+      pure wt
+        <* ensureBoehmGc parent wt
+  -- Also on the resume path: a worktree created by recipe r2 has no GC.
+  where
+    -- The world-fact: @boehm_gc@ is a git submodule that fresh worktrees
+    -- never initialize (and this deployment has no network for it), while
+    -- the parent checkout's copy is populated AND built. The runtime stage
+    -- cannot even compile without gc_mark.h, so the recipe copies the
+    -- parent's tree in. Idempotent: only when the worktree's copy is empty.
+    ensureBoehmGc parentRepo wt = do
+      let gcInWt = wt </> "boehm_gc"
+          gcInParent = parentRepo </> "boehm_gc"
+      haveParent <- doesDirectoryExist gcInParent
+      haveInWt <- doesDirectoryExist gcInWt
+      emptyInWt <- if haveInWt then null <$> listDirectory gcInWt else pure True
+      when (emptyInWt && haveParent) $
+        -- The destination exists (git creates the empty submodule dir), so
+        -- copy the CONTENTS (SRC/.), not the directory itself.
+        void $ readProcess (proc "cp" ["-a", gcInParent <> "/.", gcInWt])
+
+-- | Any exception, swallowed (the git merges and probes run on real trees
+-- and can fail in real ways; the verdicts carry the failure).
+catchAny :: IO a -> (SomeException -> IO a) -> IO a
+catchAny = catch
+
+-- | Run a shell command in a directory under a wall-clock timeout, with the
+-- installed compiler pinned as the bootstrapping MERCURY_COMPILER. Exit 124
+-- means the timeout fired — the stage simply is not done yet.
+runPaced :: Int -> FilePath -> Text -> IO (ExitCode, Text)
+runPaced secs dir cmd = do
+  (ec, out, err) <-
+    readProcess $
+      proc "timeout" [show secs, "sh", "-c", T.unpack cmd]
+        & setWorkingDir dir
+  pure (ec, TL.toStrict (TLE.decodeUtf8 out) <> TL.toStrict (TLE.decodeUtf8 err))
+
+bootstrappingCompiler :: Text
+bootstrappingCompiler = "MERCURY_COMPILER=/home/nyc/.local/bin/mercury_compile"
+
+-- | One bounded probe of the configure stage. The world-fact this
+-- deployment encodes: the @configure@ script is generated (never committed)
+-- and this box's autoconf produces a broken one, while the parent checkout's
+-- pre-generated script works — so the bootstrap copies the parent's before
+-- configuring.
+bootstrapConfigureProbe :: FilePath -> IO HelpStageVerdict
+bootstrapConfigureProbe tree = do
+  configured <- doesFileExist (tree </> "Mmake.common")
+  if configured
+    then pure (HelpStageVerdict "configure" "completed" "Mmake.common already present")
+    else do
+      haveConfigure <- doesFileExist (tree </> "configure")
+      unless haveConfigure $ do
+        srcConfigure <-
+          TIO.readFile "/home/nyc/src/mercury/configure"
+            `catch` \(_ :: SomeException) -> pure ""
+        unless (T.null srcConfigure) $
+          TIO.writeFile (tree </> "configure") srcConfigure
+      -- The script must be executable UNCONDITIONALLY: a worktree may carry
+      -- a configure copied by an older recipe (writeFile makes mode 644,
+      -- and an existing file skips the copy path entirely — journal-verified
+      -- when recipe r6 failed on exactly that stale copy).
+      hasConfigure <- doesFileExist (tree </> "configure")
+      when hasConfigure $
+        void $ readProcess (proc "chmod" ["+x", tree </> "configure"])
+      (ec, out) <- runPaced 240 tree (bootstrappingCompiler <> " ./configure --prefix=/tmp/mhelp-install 2>&1")
+      pure $ case ec of
+        ExitSuccess -> HelpStageVerdict "configure" "completed" "configured"
+        ExitFailure 124 -> HelpStageVerdict "configure" "still-running" (T.take 200 (lastNonEmptyLine out))
+        ExitFailure 143 -> HelpStageVerdict "configure" "still-running" (T.take 200 (lastNonEmptyLine out))
+        _ -> HelpStageVerdict "configure" "failed" (T.take 400 (T.strip out))
+  where
+    lastNonEmptyLine t = case reverse (filter (not . T.null . T.strip) (T.lines t)) of
+      (l : _) -> T.strip l
+      [] -> "(no output)"
+
+-- | The canonical bootstrap order: (stage name, command, subdirectory).
+-- The C stages (util, runtime) are plain @mmake@; the Mercury-source stages
+-- need dependency generation first — without it the library fails with
+-- "undefined variable mer_std.mhs" (journal-verified, recipe r4). The
+-- compiler stage is the hours-long one and names its binary target.
+mercuryBootstrapStages :: [(Text, Text, FilePath)]
+mercuryBootstrapStages =
+  [ ("util", "mmake", "util"),
+    ("runtime", "mmake", "runtime"),
+    ("library", "mmake depend && mmake", "library"),
+    ("mdbcomp", "mmake depend && mmake", "mdbcomp"),
+    -- The compiler links ../trace/libmer_trace.a — journal-verified (recipe
+    -- r5 died exactly there) — so trace is a stage of its own. Its
+    -- Mmakefile has no depend target at all: it is a C-only library, so a
+    -- plain mmake (journal-verified: r7's "mmake depend" died with "no rule
+    -- to make depend").
+    ("trace", "mmake", "trace"),
+    ("browser", "mmake depend && mmake", "browser"),
+    ("ssdb", "mmake depend && mmake", "ssdb"),
+    ("compiler", "mmake depend && mmake mercury_compile", "compiler"),
+    -- What `mmake install` would do next: put the freshly generated
+    -- compiler configuration where the freshly built compiler looks for it
+    -- (<stdlib>/conf/Mercury.config). Without it the artifact probe dies
+    -- with "cannot open options file" (journal-verified, recipe r9). The
+    -- probe then runs the bare binary against the FRESH library, never the
+    -- installed one.
+    ("install-config", "mkdir -p library/conf && cp -f scripts/Mercury.config library/conf/Mercury.config", "")
+  ]
+
+-- | One bounded probe of one stage, in the stage's own directory. The C
+-- stages finish in seconds; the Mercury-source stages are given a generous
+-- slice per round — mmake is incremental, so every timeout simply means
+-- "more done, resume later".
+bootstrapStageProbe :: FilePath -> (Text, Text, FilePath) -> IO HelpStageVerdict
+bootstrapStageProbe tree (name, cmd, subdir) = do
+  let slice = if name `elem` ["util", "runtime"] then 60 else 240
+  (ec, out) <- runPaced slice (tree </> subdir) (bootstrappingCompiler <> " " <> cmd <> " 2>&1")
+  pure $ case ec of
+    ExitSuccess -> HelpStageVerdict name "completed" (lastLine out)
+    ExitFailure 124 -> HelpStageVerdict name "still-running" (lastLine out)
+    ExitFailure 143 -> HelpStageVerdict name "still-running" (lastLine out)
+    _ -> HelpStageVerdict name "failed" (T.take 400 (T.strip out))
+  where
+    lastLine t = case reverse (filter (not . T.null . T.strip) (T.lines t)) of
+      (l : _) -> T.take 200 (T.strip l)
+      [] -> "(no output)"
+
+-- | The artifact probe: the freshly built compiler's --help, via the
+-- build tree's own generated @scripts/mmc@ wrapper (it pins the fresh
+-- MERCURY_COMPILER, MERCURY_STDLIB_DIR and friends INTO the worktree — the
+-- bare binary refuses to even print --help without them, journal-verified
+-- in recipe r8). The negative control is real: the installed compiler
+-- shows zero dump-mlds lines.
+helpCheckProbe :: FilePath -> Text -> IO HelpCheckVerdict
+helpCheckProbe tree opt = do
+  let bin = tree </> "compiler" </> "mercury_compile"
+  have <- doesFileExist bin
+  if not have
+    then pure (HelpCheckVerdict False 0 "the compiler binary does not exist yet")
+    else do
+      -- The FRESH library (the build tree's own), never the installed one:
+      -- the whole point is that the built compiler is the one under test.
+      let invocation =
+            "MERCURY_STDLIB_DIR=" <> T.pack (tree </> "library") <> " "
+              <> T.pack bin <> " --help 2>&1"
+      (ec, out) <- runPaced 60 (tree </> "compiler") invocation
+      let hits = length [() | l <- T.lines out, ("--" <> opt) `T.isInfixOf` l]
+      pure $ case ec of
+        ExitSuccess ->
+          HelpCheckVerdict
+            { hvShows = hits > 0,
+              hvHits = hits,
+              hvDetail =
+                if hits > 0
+                  then "--" <> opt <> " appears " <> T.pack (show hits) <> " time(s) in --help"
+                  else "--" <> opt <> " is still absent from --help"
+            }
+        _ -> HelpCheckVerdict False 0 ("--help failed: " <> T.take 300 (T.strip out))
+
+helpCheckCoolDown :: NominalDiffTime
+helpCheckCoolDown = 0.1
+
+-- | The help-check workflow: integrate the landings, ensure the worktree,
+-- then pace through configure and the bootstrap stages — one bounded probe
+-- per round, one round-unique step per probe (a recorded step never
+-- re-executes, so each resume pass runs exactly one new probe);
+-- @still-running@ suspends on a durable timer; @failed@ parks on the human
+-- seam. After the compiler stage, the artifact check decides the cell.
+mercuryHelpCheckWorkflow ::
+  (Workflow :> es, KirokuStoreResource :> es, Store :> es, IOE :> es) =>
+  -- | publish the human-query awakeable id
+  (AwakeableId -> Eff es ()) ->
+  HelpCheckCell ->
+  Eff es Text
+mercuryHelpCheckWorkflow publishHumanQuery cell = do
+  (_branch, integrated) <-
+    step (StepName "integrate") . liftIO $
+      ensureIntegrationWorktree "/home/nyc/src/mercury"
+  wt <-
+    step (StepName "ensure-worktree") . liftIO $
+      ensureHelpCheckWorktree
+        "/home/nyc/src/mercury"
+        integrationBranchName
+        (helpCheckBranchFor (hcTag cell))
+  configureLoop wt 1
+  where
+    total = length mercuryBootstrapStages
+
+    -- The configure stage: one bounded probe per round until it completes.
+    configureLoop wt k = do
+      v <- step (StepName ("configure-r" <> T.pack (show k))) (liftIO (bootstrapConfigureProbe wt))
+      case hsOutcome v of
+        "completed" -> paceStages wt 1 1
+        "still-running" -> do
+          sleepNamed (StepName ("cool-configure-r" <> T.pack (show k))) helpCheckCoolDown
+          configureLoop wt (k + 1)
+        _ -> park ("configure failed: " <> hsDetail v)
+
+    -- The bootstrap stages: round k of stage n is its own step; a
+    -- still-running probe suspends on a durable timer and the next round
+    -- re-probes the same stage.
+    paceStages wt n k
+      | n > total = finish wt
+      | otherwise = do
+          let stage = mercuryBootstrapStages !! (n - 1)
+              stageName = fst3 stage
+          v <-
+            step
+              (StepName ("bootstrap-" <> T.pack (show n) <> "-" <> stageName <> "-r" <> T.pack (show k)))
+              (liftIO (bootstrapStageProbe wt stage))
+          case hsOutcome v of
+            "completed" -> paceStages wt (n + 1) 1
+            "still-running" -> do
+              sleepNamed (StepName ("cool-" <> T.pack (show n) <> "-r" <> T.pack (show k))) helpCheckCoolDown
+              paceStages wt n (k + 1)
+            _ -> park ("stage " <> stageName <> " failed: " <> hsDetail v)
+
+    finish wt = do
+      verdicts <-
+        step (StepName "help-check") . liftIO $
+          forM (hcOptions cell) (helpCheckProbe wt)
+      let zipped = zip (hcOptions cell) verdicts
+          shown_ = [o | (o, v) <- zipped, hvShows v]
+          missing = [o | (o, v) <- zipped, not (hvShows v)]
+      pure $
+        "help-check: " <> T.pack (show (length shown_)) <> "/" <> T.pack (show (length (hcOptions cell)))
+          <> " promoted option(s) visible in the built compiler's --help"
+          <> (if null missing then "" else "; absent: " <> T.intercalate ", " missing)
+
+    park reason = do
+      (awakeableId, awaitVerdict) <- awakeableNamed humanQueryStepName
+      _publication <- step (StepName "publish-human-query") (publishHumanQuery awakeableId)
+      verdict <- awaitVerdict
+      case verdict of
+        VerdictApproved -> pure ("human-approved: " <> reason)
+        VerdictRejected -> pure ("human-rejected: " <> reason)
+
+    fst3 (a, _, _) = a
+
+-- | The help-check registry: the one per-tag cell rebuilt from its id
+-- (@mercury-help:\<tag\>@). The options are the run's landing set — the tag
+-- pins that set (any new landing changes the newest tip hash), so the
+-- closure is deterministic across replays of the same tag.
+helpCheckRegistry ::
+  (IOE :> es, KirokuStoreResource :> es, Store :> es) =>
+  -- | the promoted options this run proves
+  [Text] ->
+  (AwakeableId -> Eff es ()) ->
+  WorkflowRegistry es
+helpCheckRegistry opts publishHumanQuery =
+  Map.fromList
+    [ ( helpCheckWorkflowName,
+        WorkflowDef $ \wid ->
+          case helpCheckCellKeyFromWf wid of
+            Nothing -> error ("helpCheckRegistry: malformed workflow id " <> show wid)
+            Just tag ->
+              mercuryHelpCheckWorkflow
+                (raise . publishHumanQuery)
+                (helpCheckCellFor opts tag)
+      )
+    ]
+
+-- | The negative control, run for real: the INSTALLED compiler's --help
+-- (zero dump-mlds mentions today). The bare binary needs the environment
+-- its @mmc@ wrapper would set — at minimum MERCURY_STDLIB_DIR — and this is
+-- the same artifact probe the cell runs against the built compiler, pointed
+-- at the pre-promotion binary.
+installedHelpCheckProbe :: Text -> IO HelpCheckVerdict
+installedHelpCheckProbe opt = do
+  (ec, out) <-
+    runPaced
+      60
+      "/tmp"
+      ( "MERCURY_STDLIB_DIR=/home/nyc/.local/lib/mercury "
+          <> T.pack "/home/nyc/.local/bin/mercury_compile --help 2>&1"
+      )
+  let hits = length [() | l <- T.lines out, ("--" <> opt) `T.isInfixOf` l]
+  pure $ case ec of
+    ExitSuccess ->
+      HelpCheckVerdict
+        { hvShows = hits > 0,
+          hvHits = hits,
+          hvDetail =
+            if hits > 0
+              then "--" <> opt <> " appears " <> T.pack (show hits) <> " time(s) in the installed compiler's --help"
+              else "--" <> opt <> " is absent from the installed compiler's --help (the negative control)"
+        }
+    _ -> HelpCheckVerdict False 0 ("installed --help failed: " <> T.take 300 (T.strip out))

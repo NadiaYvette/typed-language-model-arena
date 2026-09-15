@@ -62,7 +62,7 @@ import Data.Aeson.KeyMap qualified as KeyMap
 import Data.ByteString.Lazy qualified as BL
 import Data.Foldable (for_, traverse_)
 import Data.IORef (atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
-import Data.Maybe (catMaybes, isJust)
+import Data.Maybe (catMaybes, isJust, maybeToList)
 import Data.Set qualified as SSet
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -220,6 +220,22 @@ import Campaign.Mercury
     oracleDumpProbe,
     oracleFactProbe,
     readMercuryFacts,
+    -- help-check: the paced compiler build
+    HelpCheckCell (..),
+    HelpCheckVerdict (..),
+    helpCheckBranchFor,
+    helpCheckCellFor,
+    helpCheckCellKeyFromWf,
+    helpCheckProbe,
+    helpCheckRegistry,
+    helpCheckWorkflowIdTagged,
+    HelpStageVerdict (..),
+    helpCheckWorkflowName,
+    installedHelpCheckProbe,
+    mercuryBootstrapStages,
+    mercuryHelpCheckWorkflow,
+    mercuryIntegrationTag,
+    mercuryPromotionBranches,
   )
 import Baikai (Context (..), Message (..), Response, TextContent (..), UserContent (..))
 import Baikai.Message (UserPayload (UserPayload))
@@ -256,7 +272,7 @@ main = do
   -- 5 distills it — or act 5 records it itself when act 4 was filtered out.
   acts <- lookupEnv "ACTS"
   let splitOnComma = T.splitOn "," . T.strip
-      wanted = maybe [1 .. 19] (map (read . T.unpack) . splitOnComma . T.pack) acts
+      wanted = maybe [1 .. 20] (map (read . T.unpack) . splitOnComma . T.pack) acts
       step mSid n
         | n `notElem` wanted = pure mSid
         | otherwise = case n of
@@ -279,8 +295,9 @@ main = do
             17 -> runCrossPlanAct >> pure mSid
             18 -> runMercuryAct >> pure mSid
             19 -> runLiveMercuryAct >> pure mSid
+            20 -> runHelpCheckAct >> pure mSid
             n -> fail ("unknown act: " <> show n)
-  foldM_ step Nothing [1 .. 19 :: Int]
+  foldM_ step Nothing [1 .. 20 :: Int]
 
 -- ---------------------------------------------------------------------------
 -- Store plumbing (jitsurei's shape; no projection schema — the journal is
@@ -2985,4 +3002,200 @@ runLiveMercuryAct = do
       [ ("engine", "the live engine wraps runAIProgram (Extraction tier) with a 3-retry loop inside the MercuryEngine shape; attempt economics: one propose call plus the two probes per attempt"),
         ("adaptive-driver", "the driver demands a cool-down timer only when a journaled failed attempt proves it will be armed — the general form of act 16's hand-tuned second sweep"),
         ("verdicts", "the typed guard rejections (stale context, ambiguous match) and no-decode replies are the same data for a live model as for a script; the informed retry feeds them back as notes")
+      ]
+
+-- ---------------------------------------------------------------------------
+-- Act 20: the help-check cell — proving the promotion in a BUILT compiler
+-- ---------------------------------------------------------------------------
+--
+-- The paced, resumable, hours-long cell. The third oracle probe, deferred
+-- from act 18: @mercury_compile --help@ shows the promoted options only in a
+-- compiler BUILT from a promoted tree, so the cell builds one — configure,
+-- util, runtime, library, mdbcomp, browser, ssdb, compiler — one bounded
+-- probe per round, @still-running@ suspending on a durable timer, the next
+-- act run resuming the same worktree, journal, and build. ONE cell for all
+-- three options: one build, three artifact assertions.
+
+runHelpCheckAct :: IO ()
+runHelpCheckAct = do
+  putStrLn "\n=== act 20: the help-check cell — one paced compiler build, three --help assertions ==="
+  sink <- newIORef []
+  let publishHumanQuery :: AwakeableId -> Eff CampaignEffects ()
+      publishHumanQuery aid = do
+        inserted <-
+          liftIO $
+            atomicModifyIORef' sink $ \published ->
+              if aid `elem` published
+                then (published, False)
+                else (published <> [aid], True)
+        when inserted $
+          liftIO $ putStrLn ("  published human-query awakeable id: " <> T.unpack (awakeableIdText aid))
+      parent = "/home/nyc/src/mercury"
+      streamOf tag = campaignStreamNameText helpCheckWorkflowName (helpCheckWorkflowIdTagged tag)
+
+  -- ------------------------------------------------------------- (1) analyze
+  putStrLn "[help-check] analyze — the landings the campaign has actually produced"
+  landings <- mercuryPromotionBranches parent
+  unless (null landings) $
+    for_ landings $ \(opt, b) ->
+      putStrLn ("  landing: --" <> T.unpack opt <> " on " <> T.unpack b)
+  when (null landings) $
+    fail "act 20: no campaign/mercury-* branches — run act 18 first"
+  tag <- mercuryIntegrationTag parent landings
+  let opts = nub [opt | (opt, _) <- landings]
+      cell = helpCheckCellFor opts tag
+      wid = helpCheckWorkflowIdTagged tag
+  putStrLn
+    ( "  tag " <> T.unpack tag <> ": one help-check cell proving "
+        <> show (length opts) <> " promoted option(s): " <> T.unpack (T.intercalate ", " opts)
+    )
+
+  -- The negative control, run for real: the INSTALLED compiler's --help —
+  -- the same artifact probe the cell runs, pointed at the pre-promotion
+  -- binary. It must show zero.
+  for_ opts $ \opt -> do
+    neg <- installedHelpCheckProbe opt
+    putStrLn ("  negative control: " <> T.unpack (hvDetail neg))
+    when (hvShows neg) $
+      fail ("act 20: the installed compiler already shows --" <> T.unpack opt <> " — nothing to prove")
+
+  -- ------------------------------------------------------- (2) the paced run
+  putStrLn "[help-check] launch — the paced compiler build under the durable workflow"
+  withCampaignStore $ \store -> do
+    let stream = streamOf tag
+    journal0 <- decodedJournal <$> readJournal store stream
+    if journalIsComplete journal0
+      then putStrLn "  already complete — resume only"
+      else
+        if not (null journal0)
+          then putStrLn ("  journal exists with " <> show (length journal0) <> " event(s) — resuming in place")
+          else do
+            requireFreshJournal store stream
+            outcome <-
+              requireEither
+                =<< runCampaignStore
+                  store
+                  (runWorkflowWith defaultWorkflowRunOptions helpCheckWorkflowName wid (mercuryHelpCheckWorkflow (raise . publishHumanQuery) cell))
+            putStrLn ("  launch: " <> show outcome)
+
+  -- The driver: discover armed cool-down timers from the journals (step
+  -- names cool-<stage>-r<round>), fire exactly those, resume, repeat —
+  -- bounded by the probe BUDGET, not a fixed round count: the build is
+  -- hours long and the act is designed to be re-run until it closes.
+  let registry = helpCheckRegistry opts publishHumanQuery
+      ourIds = [wfIdText wid]
+      probeBudget = 6 :: Int
+      driveRound :: IO Bool
+      driveRound = do
+        doneRef <- newIORef False
+        withCampaignStore $ \store -> do
+          unfinished <- ourUnfinished store ourIds
+          if null unfinished
+            then writeIORef doneRef True
+            else do
+              let stream = streamOf tag
+              journal <- decodedJournal <$> readJournal store stream
+              -- The workflow is suspended INSIDE the sleep that follows the
+              -- last still-running probe, so that sleep has no recorded
+              -- step yet — the demand must come from the probe VERDICT, not
+              -- from recorded sleep steps. The sleep names mirror the
+              -- workflow's convention exactly: @configure-r<k>@ arms
+              -- @cool-configure-r<k>@; @bootstrap-<n>-<stage>-r<k>@ arms
+              -- @cool-<n>-r<k>@ (the stage NUMBER, not its name).
+              let probeOutcomes =
+                    [ (name, Aeson.fromJSON v :: Aeson.Result HelpStageVerdict)
+                    | StepRecorded name v _ <- journal,
+                      "bootstrap-" `T.isPrefixOf` name || "configure-r" `T.isPrefixOf` name
+                    ]
+                  sleepForProbe name =
+                    case T.stripPrefix "configure-" name of
+                      Just suffix -> Just ("cool-configure-" <> suffix)
+                      Nothing -> do
+                        rest <- T.stripPrefix "bootstrap-" name
+                        let (num, tail_) = T.span (/= '-') rest
+                            roundK = T.takeWhileEnd (/= '-') tail_
+                        digits <- T.stripPrefix "r" roundK
+                        if T.null num || T.null digits
+                          then Nothing
+                          else pure ("cool-" <> num <> "-r" <> digits)
+                  stillRunning =
+                    [ s
+                    | (name, Aeson.Success hv) <- probeOutcomes,
+                      hsOutcome hv == "still-running",
+                      Just s <- [sleepForProbe name]
+                    ]
+                  demand = case reverse stillRunning of
+                    (latest : _) -> [latest]
+                    [] -> []
+              forM_ demand $ \n ->
+                fireTimerSweep store registry [(stream, "sleep:" <> n)]
+              driveResumeOnce store registry
+        readIORef doneRef
+      driveRounds k
+        | k <= (0 :: Int) = pure ()
+        | otherwise = do
+            done <- driveRound
+            unless done $ do
+              putStrLn ("  paced rounds remaining: " <> show (k - 1) <> " (probe budget)")
+              driveRounds (k - 1)
+  driveRounds probeBudget
+  stillOpenRef <- newIORef False
+  withCampaignStore $ \store -> do
+    unfinished <- ourUnfinished store ourIds
+    writeIORef stillOpenRef (not (null unfinished))
+  stillOpen <- readIORef stillOpenRef
+  when stillOpen $
+    putStrLn
+      ( "  BUDGET: " <> show probeBudget <> " driver rounds used without finishing — the cell remains open in its journal."
+          <> " Re-run ACTS=20 to resume the same build (mmake is idempotent; no work is lost)."
+      )
+
+  -- Anything parked goes through the human seam (the operator approves).
+  withCampaignStore $ \store -> do
+    published <- readIORef sink
+    unless (null published) $
+      putStrLn ("  parked cells awaiting the operator: " <> show (length published))
+    for_ published $ \aid -> do
+      _ <- requireEither =<< runCampaignStore store (signalAwakeable aid VerdictApproved)
+      pure ()
+    driveResumeOnce store registry
+    driveResumeOnce store registry
+
+  -- ------------------------------------------------------------ (3) verdicts
+  putStrLn "[help-check] verdicts — the built compiler's --help, per option"
+  withCampaignStore $ \store -> do
+    journal <- decodedJournal <$> readJournal store (streamOf tag)
+    let helpSteps = [v | StepRecorded name v _ <- journal, name == "help-check"]
+    case reverse helpSteps of
+      (v : _) -> case Aeson.fromJSON v of
+        Aeson.Success vs ->
+          for_ (zip [1 :: Int ..] vs) $ \(i, hv) ->
+            putStrLn
+              ( "  assertion " <> show i <> ": " <> (if hvShows hv then "SHOWN" else "ABSENT")
+                  <> " — " <> T.unpack (hvDetail hv)
+              )
+        Aeson.Error err -> putStrLn ("  help-check verdict undecodable: " <> err)
+      [] -> putStrLn "  no help-check verdict yet — the build is still pacing"
+    remaining <- ourUnfinished store ourIds
+    unless (null remaining) $
+      putStrLn "  (open — re-run ACTS=20; the build continues where it left off)"
+
+  -- ------------------------------------------------------------- (4) memory
+  putStrLn "[help-check] memory — the paced-cell recipe enters the campaign's memory"
+  withCampaignStore $ \store -> do
+    sid <- runKiokuWrite store (startInfraSession "mercury help-check paced build")
+    for_ (zip [1 ..] helpCheckEvidence) $ \(idx, (topic, body)) -> do
+      _ <- runKiokuWrite store (recordFixTurn sid idx "assistant" ("[" <> topic <> "] " <> body))
+      pure ()
+    _ <- runKiokuWrite store (completeFixSession sid "a paced compiler build is an ordinary campaign cell: bounded probes, durable timers, resume across act runs")
+    putStrLn ("  infra session recorded (" <> show (length helpCheckEvidence) <> " evidence turns)")
+    hits <- runCampaignStore store (recallNotesForKeyword (projectNamespace "mercury") "help-check")
+    putStrLn ("  recall for \"help-check\": " <> show (length hits) <> " hit(s)")
+  putStrLn "[help-check] done — the promotion is proven (or pacing) in a real built compiler"
+  where
+    helpCheckEvidence =
+      [ ("paced-build", "the help-check cell is the matrix rung's slow cell on a compiler: configure and each mmake stage are bounded probes; timeout 124/143 is the typed still-running verdict; mmake's idempotence makes every resume safe"),
+        ("resume-across-acts", "the run tag is the newest landing's tip hash, so re-running the act resumes the same worktree and journal instead of discarding hours of build progress; one shared build serves all three option assertions"),
+        ("keiro-determinism", "a recorded step never re-executes, so each probe round is its own step name (bootstrap-<n>-<stage>-r<k>): a resume pass replays recorded rounds cheaply, runs exactly one new bounded probe, and suspends again"),
+        ("world-facts", "the bootstrap copies the parent checkout's pre-generated configure because this box's autoconf emits a broken one — a world-fact the cell encodes rather than fights")
       ]
