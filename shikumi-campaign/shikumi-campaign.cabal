@@ -35,6 +35,7 @@ library
   import: warnings, shared
   exposed-modules:
     Campaign.Aggregate
+    Campaign.Bootstrap
     Campaign.Cell
     Campaign.Fanout
     Campaign.Hands
@@ -55,6 +56,8 @@ library
     effectful-core >=2.6,
     filepath,
     generic-lens >=2.2,
+    hasql >=1.9,
+    hasql-pool >=1.4,
     keiki >=0.9 && <0.10,
     keiro,
     keiro-core,

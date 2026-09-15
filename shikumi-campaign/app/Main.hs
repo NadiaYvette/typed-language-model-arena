@@ -106,6 +106,19 @@ import Kiroku.Store.Types
   )
 import System.Directory (createDirectoryIfMissing, listDirectory, removeFile)
 import System.Environment (lookupEnv)
+
+import Campaign.Bootstrap
+  ( bootstrapCampaignStore
+  , bootstrapStore
+  , ccDbname
+  , createDatabaseIfAbsent
+  , defaultCampaignConn
+  , dropDatabase
+  , renderCampaignConn
+  , scratchConnFor
+  , sentinelRelation
+  , storeWorkflowCount
+  )
 import System.FilePath ((</>))
 import System.IO (hClose, openTempFile)
 import Data.UUID.V4 (nextRandom)
@@ -194,7 +207,7 @@ main = do
   -- 5 distills it — or act 5 records it itself when act 4 was filtered out.
   acts <- lookupEnv "ACTS"
   let splitOnComma = T.splitOn "," . T.strip
-      wanted = maybe [1 .. 13] (map (read . T.unpack) . splitOnComma . T.pack) acts
+      wanted = maybe [1 .. 14] (map (read . T.unpack) . splitOnComma . T.pack) acts
       step mSid n
         | n `notElem` wanted = pure mSid
         | otherwise = case n of
@@ -210,8 +223,9 @@ main = do
             10 -> runPlannerAct >> pure mSid
             11 -> runLandingAct >> pure mSid
             12 -> runReactAct >> pure mSid
-            _ -> runFanoutAct >> pure mSid
-  foldM_ step Nothing [1 .. 13 :: Int]
+            13 -> runFanoutAct >> pure mSid
+            _ -> runScratchAct >> pure mSid
+  foldM_ step Nothing [1 .. 14 :: Int]
 
 -- ---------------------------------------------------------------------------
 -- Store plumbing (jitsurei's shape; no projection schema — the journal is
@@ -231,11 +245,10 @@ newtype CampaignStore = CampaignStore
 campaignConnectionSettings :: Text -> ConnectionSettings
 campaignConnectionSettings connString = keiroConnectionSettings connString "campaign"
 
-withCampaignStore :: (CampaignStore -> IO ()) -> IO ()
-withCampaignStore action = do
-  connString <- do
-    configured <- lookupEnv "PG_CONNECTION_STRING"
-    pure (maybe "host=/tmp dbname=campaign" T.pack configured)
+-- | The campaign store on an explicit connection — the parameterized scope
+-- (act 14's scratch store uses this directly).
+withCampaignStoreAt :: T.Text -> (CampaignStore -> IO ()) -> IO ()
+withCampaignStoreAt connString action = do
   putStrLn ("[campaign] connecting to " <> T.unpack connString)
   runEff $
     withKirokuStore (campaignConnectionSettings connString) $
@@ -248,6 +261,22 @@ withCampaignStore action = do
         reg <- runIt Kioku.ReadModel.registerKiokuReadModels
         either (ioError . userError . show) pure reg
         action (CampaignStore runIt)
+
+-- | The campaign store on the default connection, after a self-boot: resolve
+-- the connection, create the database if the server lacks it, migrate if the
+-- schema is absent — then open. A @dropdb@ followed by the demo Just Works.
+withCampaignStore :: (CampaignStore -> IO ()) -> IO ()
+withCampaignStore action = do
+  conn <- defaultCampaignConn
+  applied <- bootstrapCampaignStore conn
+  putStrLn
+    ( if applied == 0
+        then "[bootstrap] store current (schema present, nothing to apply)"
+        else
+          "[bootstrap] applied " <> show applied <> " migration file(s) to "
+            <> T.unpack (renderCampaignConn conn)
+    )
+  withCampaignStoreAt (renderCampaignConn conn) action
 
 requireEither :: (Show err) => Either err a -> IO a
 requireEither = \case
@@ -1770,3 +1799,55 @@ runFanoutAct = do
     pure (maybe "host=/tmp dbname=campaign" T.pack configured)
   putStrLn "=== act 13: keiki aggregate + shibuya fan-out (live-vs-offline) ==="
   runCellFanout connString
+
+-- ---------------------------------------------------------------------------
+-- Act 14: the campaign boots its own store — a fresh database, end to end.
+--
+-- The act derives a scratch database on the same server as the campaign's
+-- own, drops any stale copy, and proves the bootstrap from three angles:
+--
+--   1. a bare connection to the empty database applies the full migration
+--      set (kiroku, keiro, kioku) in one call — no psql, no external tools;
+--   2. the sentinel agrees: before, keiro's workflow-instances table is
+--      absent (Nothing); after, it exists and counts zero (Just 0);
+--   3. the campaign's own machinery runs on the bootstrapped store: the
+--      zeta.py cell — launched with the same workflow body the fleet uses,
+--      cleared by the honest stub, settle sleep fired, journal complete.
+--
+-- The scratch database is dropped afterwards; the main store is untouched.
+runScratchAct :: IO ()
+runScratchAct = do
+  putStrLn "\n=== act 14: the campaign boots its own store (scratch DB end-to-end) ==="
+  mainConn <- defaultCampaignConn
+  let scratchName = mainConn.ccDbname <> "-scratch"
+      scratch = scratchConnFor mainConn scratchName
+  putStrLn ("[scratch] database " <> T.unpack scratchName <> " on the main server")
+  dropDatabase scratch
+  _ <- createDatabaseIfAbsent scratch
+  before <- storeWorkflowCount scratch
+  putStrLn ("[scratch] sentinel (" <> T.unpack sentinelRelation <> ") before: " <> show before)
+  files <- bootstrapStore scratch
+  putStrLn ("[scratch] bootstrap applied " <> show files <> " migration file(s)")
+  after <- storeWorkflowCount scratch
+  putStrLn ("[scratch] sentinel after: " <> show after)
+  case after of
+    Just 0 -> pure ()
+    other -> fail ("scratch: sentinel should be Just 0 after bootstrap, got " <> show other)
+  cell <- requireCell "zeta.py"
+  let wfId = campaignWorkflowId cell.cellId
+      stream = campaignStreamNameText cellCampaignWorkflowName wfId
+      registry = campaignRegistry [] [] honestEngineFor noPublisherEff
+  withCampaignStoreAt (renderCampaignConn scratch) $ \store -> do
+    _ <-
+      requireEither
+        =<< runCampaignStore
+          store
+          (runWorkflowWith defaultWorkflowRunOptions cellCampaignWorkflowName wfId (cellCampaignWorkflow (honestEngineFor markerOracle cell) (raise . noPublisherEff) cell markerOracle campaignNamespace defaultMaxAttempts))
+    fireTimerSweep store registry [(stream, "sleep:settle-1")]
+    drainFleet store registry [wfIdText wfId]
+    putStrLn "[scratch] cell scoreboard on the bootstrapped store:"
+    printCellScoreboard store registry [(unCellId cell.cellId, stream, cellCampaignWorkflowName, wfId)]
+    remaining <- ourUnfinished store [wfIdText wfId]
+    unless (null remaining) $ fail ("scratch: unfinished work remains: " <> show remaining)
+  dropDatabase scratch
+  putStrLn "[scratch] dropped — the campaign can now boot any empty database on demand"
