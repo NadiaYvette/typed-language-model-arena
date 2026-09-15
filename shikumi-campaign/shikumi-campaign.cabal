@@ -41,6 +41,7 @@ library
     Campaign.Hands
     Campaign.Landing
     Campaign.Memory
+    Campaign.Matrix
     Campaign.Oracle
     Campaign.ReactFixer
     Campaign.Workflow

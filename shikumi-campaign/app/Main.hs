@@ -67,6 +67,7 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
 import Data.Time.Clock (addUTCTime, getCurrentTime)
+import Data.Time.Clock.POSIX (utcTimeToPOSIXSeconds)
 import Data.Vector qualified as Vector
 import Control.Concurrent.Async (mapConcurrently)
 import Effectful (Eff, IOE, UnliftStrategy (..), liftIO, raise, runEff, withEffToIO)
@@ -175,6 +176,20 @@ import Campaign.Memory
     startFixSession,
     startInfraSession,
   )
+import Campaign.Matrix
+  ( MatrixAttempt (..),
+    MatrixCell (..),
+    TriageIn (..),
+    TriageOut (..),
+    matrixAttemptsOf,
+    matrixCellFromWf,
+    matrixCellId,
+    matrixCellSpecs,
+    matrixCellWorkflow,
+    matrixRegistry,
+    matrixWorkflowIdTagged,
+    matrixWorkflowName,
+  )
 import Baikai (Context (..), Message (..), Response, TextContent (..), UserContent (..))
 import Baikai.Message (UserPayload (UserPayload))
 import Campaign.Oracle (CellOracle (..), ProjectCell (..), diagLineOf, markerOracle, projectCellSpecs, readProjectCell, unusedImportOracle)
@@ -210,7 +225,7 @@ main = do
   -- 5 distills it — or act 5 records it itself when act 4 was filtered out.
   acts <- lookupEnv "ACTS"
   let splitOnComma = T.splitOn "," . T.strip
-      wanted = maybe [1 .. 15] (map (read . T.unpack) . splitOnComma . T.pack) acts
+      wanted = maybe [1 .. 16] (map (read . T.unpack) . splitOnComma . T.pack) acts
       step mSid n
         | n `notElem` wanted = pure mSid
         | otherwise = case n of
@@ -228,8 +243,9 @@ main = do
             12 -> runReactAct >> pure mSid
             13 -> runFanoutAct >> pure mSid
             14 -> runScratchAct >> pure mSid
-            _ -> runInfraMemoryAct >> pure mSid
-  foldM_ step Nothing [1 .. 15 :: Int]
+            15 -> runInfraMemoryAct >> pure mSid
+            _ -> runMatrixAct >> pure mSid
+  foldM_ step Nothing [1 .. 16 :: Int]
 
 -- ---------------------------------------------------------------------------
 -- Store plumbing (jitsurei's shape; no projection schema — the journal is
@@ -1992,3 +2008,116 @@ runInfraMemoryAct = do
           when (null hits) $ fail ("infra memory: keyword recall for \"" <> T.unpack kw <> "\" found nothing")
 
   putStrLn "[infra-memory] done — the campaign's memory now knows how the campaign runs"
+
+-- ---------------------------------------------------------------------------
+-- Act 16: the verification matrix — (arch × config) cells whose verification
+-- is a staged boot → stress process, triaged by a typed shikumi verdict that
+-- splits retry from human escalation.
+--
+-- This is the pgcl shape: an 80-cell matrix of boards × configs where a
+-- boot log or a stress failure means one of two futures — retry with advice,
+-- or a human walks to the board. Here the world is synthetic but the
+-- machinery is the campaign's own:
+--
+--   * each stage is a journaled step (boot-N, stress-N) — the device log is
+--     data, so replay reproduces it without re-running hardware;
+--   * the triage program ('triageSignature') reads the actual boot/stress
+--     logs and returns needsHardware + advice as typed fields;
+--   * needsHardware=false loops through a durable cool-down timer and
+--     retries (the riscv/kvm cell clears on attempt 2);
+--   * needsHardware=true parks on the campaign's human seam — the SAME
+--     awakeable the fixer uses — and an operator answer resumes it.
+--
+-- The scripted triage engine decides from the TYPED TriageIn (the engine
+-- receives the program input directly), so no Context sniffing: a cell with
+-- a DOWN net stage is retryable advice; a cell with stress corruption is
+-- hardware-only.
+runMatrixAct :: IO ()
+runMatrixAct = do
+  putStrLn "\n=== act 16: the verification matrix — boot/stress cells, triage, hardware seam ==="
+  runTag <- T.pack . show . floor . utcTimeToPOSIXSeconds <$> getCurrentTime 
+  sink <- newIORef []
+  let publishHumanQuery :: AwakeableId -> Eff CampaignEffects ()
+      publishHumanQuery aid = do
+        inserted <-
+          liftIO $
+            atomicModifyIORef' sink $ \published ->
+              if aid `elem` published
+                then (published, False)
+                else (published <> [aid], True)
+        when inserted $
+          liftIO $ putStrLn ("  published human-query awakeable id: " <> T.unpack (awakeableIdText aid))
+
+      scriptedTriage :: Campaign.Matrix.TriageIn -> TriageOut
+      scriptedTriage input =
+        let stressLines = unField input.tiStress
+            corrupt = any ("corruption" `T.isInfixOf`) stressLines
+         in if corrupt
+              then
+                TriageOut
+                  (Field True)
+                  (Field "this stress corruption reproduces only on the physical board; a human must inspect it")
+              else
+                TriageOut
+                  (Field False)
+                  (Field "the kvm misconfiguration clears by re-applying the config; retry after the cool-down")
+      -- The scripted policy decides from the typed TriageIn the engine call
+      -- carries directly — no stub-LM round trip, no Context sniffing.
+      matrixEngine _n _prog input _notes = pure (Just (scriptedTriage input))
+      registry = matrixRegistry matrixEngine publishHumanQuery
+
+      cells = matrixCellSpecs
+      rows = [(mc, matrixWorkflowIdTagged mc runTag) | mc <- cells]
+      ourIds = [wfIdText wid | (_, wid) <- rows]
+      streamOf = campaignStreamNameText matrixWorkflowName
+
+  putStrLn ("[matrix] launching " <> show (length cells) <> " cells (3 arch × 3 config), run tag " <> T.unpack runTag)
+  for_ rows $ \(mc, wid) ->
+    withCampaignStore $ \store -> do
+      requireFreshJournal store (streamOf wid)
+      outcome <-
+        requireEither
+          =<< runCampaignStore
+            store
+            (runWorkflowWith defaultWorkflowRunOptions matrixWorkflowName wid (matrixCellWorkflow matrixEngine (raise . publishHumanQuery) mc (projectNamespace "matrix") 3))
+      putStrLn ("  launch " <> T.unpack (unCellId (matrixCellId mc)) <> ": " <> show outcome)
+
+  -- Drive every cell: cool-down timers fire, retries resume, the hardware
+  -- cell parks. Then the human answers the one parked query. The second
+  -- sweep targets only the cell that reaches a second attempt — the
+  -- hardware-parked cell never arms a second cool-down (its future is the
+  -- human seam, not a retry), so demanding its timer would spin forever.
+  let retryingRows = [(mc, wid) | (mc, wid) <- rows, unCellId (matrixCellId mc) == "matrix:riscv@kvm"]
+  withCampaignStore $ \store -> do
+    fireTimerSweep store registry [(streamOf wid, "sleep:cool-down-1") | (_, wid) <- rows]
+    fireTimerSweep store registry [(streamOf wid, "sleep:cool-down-2") | (_, wid) <- retryingRows]
+    driveResumeOnce store registry
+    driveResumeOnce store registry
+    published <- readIORef sink
+    putStrLn ("  parked cells awaiting the operator: " <> show (length published))
+    for_ published $ \aid -> do
+      _ <- requireEither =<< runCampaignStore store (signalAwakeable aid VerdictApproved)
+      pure ()
+    driveResumeOnce store registry
+    driveResumeOnce store registry
+
+  putStrLn "[matrix] scoreboard — arch × config grid:"
+  withCampaignStore $ \store -> do
+    for_ rows $ \(mc, wid) -> do
+      journal <- readJournal store (streamOf wid)
+      let attempts = matrixAttemptsOf (decodedJournal journal)
+          verdicts = [ma.maVerdict | ma <- attempts]
+      putStrLn
+        ( "  " <> T.unpack (unCellId (matrixCellId mc))
+            <> ": "
+            <> ( if journalIsComplete (decodedJournal journal)
+                   then "complete"
+                   else "incomplete"
+               )
+            <> " — "
+            <> T.unpack (T.intercalate " | " (map (T.take 70) verdicts))
+        )
+    remaining <- ourUnfinished store ourIds
+    unless (null remaining) $ fail ("matrix: unfinished cells remain: " <> show remaining)
+
+  putStrLn "[matrix] done — boot/stress as data, triage as typed verdict, the human seam shared"
