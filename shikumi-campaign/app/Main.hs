@@ -162,15 +162,18 @@ import Campaign.Landing
   )
 import Campaign.Memory
   ( campaignAccessContext,
+    campaignInfraNamespace,
     campaignMemorySpace,
     campaignNamespace,
     completeFixSession,
     projectNamespace,
     recallNotes,
+    recallNotesForKeyword,
     recordFixTurn,
     recordGlobalLesson,
     recordLesson,
     startFixSession,
+    startInfraSession,
   )
 import Baikai (Context (..), Message (..), Response, TextContent (..), UserContent (..))
 import Baikai.Message (UserPayload (UserPayload))
@@ -207,7 +210,7 @@ main = do
   -- 5 distills it — or act 5 records it itself when act 4 was filtered out.
   acts <- lookupEnv "ACTS"
   let splitOnComma = T.splitOn "," . T.strip
-      wanted = maybe [1 .. 14] (map (read . T.unpack) . splitOnComma . T.pack) acts
+      wanted = maybe [1 .. 15] (map (read . T.unpack) . splitOnComma . T.pack) acts
       step mSid n
         | n `notElem` wanted = pure mSid
         | otherwise = case n of
@@ -224,8 +227,9 @@ main = do
             11 -> runLandingAct >> pure mSid
             12 -> runReactAct >> pure mSid
             13 -> runFanoutAct >> pure mSid
-            _ -> runScratchAct >> pure mSid
-  foldM_ step Nothing [1 .. 14 :: Int]
+            14 -> runScratchAct >> pure mSid
+            _ -> runInfraMemoryAct >> pure mSid
+  foldM_ step Nothing [1 .. 15 :: Int]
 
 -- ---------------------------------------------------------------------------
 -- Store plumbing (jitsurei's shape; no projection schema — the journal is
@@ -1851,3 +1855,140 @@ runScratchAct = do
     unless (null remaining) $ fail ("scratch: unfinished work remains: " <> show remaining)
   dropDatabase scratch
   putStrLn "[scratch] dropped — the campaign can now boot any empty database on demand"
+
+-- ---------------------------------------------------------------------------
+-- Act 15: the campaign remembers its own infrastructure — the keiki/shibuya
+-- read model and the self-bootstrapping store recorded as kioku L0 evidence,
+-- distilled to L1, promoted to global lessons, and recalled the way the
+-- planner will.
+--
+-- Acts 13 and 14 built two pieces of infrastructure: the read model (one
+-- keiki aggregate fed two ways — offline replay and a live shibuya fan-out
+-- over the kiroku adapter) and the self-bootstrapping store (kiroku, keiro
+-- and kioku migrations applied in-process, freshness read from keiro's
+-- sentinel). Until now that knowledge lived only in the driver's source.
+-- This act teaches the campaign's own memory about it:
+--
+--   1. an infra session (L0) records the bootstrap recipe and the
+--      live-vs-offline agreement property as evidence turns;
+--   2. the L1 distiller runs over the session, storing machine-written
+--      atoms (degraded honestly when the live model is unavailable —
+--      evidence is already durable, so a later pass can pick it up);
+--   3. two global lessons promote the operational essentials into the
+--      infra namespace — the units a planner or a fresh operator consumes;
+--   4. keyword recall reads the namespace back — the queries a planner
+--      would issue (@bootstrap@, @read model@) must both hit.
+--
+-- The infra namespace is deliberately separate from every project
+-- namespace: @how do we run at all@ is not fix advice, and conflating them
+-- would make planner recall wade through both.
+infraEvidence :: [(Text, Text)]
+infraEvidence =
+  [ ( "bootstrap",
+      "an empty database is bootstrapped in-process: Campaign.Bootstrap applies"
+        <> " all three migration sets (kiroku, keiro, kioku — 56 idempotent SQL files)"
+        <> " as one Session.script transaction each; no external psql or migrate tool"
+    )
+  , ( "freshness",
+      "store freshness is data, not schema: keiro.keiro_workflows absent means"
+        <> " unmigrated, present and empty means fresh; the driver self-boots before"
+        <> " opening the store, so dropdb followed by a rerun just works"
+    )
+  , ( "server",
+      "the private Postgres cluster lives in the arena repo (db/campaign-private,"
+        <> " socket db/campaign-private-socket, trust auth, user campaign);"
+        <> " PG_CONNECTION_STRING carries user= explicitly because the notifier"
+        <> " does not inherit PGUSER"
+    )
+  , ( "read-model",
+      "the campaign's read model is one keiki symbolic-register transducer over"
+        <> " cell journals (CellOpen -> Cleared/Escalated with a non-terminal"
+        <> " CellHumanQueried vertex), fed two ways: offline replay via keiro's"
+        <> " replayEvents, and live through a shibuya app over the shibuya-kiroku adapter"
+    )
+  , ( "agreement",
+      "the live fan-out and the offline replay must agree on every cell journal;"
+        <> " act 13 proves it (13 match, 0 diff), and the per-act hand-rolled journal"
+        <> " decoders were retired in favor of the one verified read model"
+    )
+  ]
+
+runInfraMemoryAct :: IO ()
+runInfraMemoryAct = do
+  putStrLn "\n=== act 15: the campaign remembers its own infrastructure ==="
+  withCampaignStore $ \store -> do
+    -- (1) L0: the infra session, one turn per fact, straight from the acts
+    -- that earned them.
+    sid <- runKiokuWrite store (startInfraSession "store bootstrap and read model")
+    putStrLn ("  infra session started: " <> show sid)
+    for_ (zip [1 ..] infraEvidence) $ \(idx, (topic, body)) -> do
+      _ <- runKiokuWrite store (recordFixTurn sid idx "assistant" ("[" <> topic <> "] " <> body))
+      putStrLn ("  evidence " <> show idx <> " recorded: " <> T.unpack topic)
+    _ <- runKiokuWrite store (completeFixSession sid "the campaign can boot any empty database in-process and serves one verified read model over its journals")
+    putStrLn "  session completed — L0 evidence ready"
+
+    -- (2) L1: the distiller turns evidence into atoms. A rate-limited or
+    -- absent live model is a warning, not a failure: the evidence is
+    -- durable, and a later distillation pass picks it up.
+    withLoadedAIRuntime $ \air -> do
+      let distillRT =
+            withTestRunners
+              (newDistillRuntime air Nothing)
+              ( \tr ->
+                  tr
+                    { runExtract = campaignExtractRunner air,
+                      runConsolidate = campaignConsolidateRunner air
+                    }
+              )
+      result <-
+        runCampaignStore store $
+          distillSessionL1
+            campaignAccessContext
+            IgnoreWatermark
+            distillRT
+            (scopedScanCandidates 8)
+            sid
+      case result of
+        Left err -> putStrLn ("  [warn] store error during L1 distillation (continuing): " <> show err)
+        Right inner -> case inner of
+          Left err -> putStrLn ("  [warn] L1 distillation unavailable (continuing): " <> show err)
+          Right L1SkippedUpToDate ->
+            putStrLn "  distiller: session already up to date"
+          Right (L1Distilled summary) ->
+            putStrLn
+              ( "  distilled: " <> show summary.extracted <> " candidate(s) extracted, "
+                  <> show summary.stored <> " stored, "
+                  <> show summary.merged <> " merged, "
+                  <> show summary.skipped <> " skipped"
+              )
+
+    -- (3) Promote the operational essentials to the infra namespace's global
+    -- scope — the units recall serves to planners and fresh operators.
+    for_
+      [ "the store self-boots: an empty database gets the kiroku, keiro and kioku"
+          <> " migrations applied in-process (56 idempotent files); freshness is"
+          <> " keiro.keiro_workflows being present and empty; the private cluster"
+          <> " lives at db/campaign-private with its socket at db/campaign-private-socket"
+      ,
+        "the read model is one keiki aggregate over cell journals, fed two ways"
+          <> " (offline replay and a live shibuya fan-out over the kiroku adapter);"
+          <> " the two paths must agree — act 13 proves 13 match, 0 diff"
+      ]
+      $ \advice -> do
+        _ <- runKiokuWrite store (recordGlobalLesson campaignInfraNamespace advice)
+        pure ()
+    putStrLn "  2 global lesson(s) promoted to the infra namespace"
+
+    -- (4) The proof: planner-shaped keyword recall must hit.
+    notes <- runCampaignStore store (recallNotes campaignInfraNamespace)
+    case notes of
+      Left err -> fail ("infra recall failed: " <> show err)
+      Right ns -> do
+        putStrLn ("  infra recall — " <> show (length ns) <> " note(s) in the infra namespace:")
+        for_ ns \n -> TIO.putStrLn ("    - " <> n)
+        for_ ["bootstrap", "read model"] $ \kw -> do
+          hits <- runCampaignStore store (recallNotesForKeyword campaignInfraNamespace kw)
+          putStrLn ("  recall for \"" <> T.unpack kw <> "\": " <> show (length hits) <> " hit(s)")
+          when (null hits) $ fail ("infra memory: keyword recall for \"" <> T.unpack kw <> "\" found nothing")
+
+  putStrLn "[infra-memory] done — the campaign's memory now knows how the campaign runs"

@@ -23,6 +23,7 @@ module Campaign.Memory
   ( -- * Configuration
     campaignMemorySpace,
     campaignNamespace,
+    campaignInfraNamespace,
     projectNamespace,
     campaignAccessContext,
     cellScope,
@@ -36,6 +37,7 @@ module Campaign.Memory
     recordLesson,
     recordGlobalLesson,
     startFixSession,
+    startInfraSession,
     recordFixTurn,
     completeFixSession,
 
@@ -101,6 +103,13 @@ projectNamespace name = either (error . T.unpack) id (mkNamespace name)
 -- | The toy corpus's namespace (the original single-project demo).
 campaignNamespace :: Namespace
 campaignNamespace = projectNamespace "toy"
+
+-- | The campaign's own infrastructure namespace: how the store is
+-- provisioned, how the read model is built, what the stack needs to run.
+-- Infrastructure memory lives apart from project lessons so a planner can
+-- pull @how do we run at all@ without wading through fix advice.
+campaignInfraNamespace :: Namespace
+campaignInfraNamespace = projectNamespace "infra"
 
 -- | The embedded host mints its own context: full permissions on its space.
 campaignAccessContext :: MemoryAccessContext
@@ -226,6 +235,34 @@ startFixSession ns path = do
         focus = "fix " <> path,
         scope = cellScopeIn ns path,
         subjectRef = Just path,
+        previousSessionId = Nothing,
+        parentSessionId = Nothing,
+        delegationDepth = 0,
+        startedAt = now
+      }
+
+-- | Start an infrastructure session (L0 evidence about the campaign's own
+-- stack) at the infra namespace's global scope — the scope that later
+-- distillation and planner-facing keyword recall read.
+startInfraSession ::
+  (IOE :> es, KirokuStoreResource :> es, Store :> es, Error StoreError :> es) =>
+  -- | the topic (goes into the session focus)
+  Text ->
+  Eff es (Either SessionWriteError SessionId)
+startInfraSession topic = do
+  sid <- genSessionId
+  now <- liftIO getCurrentTime
+  let ctx = campaignAccessContext
+  startWithContext ctx
+    StartSessionData
+      { sessionId = sid,
+        memorySpaceId = campaignMemorySpace,
+        actorPrincipal = memoryContextRecordedActor ctx,
+        ownerPrincipal = Nothing,
+        agentId = "campaign-ops",
+        focus = "campaign infrastructure: " <> topic,
+        scope = ScopeGlobal campaignInfraNamespace,
+        subjectRef = Nothing,
         previousSessionId = Nothing,
         parentSessionId = Nothing,
         delegationDepth = 0,
