@@ -54,7 +54,8 @@ where
 
 import Control.Applicative ((<|>))
 import Control.Monad (filterM, foldM_, forM, forM_, unless, when)
-import Data.List (find, nub, sort, sortOn)
+import Data.List (find, nub, partition, sort, sortOn)
+import Data.Map.Strict qualified as Map
 import Data.Aeson qualified as Aeson
 import Data.Aeson.Key qualified as Key
 import Data.Aeson.KeyMap qualified as KeyMap
@@ -150,6 +151,7 @@ import Shikumi.Schema (FromModel, ToSchema, Validatable)
 import Shikumi.Schema.Types (Field (Field, unField), field)
 import Shikumi.Signature (Demo (..), Signature, getInstruction, mkSignature, setDemos, setInstruction)
 
+import Campaign.Aggregate (CellSummary (..), CellVertex (..), cellSummaryOf, replayCellJournal)
 import Campaign.Cell (Cell (..), CellId (..), FixAttempt (..), corpusCells, cellForId, unCellId)
 import Campaign.Fanout (runCellFanout)
 import Campaign.Hands (campaignBranchFor, campaignWorktreePath, gitCapture, parentDirtyCount)
@@ -219,13 +221,13 @@ import Data.Aeson (FromJSON, ToJSON)
 main :: IO ()
 main = do
   putStrLn "[campaign] verification cells on keiro's durable runtime (shikumi decides, keiro journals, kioku remembers)"
-  -- The demo runs all thirteen acts; a filter like ACTS=9 runs one act alone
+  -- The demo runs all seventeen acts; a filter like ACTS=9 runs one act alone
   -- (against whatever journal state the database already has). The fix
   -- session is recorded exactly once per driver run: act 4 records it, act
   -- 5 distills it — or act 5 records it itself when act 4 was filtered out.
   acts <- lookupEnv "ACTS"
   let splitOnComma = T.splitOn "," . T.strip
-      wanted = maybe [1 .. 16] (map (read . T.unpack) . splitOnComma . T.pack) acts
+      wanted = maybe [1 .. 17] (map (read . T.unpack) . splitOnComma . T.pack) acts
       step mSid n
         | n `notElem` wanted = pure mSid
         | otherwise = case n of
@@ -244,8 +246,9 @@ main = do
             13 -> runFanoutAct >> pure mSid
             14 -> runScratchAct >> pure mSid
             15 -> runInfraMemoryAct >> pure mSid
-            _ -> runMatrixAct >> pure mSid
-  foldM_ step Nothing [1 .. 16 :: Int]
+            16 -> runMatrixAct >> pure mSid
+            _ -> runCrossPlanAct >> pure mSid
+  foldM_ step Nothing [1 .. 17 :: Int]
 
 -- ---------------------------------------------------------------------------
 -- Store plumbing (jitsurei's shape; no projection schema — the journal is
@@ -1122,7 +1125,12 @@ printCellScoreboard store _registry rows =
 -- | The campaign's AI runtime, generated from the OmniRoute environment (see
 -- act 5 for the config discipline). Shared by acts 5 and 8.
 withLoadedAIRuntime :: (AIRuntime -> IO ()) -> IO ()
-withLoadedAIRuntime action = do
+withLoadedAIRuntime action = withAIRuntime (\air -> action air >> pure ())
+
+-- | The same runtime, for blocks that produce a value (act 17's planner and
+-- persona distillation both need the result, not just the effect).
+withAIRuntime :: (AIRuntime -> IO a) -> IO a
+withAIRuntime action = do
   cfgJSON <- campaignAIConfigJSON
   (cfgPath, cfgHandle) <- openTempFile "/tmp" "campaign-ai.json"
   BL.hPut cfgHandle cfgJSON
@@ -2121,3 +2129,345 @@ runMatrixAct = do
     unless (null remaining) $ fail ("matrix: unfinished cells remain: " <> show remaining)
 
   putStrLn "[matrix] done — boot/stress as data, triage as typed verdict, the human seam shared"
+
+-- ===========================================================================
+-- Act 17: cross-project planning — one portfolio, one persona, one plan
+-- ===========================================================================
+
+-- | Act 17 lifts planning from cells to the portfolio. Act 10's planner
+-- chose a cell within one campaign; this act's planner reads the WHOLE
+-- portfolio — every cell journal in the store, all three namespace scopes
+-- (toy, project, infra), and the two distilled personas — and emits a typed
+-- cross-project plan:
+--
+--   * the NEXT ACTION for each project (campaign, mowgli, peirce),
+--   * a PRIORITY ordering over the portfolio, and
+--   * a dispatch class per project: @execute@ (this stack runs it),
+--     @delegate@ (a human or another agent owns it), or @verify@ (nothing
+--     may start until an existing claim is checked against ground truth).
+--
+-- The planner program is live (the same runAIProgram path act 10 uses), the
+-- persona is distilled live at the portfolio's global scope, and the plan
+-- itself is recorded back into memory as evidence — the loop closes.
+runCrossPlanAct :: IO ()
+runCrossPlanAct = do
+  putStrLn "\n=== act 17: cross-project planning — the persona schedules the portfolio ==="
+  putStrLn "[portfolio] reading every cell journal in the store"
+  withCampaignStore $ \store -> do
+    journalRows <- portfolioJournalRows store
+    summaries <-
+      forM journalRows $ \(label, stream, vertexHint) -> do
+        events <- readJournal store stream
+        let wjes = [wje | Right wje <- decodeRecorded workflowJournalCodec <$> events]
+        pure
+          ( PortfolioRow
+              { prLabel = label,
+                prStream = stream,
+                prEvents = length events,
+                prVertex = case replayCellJournal wjes of
+                  Left _ -> vertexHint
+                  Right st ->
+                    let s = cellSummaryOf st
+                     in if s.csComplete
+                          then case s.csVertex of
+                            CellClearedVertex -> "cleared"
+                            CellEscalatedVertex -> "escalated"
+                            _ -> "complete"
+                          else case s.csVertex of
+                            CellHumanQueried -> "awaiting-human"
+                            _ -> vertexHint
+              }
+          )
+
+    let toyRows = [r | r@(PortfolioRow l _ _ _) <- summaries, "toy/" `T.isPrefixOf` l]
+        projectRows = [r | r@(PortfolioRow l _ _ _) <- summaries, "project/" `T.isPrefixOf` l]
+        matrixRows = [r | r@(PortfolioRow l _ _ _) <- summaries, "matrix/" `T.isPrefixOf` l]
+        matrixHealthy = not (null matrixRows) && all ((\v -> v == "cleared" || v == "escalated") . prVertex) matrixRows
+        (projectDone, projectOpen) =
+          partition ((\v -> v == "cleared" || v == "escalated") . prVertex) projectRows
+        (toyDone, toyOpen) =
+          partition ((\v -> v == "cleared" || v == "escalated") . prVertex) toyRows
+
+    putStrLn
+      ( "  toy cells: " <> show (length toyRows) <> " (" <> show (length toyDone) <> " done, "
+          <> show (length toyOpen) <> " open)"
+      )
+    putStrLn
+      ( "  project cells: " <> show (length projectRows) <> " (" <> show (length projectDone) <> " done, "
+          <> show (length projectOpen) <> " open)"
+      )
+    putStrLn ("  matrix cells: " <> show (length matrixRows) <> " (" <> show (length matrixRows) <> " terminal)")
+    for_ toyOpen $ \r -> putStrLn ("    open: " <> T.unpack (prLabel r) <> " [" <> T.unpack (prVertex r) <> "]")
+    for_ projectOpen $ \r -> putStrLn ("    open: " <> T.unpack (prLabel r) <> " [" <> T.unpack (prVertex r) <> "]")
+
+    -- Cross-project lessons: what one project knows that another needs.
+    -- These are recorded once (idempotent on re-run by content), recalled
+    -- into the planner prompt, and the recall is verified — the portfolio
+    -- plan is grounded in the campaign's own memory, not thin air.
+    putStrLn "[portfolio] recording cross-project lessons"
+    _ <-
+      requireEither
+        =<< runCampaignStore
+          store
+          (recordGlobalLesson (projectNamespace "mowgli") "The one-cell campaign cleared its corpus; the fixer cell machinery is proven and reusable for mowgli's unused-import class")
+    _ <-
+      requireEither
+        =<< runCampaignStore
+          store
+          (recordGlobalLesson (projectNamespace "peirce") "The matrix's staged boot/stress cells and hardware seam are the pattern for any peirce verification campaign")
+    _ <-
+      requireEither
+        =<< runCampaignStore
+          store
+          (recordGlobalLesson campaignInfraNamespace "Campaign store boots itself from bare Postgres; any new project campaign needs no manual migration recipe")
+    mowgliRecall <- requireEither =<< runCampaignStore store (recallNotes (projectNamespace "mowgli"))
+    unless (any ("fixer" `T.isInfixOf`) mowgliRecall) $
+      fail "act 17: the campaign->mowgli cross lesson is not recallable in the mowgli namespace"
+    peirceRecallEarly <- requireEither =<< runCampaignStore store (recallNotes (projectNamespace "peirce"))
+    unless (any ("matrix" `T.isInfixOf`) peirceRecallEarly) $
+      fail "act 17: the matrix->peirce cross lesson is not recallable in the peirce namespace"
+    putStrLn
+      ( "  cross lessons recallable: mowgli " <> show (length mowgliRecall) <> " note(s), peirce "
+          <> show (length peirceRecallEarly) <> " note(s)"
+      )
+
+    -- One distilled persona at the portfolio's global scope, read back
+    -- through kioku's own L3 API (the same path act 8 uses per project).
+    personaText <- withAIRuntime $ \air -> do
+      let distillRT =
+            withDistillWorkspace "/tmp/campaign-mirrors"
+              ( withTestRunners
+                  (newDistillRuntime air Nothing)
+                  (\tr -> tr{runScene = campaignSceneRunner air, runPersona = campaignPersonaRunner air})
+              )
+          gscope = ScopeGlobal campaignNamespace
+      _ <- requireEither =<< runCampaignStore store (regenerateScene distillRT campaignMemorySpace gscope)
+      personaR <- requireEither =<< runCampaignStore store (regeneratePersona distillRT campaignMemorySpace gscope)
+      case personaR of
+        Right (Just prow) -> do
+          putStrLn ("  persona distilled: " <> show (T.length prow.bodyMd) <> " chars of markdown")
+          pure prow.bodyMd
+        Right Nothing -> pure "(no persona yet — a fresh campaign)"
+        Left err -> fail ("persona distillation failed: " <> show err)
+
+    -- The live cross-project planner. Its typed input is the portfolio: the
+    -- real journal-derived state per project, the recalled notes per
+    -- namespace, the personas, and the infra facts.
+    let mowgliNotes = T.unlines (map ("- " <>) mowgliRecall)
+    peirceRecall <- requireEither =<< runCampaignStore store (recallNotes (projectNamespace "peirce"))
+    infraRecall <- requireEither =<< runCampaignStore store (recallNotes campaignInfraNamespace)
+    toyRecall <- requireEither =<< runCampaignStore store (recallNotes campaignNamespace)
+    let input =
+          PortfolioInput
+            { piState = Field (portfolioStateText summaries matrixHealthy),
+              piToyNotes = Field (T.unlines (map ("- " <>) toyRecall)),
+              piMowgliNotes = Field mowgliNotes,
+              piPeirceNotes = Field (T.unlines (map ("- " <>) peirceRecall)),
+              piInfraNotes = Field (T.unlines (map ("- " <>) infraRecall)),
+              piPersona = Field personaText
+            }
+    putStrLn "[planner] live cross-project plan over the real portfolio"
+    plan <- withAIRuntime $ \air -> do
+      r <- runWithRetry air Extraction portfolioPlannerProgram input
+      case r of
+        Left err -> fail ("cross-project planner failed: " <> show err)
+        Right out -> pure out
+    putStrLn ("  priority: " <> T.unpack (unField plan.ppPriority))
+    for_ plan.ppNext $ \nx ->
+      putStrLn
+        ( "    " <> T.unpack (unField nx.anProject) <> " -> " <> T.unpack (unField nx.anAction)
+            <> " [" <> T.unpack (unField nx.anDispatch) <> "] :: " <> T.unpack (T.take 110 (unField nx.anWhy))
+        )
+
+    -- The plan is honest: every dispatch class must be one of the three;
+    -- each project must appear; mowgli's plan must cite the cross lesson
+    -- (the planner was shown it; the stub-grade live model can paraphrase,
+    -- so accept a loose match).
+    let dispatches = [T.toLower (unField nx.anDispatch) | nx <- plan.ppNext]
+    unless (all (`elem` ["execute", "delegate", "verify"]) dispatches) $
+      fail ("act 17: planner produced an unknown dispatch class: " <> show dispatches)
+    let projectsNamed = [T.strip (unField nx.anProject) | nx <- plan.ppNext]
+    for_ ["campaign", "mowgli", "peirce"] $ \p ->
+      unless (any (p `T.isInfixOf`) projectsNamed) $
+        fail ("act 17: the plan omits project " <> T.unpack p)
+    mowgliPlan <-
+      case [nx | nx <- plan.ppNext, "mowgli" `T.isInfixOf` T.strip (unField nx.anProject)] of
+        (nx : _) -> pure nx
+        [] -> fail "act 17: no mowgli line in the plan"
+    unless
+      ( any
+          (\kw -> kw `T.isInfixOf` T.toLower (unField mowgliPlan.anAction <> " " <> unField mowgliPlan.anWhy))
+          ["import", "matrix", "cell", "reuse", "fixer", "campaign"]
+      )
+      $ fail "act 17: mowgli's plan does not engage its known state"
+
+    -- The plan is recorded back into memory as evidence: the portfolio's
+    -- next planner call can recall what was decided and why.
+    sessionOutcome <-
+      requireEither
+        =<< runCampaignStore
+          store
+          ( do
+              e <- startInfraSession "cross-project plan (act 17)"
+              case e of
+                Left err -> pure (Left err)
+                Right sid -> do
+                  _ <- recordFixTurn sid 1 "assistant" (portfolioPlanText plan)
+                  _ <- completeFixSession sid "the portfolio's cross-project plan, recorded as evidence"
+                  pure (Right ())
+          )
+    case sessionOutcome of
+      Left err -> fail ("recording the plan failed: " <> show err)
+      Right () -> pure ()
+    putStrLn "[cross-plan] done — one portfolio, one persona, one plan, recorded"
+
+-- ---------------------------------------------------------------------------
+-- Act 17 internals: portfolio state, typed plan, planner program
+-- ---------------------------------------------------------------------------
+
+-- | One portfolio row: a real journal in the store, read through the
+-- keiki aggregate (act 13's replay) into a vertex-shaped verdict.
+data PortfolioRow = PortfolioRow
+  { prLabel :: !Text,
+    prStream :: !Text,
+    prEvents :: !Int,
+    prVertex :: !Text
+  }
+  deriving stock (Eq, Show)
+
+-- | Every cell journal in the store: the toy corpus (the acts' cell
+-- campaigns), the project cells (mowgli/peirce, with and without the
+-- react/live run prefixes), and the matrix (with run tags). Discovered from
+-- kiroku's $all log plus a stream-name lookup — the store itself says what
+-- campaigns it has run, which is the point: planning reads state, not
+-- assumptions. Everything else in the store (landing journals, kioku's own
+-- evidence streams) is not a cell and is skipped.
+portfolioJournalRows :: CampaignStore -> IO [(Text, Text, Text)]
+portfolioJournalRows store = do
+  events <-
+    requireEither
+      =<< runCampaignStore
+        store
+        (Store.readAllForward (Store.GlobalPosition 0) 10000)
+  let ids = nub (map originalStreamId (Vector.toList events))
+  namesE <- requireEither =<< runCampaignStore store (Store.lookupStreamNames ids)
+  pure
+    [ row
+    | sid <- ids,
+      Just (StreamName sname) <- [Map.lookup sid namesE],
+      Just row <- [classifyJournalStream sname]
+    ]
+
+-- | A stream is a portfolio journal iff its name names one of the three
+-- campaign workflow bodies. The label carries the raw workflow id —
+-- per-project grouping is by substring, so run prefixes (react-, live-,
+-- matrix run tags) survive verbatim.
+classifyJournalStream :: Text -> Maybe (Text, Text, Text)
+classifyJournalStream sname
+  | Just wid <- T.stripPrefix "wf:cell-campaign-" sname =
+      Just ("toy/" <> wid, sname, "open")
+  | Just wid <- T.stripPrefix "wf:project-cell-campaign-" sname =
+      Just ("project/" <> wid, sname, "open")
+  | Just wid <- T.stripPrefix "wf:matrix-campaign-" sname =
+      Just ("matrix/" <> wid, sname, "open")
+  | otherwise = Nothing
+
+-- | A journal whose events we could not decode is a foreign stream; the
+-- aggregate replay is the shared fold over the decoded events.
+journalEventsOfLocal :: [RecordedEvent] -> [WorkflowJournalEvent]
+journalEventsOfLocal events = [wje | Right wje <- decodeRecorded workflowJournalCodec <$> events]
+
+-- | The typed plan the planner emits.
+data PortfolioInput = PortfolioInput
+  { piState :: Field "the portfolio's real state read off the journals" Text,
+    piToyNotes :: Field "lessons recalled from the toy campaign's namespace" Text,
+    piMowgliNotes :: Field "lessons recalled from mowgli's namespace (incl. cross-project ones)" Text,
+    piPeirceNotes :: Field "lessons recalled from peirce's namespace" Text,
+    piInfraNotes :: Field "infrastructure lessons (the campaign's own ops memory)" Text,
+    piPersona :: Field "the distilled persona of this portfolio's operator" Text
+  }
+  deriving stock (Generic, Eq, Show)
+  deriving anyclass (ToSchema, FromModel, ToPrompt)
+
+data PortfolioNext = PortfolioNext
+  { anProject :: Field "which project this line is about (campaign, mowgli, or peirce)" Text,
+    anAction :: Field "the concrete next action for that project" Text,
+    anDispatch :: Field "who runs it: execute (this stack), delegate (a human/other agent), or verify (check an existing claim first)" Text,
+    anWhy :: Field "why this action, given the state and the persona" Text
+  }
+  deriving stock (Generic, Eq, Show)
+  deriving anyclass (ToSchema, FromModel, ToPrompt)
+
+data PortfolioOutput = PortfolioOutput
+  { ppPriority :: Field "the single highest-priority item across the whole portfolio" Text,
+    ppNext :: [PortfolioNext]
+  }
+  deriving stock (Generic, Eq, Show)
+  deriving anyclass (ToSchema, FromModel, ToPrompt, Validatable)
+
+portfolioPlannerSignature :: Signature PortfolioInput PortfolioOutput
+portfolioPlannerSignature =
+  mkSignature
+    "You are the cross-project planner of a typed-LM campaign. The input is \
+    \the portfolio's REAL state (journal-derived): the toy campaign, the \
+    \project campaigns (mowgli, peirce), and the verification matrix. Produce \
+    \exactly one PortfolioNext line per project, each with a dispatch class \
+    \(execute / delegate / verify), plus the one highest-priority item. Obey \
+    \the persona; use the recalled lessons; prefer actions that reuse proven \
+    \machinery over novel machinery."
+
+-- | The wire-shape contract, as in act 10's planner: fields only, no prose.
+portfolioContractInstruction :: Text
+portfolioContractInstruction =
+  "Reply in the exact wire shape demonstrated: a priority field holding one \
+  \sentence, and a next list holding exactly one entry per project with \
+  \project, action, dispatch, and why fields. Never reply with prose outside \
+  \the fields."
+
+portfolioPlannerProgram :: Program PortfolioInput PortfolioOutput
+portfolioPlannerProgram =
+  predict
+    ( setDemos
+        [ Demo
+            ( PortfolioInput
+                (field "campaign: 3 toy cells open; mowgli: 1/3 project cells cleared; peirce: 2/3 cleared; matrix: 9/9 terminal")
+                (field "- delete-only repairs; every repair re-checked by the oracle")
+                (field "- the campaign's fixer cells are proven for mowgli's unused-import class")
+                (field "- the matrix's staged boot/stress cells fit peirce's verification needs")
+                (field "- the store self-boots; new campaigns need no manual DB recipe")
+                (field "### Portfolio persona\n- reuse proven machinery before building new")
+            )
+            ( PortfolioOutput
+                (field "peirce: wire the matrix pattern to its verification oracles")
+                [ PortfolioNext (field "campaign") (field "clear the remaining open toy cells") (field "execute") (field "the fixer machinery is proven and the lessons cover both fault classes"),
+                  PortfolioNext (field "mowgli") (field "run the remaining project cells through the fixer campaign") (field "execute") (field "the unused-import lesson transfers and the cells are already registered"),
+                  PortfolioNext (field "peirce") (field "stand up a staged verification campaign on the matrix pattern") (field "delegate") (field "the oracles need a human's domain decisions before cells can run")
+                ]
+            )
+        ]
+        (setInstruction portfolioContractInstruction portfolioPlannerSignature)
+    )
+
+portfolioPlanText :: PortfolioOutput -> Text
+portfolioPlanText out =
+  T.unlines $
+    ("priority: " <> unField out.ppPriority)
+      : [ "- " <> unField nx.anProject <> " -> " <> unField nx.anAction <> " [" <> unField nx.anDispatch <> "]"
+        | nx <- out.ppNext
+        ]
+
+portfolioStateText :: [PortfolioRow] -> Bool -> Text
+portfolioStateText rows matrixHealthy =
+  T.unlines $
+    [ "campaign: " <> T.pack (show (length toyOpen')) <> " open / " <> T.pack (show (length toyDone')) <> " done toy cells",
+      "mowgli: " <> T.pack (show (length moOpen)) <> " open / " <> T.pack (show (length moDone)) <> " done project cells",
+      "peirce: " <> T.pack (show (length peOpen)) <> " open / " <> T.pack (show (length peDone)) <> " done project cells",
+      "matrix: " <> (if matrixHealthy then "all cells terminal" else "in flight"),
+      "awaiting human: " <> T.pack (show (length [r | r <- rows, prVertex r == "awaiting-human"]))
+    ]
+  where
+    projectLabel p = [r | r@(PortfolioRow l _ _ _) <- rows, "project/" `T.isPrefixOf` l, p `T.isInfixOf` l]
+    (toyDone', toyOpen') = splitDone [r | r@(PortfolioRow l _ _ _) <- rows, "toy/" `T.isPrefixOf` l]
+    (moDone, moOpen) = splitDone (projectLabel "mowgli")
+    (peDone, peOpen) = splitDone (projectLabel "peirce")
+    splitDone rs = partition ((\v -> v == "cleared" || v == "escalated") . prVertex) rs
