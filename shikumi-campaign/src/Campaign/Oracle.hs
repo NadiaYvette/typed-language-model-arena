@@ -44,6 +44,9 @@ module Campaign.Oracle
     -- * The syntax floor
     pythonSyntaxCheck,
 
+    -- * The use test (the oracle's, exposed for probes and rules)
+    nameUsedIn,
+
     -- * Real project cells (read from the checkouts at runtime)
     ProjectCell (..),
     projectCellSpecs,
@@ -56,6 +59,7 @@ module Campaign.Oracle
   )
 where
 
+import Data.Char (isAlphaNum)
 import Data.List (foldl', sort)
 import Control.Monad (filterM)
 import Data.Text (Text)
@@ -155,7 +159,7 @@ importSpecFrom ls = do
     parseClauses raw =
       let ls' = T.lines raw
           s = T.strip (T.intercalate " " (map T.strip ls'))
-       in if not ("import" `T.isPrefixOf` s)
+       in if not ("import" `T.isPrefixOf` s || "from " `T.isPrefixOf` s)
             then Nothing
             else
               let isFrom = "from " `T.isPrefixOf` s
@@ -285,7 +289,36 @@ unusedImportDiags path (Source body) =
     -- early shortcut — made every CamelCase import unmatchable: a used
     -- `analyseOutput` read as unused. The tessera run caught it.)
     bodyText = T.intercalate "\n" [l | (n, l) <- numbered, n > maxImportLine]
-    unused nm = not (T.null nm) && not (nm `T.isInfixOf` bodyText)
+    unused nm = not (nameUsedIn nm bodyText)
+
+-- | Is a bound name /used/ in the body text? The precise test: the name
+-- occurs as a whole word (identifier boundaries on both sides) /and not as
+-- an attribute/ — an occurrence preceded by @.@ is a field of some other
+-- object (@shutil.copyfile@ uses @shutil@, never the @copyfile@ binding).
+-- This is what the bare substring test could not see: it read
+-- @shutil.copyfile@ as a use of @copyfile@ and stayed silent on a cell
+-- whose honest repair is deleting the import.
+--
+-- Still conservative in the safe direction: a keyword argument
+-- (@f(copyfile=…)@) reads as a use, so a shadowed-argument corner counts
+-- as used and is never touched.
+nameUsedIn :: Text -> Text -> Bool
+nameUsedIn nm body
+  | T.null nm = False
+  | otherwise = any ok (occurrences nm body)
+  where
+    isIdentChar c = isAlphaNum c || c == '_'
+    ok i =
+      let prevC = if i == 0 then Nothing else Just (T.index body (i - 1))
+          nextC = if i + T.length nm >= T.length body then Nothing else Just (T.index body (i + T.length nm))
+       in maybe True (\c -> not (isIdentChar c) && c /= '.') prevC
+            && maybe True (not . isIdentChar) nextC
+    occurrences needle t = go 0 t
+      where
+        go base rest = case T.breakOn needle rest of
+          (pre, hit)
+            | T.null hit -> []
+            | otherwise -> (base + T.length pre) : go (base + T.length pre + 1) (T.drop 1 hit)
 
 -- | The real oracle over a checkout's files.
 unusedImportOracle :: CellOracle
@@ -344,9 +377,10 @@ repairRulesFor src@(Source body) flaggedStarts =
     partiallyUsed spec =
       length (isClauses spec) > length [c | c <- isClauses spec, allNamesUnused (icNames c)]
         && not (null [c | c <- isClauses spec, allNamesUnused (icNames c)])
-    -- The same use-test the oracle flags with, verbatim: substring search
-    -- in the case-sensitive body below the import block.
-    allNamesUnused = all (\nm -> not (T.null nm) && not (nm `T.isInfixOf` bodyText))
+    -- The same use-test the oracle flags with, verbatim: whole-word,
+    -- attribute-disqualified occurrences in the case-sensitive body below
+    -- the import block.
+    allNamesUnused = all (\nm -> not (T.null nm) && not (nameUsedIn nm bodyText))
     bodyText =
       let maxImportLine = foldl' (\acc s -> max acc (isEnd s)) 0 specs
        in T.intercalate "\n" [l | (n, l) <- zip [1 :: Int ..] (T.lines body), n > maxImportLine]

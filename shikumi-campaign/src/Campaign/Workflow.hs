@@ -396,6 +396,9 @@ surgicalRepair orig rules (Source new)
     alignment = go 1 origLines newLines
       where
         go _ [] ys = if null ys then Just [] else Nothing
+        -- The repair ended early: every remaining original line is a
+        -- deletion (the missing clause once crashed a live drive round).
+        go n (x : xs) [] = (n :) <$> go (n + 1) xs []
         go n (x : xs) (y : ys)
           | x == y = go (n + 1) xs ys
           | Just (rn, txt) <- mRewrite, n == rn, y == txt = go (n + 1) xs ys
