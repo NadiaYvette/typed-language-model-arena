@@ -66,7 +66,7 @@ import GHC.Generics (Generic)
 
 import Baikai (Context, Response)
 import Campaign.Memory (campaignNamespace, projectNamespace, recallNotesForKeyword)
-import Campaign.Oracle (CellOracle (..), ProjectCell (..), markerOracle, unusedImportOracle)
+import Campaign.Oracle (CellOracle (..), ProjectCell (..), flaggedLinesOf, markerOracle, pythonSyntaxCheck, unusedImportOracle)
 import Data.Char (isDigit)
 import Data.List (find)
 import Kioku.Api.Scope (Namespace)
@@ -286,17 +286,23 @@ runFixAttempt ::
   AttemptEngine ->
   Source ->
   [Int] ->
+  -- | the cell's path — the syntax check reports against it
+  SourcePath ->
   DiagnosticsIn ->
   [Text] ->
   Int ->
   Eff es (Maybe Source)
-runFixAttempt engine orig flagged input notes n = go notes (0 :: Int)
+runFixAttempt engine orig flagged path input notes n = go notes (0 :: Int)
   where
-    -- The taught retry: a surgical rejection is fed back as an extra lesson
+    -- The taught retry: a guard rejection is fed back as an extra lesson
     -- ("obey them" — 'guidedFixer' folds notes into the instruction), so the
     -- next engine call tells the model what it did wrong. The engine's own
     -- inner retries stay blind, as they must: they guard the wire shape and
-    -- the subsequence check inside the program, which see no oracle.
+    -- the subsequence check inside the program, which see no oracle. Two
+    -- guards feed back: the surgical guard (deletions outside the flagged
+    -- statements) and the syntax floor ('pythonSyntaxCheck' — the widened
+    -- oracle flags multi-line imports, and a partial deletion can leave the
+    -- file unparseable, which the AST-free oracle cannot see).
     go ns k
       | k >= 3 = pure Nothing
       | otherwise = do
@@ -304,49 +310,56 @@ runFixAttempt engine orig flagged input notes n = go notes (0 :: Int)
           case m of
             Nothing -> pure Nothing
             Just rep -> case surgicalRepair orig flagged rep of
-              Right _ -> pure (Just rep)
-              Left err -> do
-                let msg = case err of
-                      ValidationFailure t -> t
-                      _ -> T.pack (show err)
-                liftIO $ putStrLn "    [guard] surgical rejection — fed back as a lesson"
-                go
-                  ( ns
-                      <> [ "Your previous reply was rejected: " <> msg
-                             <> ". Return the complete file with ONLY the flagged lines deleted."
-                         ]
-                  )
-                  (k + 1)
+              Left err -> retryWith ns k (surgicalMsg err)
+              Right _ -> do
+                mSyn <- liftIO (pythonSyntaxCheck path rep)
+                case mSyn of
+                  Nothing -> pure (Just rep)
+                  Just syn -> retryWith ns k ("your previous reply does not parse as Python — " <> syn)
+    retryWith ns k why = do
+      liftIO $ putStrLn "    [guard] rejection — fed back as a lesson"
+      go
+        ( ns
+            <> [ "Your previous reply was rejected: " <> why
+                   <> " Return the complete file with ONLY the flagged import statements deleted."
+               ]
+        )
+        (k + 1)
+    surgicalMsg err = case err of
+      ValidationFailure t -> t
+      _ -> T.pack (show err)
 
 -- | The surgical guard: deletions only, and only the lines the oracle
--- flagged — plus blank lines, whose removal is formatting, not semantics. A
--- repair that deletes unflagged code is a degenerate solution: the
--- unused-import oracle cannot see a missing function, so it would happily
--- clear a file the repair gutted. Deleted lines are recovered by aligning
--- the repair against the original (the subsequence guard already ran, so
--- the alignment is exact).
+-- flagged — extended to whole import /statements/ ('flaggedLinesOf': a
+-- flagged multi-line import must be deleted whole, never half) and blank
+-- lines, whose removal is formatting, not semantics. A repair that deletes
+-- unflagged code is a degenerate solution: the unused-import oracle cannot
+-- see a missing function, so it would happily clear a file the repair
+-- gutted. Deleted lines are recovered by aligning the repair against the
+-- original (the subsequence guard already ran, so the alignment is exact).
 surgicalRepair :: Source -> [Int] -> Source -> Either ShikumiError Source
-surgicalRepair (Source orig) flagged (Source new)
+surgicalRepair orig@(Source origLinesT) flagged (Source new)
   | null flagged = Right (Source new)
   | all allowed deletions = Right (Source new)
   | otherwise =
       Left
         ( ValidationFailure
             "the repair deletes lines the diagnostics did not flag: only \
-            \the flagged lines (and blank lines) may be removed"
+            \the flagged import statements (whole, not half) and blank \
+            \lines may be removed"
         )
   where
-    origLines = T.lines orig
-    deletions = go 1 1 origLines (T.lines new)
+    allowedSet = flaggedLinesOf orig flagged
+    origLines = T.lines origLinesT
+    deletions = go 1 origLines (T.lines new)
       where
-        go _ _ [] _ = []
-        go n _ ys [] = [n .. n + length ys - 1]
-        go n m (x : xs) (y : ys)
-          | x == y = go (n + 1) (m + 1) xs ys
-          | otherwise = n : go (n + 1) m xs (y : ys)
-        go _ _ _ _ = []
+        go _ [] _ = []
+        go n ys [] = [n .. n + length ys - 1]
+        go n (x : xs) (y : ys)
+          | x == y = go (n + 1) xs ys
+          | otherwise = n : go (n + 1) xs (y : ys)
     allowed n =
-      n `elem` flagged
+      n `elem` allowedSet
         || T.null (T.strip (origLines !! (n - 1)))
 
 -- | One attempt, as a step action: recall lessons (a kioku read, journaled
@@ -374,7 +387,7 @@ attemptRecord cell oracle ns engine n = do
         DiagnosticsIn
           (Field (cellPath cell))
           (Field before)
-  mRepaired <- runFixAttempt engine orig flagged input notes n
+  mRepaired <- runFixAttempt engine orig flagged (cellPath cell) input notes n
   case mRepaired of
     Nothing ->
       pure

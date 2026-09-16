@@ -39,6 +39,7 @@ import Data.Map.Strict qualified as Map
 import Data.Maybe (mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
+import System.FilePath ((</>))
 import Effectful (Eff, IOE, liftIO, (:>))
 import GHC.Generics (Generic)
 
@@ -52,9 +53,9 @@ import Campaign.Hands
     ensureCampaignWorktree,
     verifyInWorktree,
   )
-import Campaign.Oracle (CellOracle (..), ProjectCell (..), unusedImportOracle)
+import Campaign.Oracle (CellOracle (..), ProjectCell (..), pythonSyntaxCheck, unusedImportOracle)
 import Campaign.Workflow (campaignStreamNameText)
-import Toy.Fixer.Domain (SourcePath, showDiagnostic)
+import Toy.Fixer.Domain (Source (..), SourcePath, showDiagnostic)
 
 -- | The journaled result of one landing: where the repair now lives, whether
 -- the on-disk check agreed with the journal, and (when it did) the commit it
@@ -102,9 +103,12 @@ landAction pc oracle branch repair = liftIO $ do
       path = pcPath pc
   wt <- ensureCampaignWorktree proj branch
   applyRepairInWorktree wt path repair
-  diags <- verifyInWorktree oracle wt path
-  if not (null diags)
-    then
+  -- The syntax floor, re-derived from disk like the oracle's verdict: the
+  -- disk gets the final word, and a file that does not parse never commits.
+  diskBody <- T.pack <$> readFile (wt </> T.unpack path)
+  mSyn <- pythonSyntaxCheck path (Source diskBody)
+  case mSyn of
+    Just syn ->
       pure
         LandingRecord
           { lrProject = proj,
@@ -113,20 +117,34 @@ landAction pc oracle branch repair = liftIO $ do
             lrBranch = branch,
             lrCommit = "",
             lrVerified = False,
-            lrDiagnostics = map showDiagnostic diags
+            lrDiagnostics = [syn]
           }
-    else do
-      commit <- commitLanding wt path repair
-      pure
-        LandingRecord
-          { lrProject = proj,
-            lrPath = path,
-            lrWorktree = T.pack wt,
-            lrBranch = branch,
-            lrCommit = commit,
-            lrVerified = True,
-            lrDiagnostics = []
-          }
+    Nothing -> do
+      diags <- verifyInWorktree oracle wt path
+      if not (null diags)
+        then
+          pure
+            LandingRecord
+              { lrProject = proj,
+                lrPath = path,
+                lrWorktree = T.pack wt,
+                lrBranch = branch,
+                lrCommit = "",
+                lrVerified = False,
+                lrDiagnostics = map showDiagnostic diags
+              }
+        else do
+          commit <- commitLanding wt path repair
+          pure
+            LandingRecord
+              { lrProject = proj,
+                lrPath = path,
+                lrWorktree = T.pack wt,
+                lrBranch = branch,
+                lrCommit = commit,
+                lrVerified = True,
+                lrDiagnostics = []
+              }
 
 -- | The landing workflow's name — registered alongside the fix campaigns.
 landingWorkflowName :: WorkflowName

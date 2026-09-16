@@ -111,6 +111,8 @@ import Kiroku.Store.Types
   )
 import System.Directory (createDirectoryIfMissing, doesFileExist, listDirectory, removeFile)
 import System.Environment (lookupEnv)
+import Data.Maybe (fromMaybe, listToMaybe)
+import Text.Read (readMaybe)
 
 import Campaign.Bootstrap
   ( bootstrapCampaignStore
@@ -3748,21 +3750,46 @@ runDispatchAct = do
 --      landed commits, and the run recorded as infra memory.
 runAppPhaseAct :: IO ()
 runAppPhaseAct = do
-  putStrLn "\n=== act 22: the application phase — mowgli's unused imports, live, landed ==="
+  -- The application target is parameterized (default: mowgli, the proven
+  -- checkout) — the same act runs wherever the oracle speaks.
+  mproj <- lookupEnv "CAMPAIGN_APP_PROJECT"
+  let proj = T.pack (fromMaybe "mowgli" (listToMaybe . words =<< mproj))
+  putStrLn "\n=== act 22: the application phase — unused imports, live, landed ==="
   runTag0 <- T.pack . show . floor . utcTimeToPOSIXSeconds <$> getCurrentTime
   let runTag = "app" <> runTag0
-      branch = appPhaseBranchFor runTag "mowgli"
+      branch = appPhaseBranchFor runTag proj
 
   -- ----------------------------------------------------------- (1) scan
-  putStrLn "[app] scanning mowgli's checkout with the real unused-import oracle"
-  cells <- scanProjectUnusedImportCells "mowgli"
-  when (null cells) $ fail "act 22: the scan found no cells — is the oracle's vocabulary still true of the checkout?"
+  putStrLn ("[app] scanning " <> T.unpack proj <> "'s checkout with the real unused-import oracle")
+  cells0 <- scanProjectUnusedImportCells proj
+  -- CAMPAIGN_APP_LIMIT=n: bound one run to n cells (a long checkout is
+  -- chewed over several runs; each run lands its own reviewable branch).
+  mlimit <- (>>= readMaybe) <$> lookupEnv "CAMPAIGN_APP_LIMIT"
+  let cells = maybe cells0 (\n -> take n cells0) (mlimit :: Maybe Int)
+  case (mlimit, length cells0) of
+    (Just n, total) | n < total -> putStrLn ("  (run limit " <> show n <> " of " <> show total <> " scanned cells — the rest wait for a later run)")
+    _ -> pure ()
+  when (null cells) $
+    putStrLn "  the scan found no cells — the oracle speaks nowhere in this checkout (nothing to do)"
   for_ cells $ \pc ->
     putStrLn
       ( "  cell " <> T.unpack (pcProject pc <> ":" <> pcPath pc)
           <> " — " <> show (length (oracleCheck unusedImportOracle (pcPath pc) (pcSource pc))) <> " diagnostic(s)"
       )
+  -- CAMPAIGN_APP_SCAN_ONLY=1: the validation run — compare this scan against
+  -- an independent detector, attempt nothing, land nothing.
+  scanOnly <- (== Just "1") <$> lookupEnv "CAMPAIGN_APP_SCAN_ONLY"
+  when scanOnly $ putStrLn "[app] scan-only mode — no attempts, no landings"
+  when (null cells && not scanOnly) $
+    fail "act 22: the scan found no cells — is the oracle's vocabulary still true of the checkout?"
+  -- (the act continues below only when cells exist and scan-only is unset)
+  unless (scanOnly || null cells) $ runAppPhaseFixAndLand proj runTag branch cells
 
+-- | Act 22, continued: fix, land, score — everything past the scan, as one
+-- function of the application target, so the scan-only validation mode stops
+-- before any attempt is made.
+runAppPhaseFixAndLand :: Text -> Text -> Text -> [ProjectCell] -> IO ()
+runAppPhaseFixAndLand proj runTag branch cells = do
   -- ------------------------------------------------------------- (2) fix
   putStrLn "[app] launching the live fixer campaigns (one per real cell)"
   withLoadedAIRuntime $ \air -> do
@@ -3885,7 +3912,7 @@ runAppPhaseAct = do
           (_, _, Nothing) -> putStrLn ("  " <> T.unpack (cellKey pc) <> ": cleared but no accepted repair recorded — not landed")
     cellsWithRepairs <- reverse <$> readIORef repairsRef
 
-    dirtyBefore <- parentDirtyCount "mowgli"
+    dirtyBefore <- parentDirtyCount proj
     withCampaignStore $ \store ->
       forM_ cellsWithRepairs $ \(pc, repair) -> do
         let wid = landingWorkflowIdFor ("app-" <> runTag) (pcProject pc, pcPath pc)
@@ -3904,14 +3931,14 @@ runAppPhaseAct = do
                   then putStrLn ("  landed " <> T.unpack (lrProject recd <> ":" <> lrPath recd) <> " — commit " <> T.unpack (lrCommit recd) <> " on " <> T.unpack (lrBranch recd))
                   else putStrLn ("  NOT LANDED " <> T.unpack (lrProject recd <> ":" <> lrPath recd) <> " — " <> T.unpack (T.intercalate "; " (lrDiagnostics recd)))
               [] -> fail ("act 22: landing journal has no record for " <> T.unpack (cellKey pc))
-    dirtyAfter <- parentDirtyCount "mowgli"
+    dirtyAfter <- parentDirtyCount proj
     putStrLn ("  parent dirty entries before: " <> show dirtyBefore <> ", after: " <> show dirtyAfter)
     when (dirtyBefore /= dirtyAfter) $ fail "act 22: the parent checkout was modified — safety rule violated"
 
     -- The run's work, reviewable — only when there is work: a run that
     -- lands nothing creates no worktree, so there is no log to show.
     unless (null cellsWithRepairs) $ do
-      wtLog <- gitCapture (campaignWorktreePath "mowgli" branch) ["log", "--oneline", T.unpack branch]
+      wtLog <- gitCapture (campaignWorktreePath proj branch) ["log", "--oneline", T.unpack branch]
       putStrLn ("  branch log (" <> T.unpack branch <> "):")
       for_ (T.lines wtLog) (putStrLn . ("    " <>) . T.unpack)
 
@@ -3934,7 +3961,7 @@ runAppPhaseAct = do
               <> (if ok then "complete" else "INCOMPLETE") <> ", "
               <> show (length attempts) <> " attempt(s) — " <> verdict
           )
-      sid <- runKiokuWrite store (startInfraSession "application phase (act 22): mowgli corpus, live, landed")
+      sid <- runKiokuWrite store (startInfraSession ("application phase (act 22): " <> proj <> " corpus, live, landed"))
       _ <- runKiokuWrite store
         ( recordFixTurn
             sid
