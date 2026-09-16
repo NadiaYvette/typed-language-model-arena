@@ -67,17 +67,18 @@ import GHC.Generics (Generic)
 import Baikai (Context, Response)
 import Campaign.Memory (campaignNamespace, projectNamespace, recallNotesForKeyword)
 import Campaign.Oracle (CellOracle (..), ProjectCell (..), markerOracle, unusedImportOracle)
+import Data.Char (isDigit)
 import Data.List (find)
 import Kioku.Api.Scope (Namespace)
 import Kiroku.Store.Effect.Resource (KirokuStoreResource)
 import Shikumi.Combinator ((>>>))
-import Shikumi.Error (ShikumiError)
+import Shikumi.Error (ShikumiError (..))
 import Shikumi.Module (predict)
 import Shikumi.Program (Program, embed, runProgram)
 import Shikumi.Schema.Types (Field (..))
 import Shikumi.Signature (Demo (..), Signature, getInstruction, setDemos, setInstruction)
 import Shikumi.Testing (runStubEval)
-import Toy.Fixer.Domain (Source (..), SourcePath, showDiagnostic, sourceText)
+import Toy.Fixer.Domain (Source (..), SourcePath, diagLine, showDiagnostic, sourceText)
 import Toy.Fixer.Program (DiagnosticsIn (..), RepairOut (..), applyRepair, repairSignature)
 
 import Campaign.Cell
@@ -151,9 +152,17 @@ projectCellFromWf (WorkflowId t0) = do
     Just path -> pure (proj, path)
   where
     stripInstancePrefixes u =
-      case T.stripPrefix "react-" u <|> T.stripPrefix "live-" u <|> T.stripPrefix "dispatch-" u of
+      -- Named prefixes first (the acts' fixed tags), then the act-22 per-run
+      -- instance tag: "app" <> digits <> "-" (runTag is a POSIX-seconds show).
+      case T.stripPrefix "react-" u <|> T.stripPrefix "live-" u <|> T.stripPrefix "dispatch-" u <|> T.stripPrefix "app-" u of
         Just u' -> stripInstancePrefixes u'
-        Nothing -> u
+        Nothing
+          | Just r <- T.stripPrefix "app" u,
+            (ds, rest) <- T.span isDigit r,
+            not (T.null ds),
+            Just u' <- T.stripPrefix "-" rest ->
+              stripInstancePrefixes u'
+          | otherwise -> u
 
 -- ---------------------------------------------------------------------------
 -- The human seam: the typed third outcome
@@ -224,7 +233,10 @@ guidedFixer orig notes =
 -- stub engines never needed this (they are scripted per cell), but a real
 -- model asked to "return the complete repaired file" while blind to the file
 -- can only hallucinate. The worked demo pins the wire contract: whole file
--- back, deletions only.
+-- back, deletions only — and /only the flagged lines/, the constraint the
+-- surgical guard enforces (a live run demonstrated why the prose alone is
+-- not enough: the model once wiped the file and obeyed the letter of the
+-- deletions-only rule).
 liveInstruction :: Source -> [Text] -> Signature DiagnosticsIn RepairOut
 liveInstruction orig notes =
   setDemos [Demo exampleIn exampleOut] $
@@ -233,8 +245,8 @@ liveInstruction orig notes =
           <> "\n\nThe current content of the file being fixed:\n"
           <> sourceText orig
           <> "\nReply with the repaired field holding the complete file after "
-          <> "deleting the flagged lines. No commentary, no fences — the field "
-          <> "is the file."
+          <> "deleting exactly the flagged lines and nothing else. No commentary, "
+          <> "no fences — the field is the file."
           <> (if null notes then "" else "\n\nLessons learned earlier in this campaign (obey them):\n" <> T.unlines (map ("- " <>) notes))
       )
       repairSignature
@@ -265,18 +277,77 @@ defaultMaxAttempts = 3
 -- right here. The program is 'guidedFixer' — the original bound in as the
 -- guard's ground truth, the lessons folded into the instruction — and the
 -- engine supplies the model behind it. Returns the repaired source when the
--- proposal passed the no-regression guard; failures surface as typed
--- 'ShikumiError's inside the engine, recorded as failed attempts.
+-- proposal passed both the no-regression guard and the surgical guard; the
+-- first failed attempt (live run 22d) was a whole-file wipe — a valid
+-- subsequence the deletion-only guard waved through — so the campaign layer
+-- adds the diagnosis-coupled constraint before anything reaches a journal.
 runFixAttempt ::
   (IOE :> es) =>
   AttemptEngine ->
   Source ->
+  [Int] ->
   DiagnosticsIn ->
   [Text] ->
   Int ->
   Eff es (Maybe Source)
-runFixAttempt engine orig input@(DiagnosticsIn _ (Field _)) notes n =
-  liftIO (engine n (guidedFixer orig notes) input notes)
+runFixAttempt engine orig flagged input notes n = go notes (0 :: Int)
+  where
+    -- The taught retry: a surgical rejection is fed back as an extra lesson
+    -- ("obey them" — 'guidedFixer' folds notes into the instruction), so the
+    -- next engine call tells the model what it did wrong. The engine's own
+    -- inner retries stay blind, as they must: they guard the wire shape and
+    -- the subsequence check inside the program, which see no oracle.
+    go ns k
+      | k >= 3 = pure Nothing
+      | otherwise = do
+          m <- liftIO (engine n (guidedFixer orig ns) input ns)
+          case m of
+            Nothing -> pure Nothing
+            Just rep -> case surgicalRepair orig flagged rep of
+              Right _ -> pure (Just rep)
+              Left err -> do
+                let msg = case err of
+                      ValidationFailure t -> t
+                      _ -> T.pack (show err)
+                liftIO $ putStrLn "    [guard] surgical rejection — fed back as a lesson"
+                go
+                  ( ns
+                      <> [ "Your previous reply was rejected: " <> msg
+                             <> ". Return the complete file with ONLY the flagged lines deleted."
+                         ]
+                  )
+                  (k + 1)
+
+-- | The surgical guard: deletions only, and only the lines the oracle
+-- flagged — plus blank lines, whose removal is formatting, not semantics. A
+-- repair that deletes unflagged code is a degenerate solution: the
+-- unused-import oracle cannot see a missing function, so it would happily
+-- clear a file the repair gutted. Deleted lines are recovered by aligning
+-- the repair against the original (the subsequence guard already ran, so
+-- the alignment is exact).
+surgicalRepair :: Source -> [Int] -> Source -> Either ShikumiError Source
+surgicalRepair (Source orig) flagged (Source new)
+  | null flagged = Right (Source new)
+  | all allowed deletions = Right (Source new)
+  | otherwise =
+      Left
+        ( ValidationFailure
+            "the repair deletes lines the diagnostics did not flag: only \
+            \the flagged lines (and blank lines) may be removed"
+        )
+  where
+    origLines = T.lines orig
+    deletions = go 1 1 origLines (T.lines new)
+      where
+        go _ _ [] _ = []
+        go n _ ys [] = [n .. n + length ys - 1]
+        go n m (x : xs) (y : ys)
+          | x == y = go (n + 1) (m + 1) xs ys
+          | otherwise = n : go (n + 1) m xs (y : ys)
+        go _ _ _ _ = []
+    allowed n =
+      n `elem` flagged
+        || T.null (T.strip (origLines !! (n - 1)))
 
 -- | One attempt, as a step action: recall lessons (a kioku read, journaled
 -- into the record — replay never re-recalls), run the engine, apply the guard.
@@ -291,7 +362,10 @@ attemptRecord ::
   Eff es FixAttempt
 attemptRecord cell oracle ns engine n = do
   let orig = oracleOriginal oracle (cellPath cell) (cellCurrent cell)
-      before = map showDiagnostic (oracleCheck oracle (cellPath cell) (cellCurrent cell))
+      beforeDiags = oracleCheck oracle (cellPath cell) (cellCurrent cell)
+      before = map showDiagnostic beforeDiags
+      -- The surgical guard's allow-list: the lines the oracle itself flags.
+      flagged = map diagLine beforeDiags
       -- The keywords the diagnostics themselves suggest: the memory consulted
       -- is a function of the task, not of the caller.
       diagKws = concat [keywordsOf d | d <- before]
@@ -300,7 +374,7 @@ attemptRecord cell oracle ns engine n = do
         DiagnosticsIn
           (Field (cellPath cell))
           (Field before)
-  mRepaired <- runFixAttempt engine orig input notes n
+  mRepaired <- runFixAttempt engine orig flagged input notes n
   case mRepaired of
     Nothing ->
       pure

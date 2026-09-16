@@ -27,6 +27,7 @@ module Campaign.Oracle
     ProjectCell (..),
     projectCellSpecs,
     readProjectCell,
+    scanProjectUnusedImportCells,
 
     -- * Diagnostics helpers
     diagLineOf,
@@ -36,8 +37,9 @@ where
 
 import Data.Text (Text)
 import Data.Text qualified as T
-import System.Directory (doesFileExist)
-import System.FilePath ((</>))
+import System.Directory (doesFileExist, listDirectory)
+import System.FilePath (takeExtension, (</>))
+import Data.List (sort)
 
 import Toy.Fixer.Domain (Diagnostic (..), Source (..), SourcePath, checkSource)
 
@@ -169,3 +171,19 @@ readProjectCell (proj, path) = do
     else do
       body <- readFile fp
       pure (Just (ProjectCell proj path (Source (T.pack body))))
+
+-- | The outer scan for the application phase: every @.py@ file at the top
+-- of a checkout that the oracle flags — the real defects, found by the
+-- real oracle, read from the real bytes on disk. A file the oracle clears
+-- is not a cell: there is nothing for the campaign to do on it.
+scanProjectUnusedImportCells :: Text -> IO [ProjectCell]
+scanProjectUnusedImportCells proj = do
+  let dir = "/home/nyc/src" </> T.unpack proj
+  entries <- listDirectory dir
+  let pyFiles = sort [T.pack e | e <- entries, takeExtension e == ".py"]
+  candidates <- mapM readProjectCell [(proj, p) | p <- pyFiles]
+  pure
+    [ pc
+    | Just pc <- candidates
+    , not (null (oracleCheck unusedImportOracle (pcPath pc) (pcSource pc)))
+    ]

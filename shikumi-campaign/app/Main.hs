@@ -80,7 +80,7 @@ import Keiro.Workflow
   ( CancelWorkflowOutcome (..),
     WorkflowId (..),
     WorkflowJournalEvent (..),
-    WorkflowName,
+    WorkflowName (..),
     WorkflowOutcome (..),
     cancelWorkflow,
     defaultWorkflowRunOptions,
@@ -168,11 +168,13 @@ import Shikumi.Coder.Task (PatchPlan (..), applyPlan)
 import Campaign.Aggregate (CellSummary (..), CellVertex (..), cellSummaryOf, replayCellJournal)
 import Campaign.Cell (Cell (..), CellId (..), FixAttempt (..), corpusCells, cellForId, unCellId)
 import Campaign.Fanout (runCellFanout)
-import Campaign.Hands  ( campaignBranchFor,
+import Campaign.Hands
+  ( appPhaseBranchFor,
+    campaignBranchFor,
     campaignWorktreePath,
     ensureCampaignWorktree,
     gitCapture,
-    parentDirtyCount
+    parentDirtyCount,
   )
 import Campaign.Landing
   ( LandingRecord (..),
@@ -263,7 +265,7 @@ import Campaign.Mercury
   )
 import Baikai (Context (..), Message (..), Response, TextContent (..), UserContent (..))
 import Baikai.Message (UserPayload (UserPayload))
-import Campaign.Oracle (CellOracle (..), ProjectCell (..), diagLineOf, markerOracle, projectCellSpecs, readProjectCell, unusedImportOracle)
+import Campaign.Oracle (CellOracle (..), ProjectCell (..), diagLineOf, markerOracle, projectCellSpecs, readProjectCell, scanProjectUnusedImportCells, unusedImportOracle)
 import Campaign.ReactFixer (renderSteps, reactEngineFor, scriptedReactEngine)
 import Campaign.Workflow
   ( AttemptEngine,
@@ -304,7 +306,7 @@ main = do
   -- 5 distills it — or act 5 records it itself when act 4 was filtered out.
   acts <- lookupEnv "ACTS"
   let splitOnComma = T.splitOn "," . T.strip
-      wanted = maybe [1 .. 21] (map (read . T.unpack) . splitOnComma . T.pack) acts
+      wanted = maybe [1 .. 22] (map (read . T.unpack) . splitOnComma . T.pack) acts
       step mSid n
         | n `notElem` wanted = pure mSid
         | otherwise = case n of
@@ -329,8 +331,9 @@ main = do
             19 -> runLiveMercuryAct >> pure mSid
             20 -> runHelpCheckAct >> pure mSid
             21 -> runDispatchAct >> pure mSid
+            22 -> runAppPhaseAct >> pure mSid
             n -> fail ("unknown act: " <> show n)
-  foldM_ step Nothing [1 .. 21 :: Int]
+  foldM_ step Nothing [1 .. 22 :: Int]
 
 -- ---------------------------------------------------------------------------
 -- Store plumbing (jitsurei's shape; no projection schema — the journal is
@@ -490,6 +493,11 @@ ourUnfinished store ourIds = do
   now <- liftIO getCurrentTime
   pairs <- requireEither =<< runCampaignStore store (findUnfinishedWorkflowIds now)
   pure [pair | pair@(wid, _) <- pairs, wid `elem` ourIds]
+
+-- | @Keiro.Workflow.Types@ keeps 'WorkflowName''s accessor internal; the act
+-- compares discovery's text against the name constant through this wrapper.
+unWorkflowName' :: WorkflowName -> Text
+unWorkflowName' (WorkflowName t) = t
 
 resumeOptions :: WorkflowResumeOptions
 resumeOptions =
@@ -3715,3 +3723,227 @@ runDispatchAct = do
           if any ("corruption" `T.isInfixOf`) (unField input.tiStress)
             then TriageOut (Field False) (Field "board corruption: human inspection required")
             else TriageOut (Field True) (Field "kvm misconfiguration clears by re-applying the config")
+
+-- ===========================================================================
+-- Act 22: the application phase — mowgli's real corpus, live, landed
+-- ===========================================================================
+
+-- | The stack, applied. Act 21 closed the dispatch loop on the campaign's
+-- own demo portfolio; this act points the same machinery at a real
+-- checkout, mowgli:
+--
+--   1. @scan@ — the real oracle scans the checkout's top-level @.py@ files.
+--      Cells are the files the oracle actually flags; nothing is invented.
+--   2. @fix@ — one live fixer campaign per file (the act-9 live engine, the
+--      unused-import oracle, the no-regression guard), driven to a verdict
+--      through the merged registry: launch, then fire whatever timers the
+--      journals prove are armed, then resume, until every journal is
+--      complete.
+--   3. @land@ — each cleared cell's accepted repair is committed for real,
+--      by the act-11 landing machinery, on this run's reviewable branch
+--      (@campaign/app-<tag>@ in the mowgli campaign worktree). The parent
+--      checkout is never touched; the dirty-count safety proof runs here
+--      exactly as act 11's does.
+--   4. @scoreboard + memory@ — per-cell verdicts from the journals, the
+--      landed commits, and the run recorded as infra memory.
+runAppPhaseAct :: IO ()
+runAppPhaseAct = do
+  putStrLn "\n=== act 22: the application phase — mowgli's unused imports, live, landed ==="
+  runTag0 <- T.pack . show . floor . utcTimeToPOSIXSeconds <$> getCurrentTime
+  let runTag = "app" <> runTag0
+      branch = appPhaseBranchFor runTag "mowgli"
+
+  -- ----------------------------------------------------------- (1) scan
+  putStrLn "[app] scanning mowgli's checkout with the real unused-import oracle"
+  cells <- scanProjectUnusedImportCells "mowgli"
+  when (null cells) $ fail "act 22: the scan found no cells — is the oracle's vocabulary still true of the checkout?"
+  for_ cells $ \pc ->
+    putStrLn
+      ( "  cell " <> T.unpack (pcProject pc <> ":" <> pcPath pc)
+          <> " — " <> show (length (oracleCheck unusedImportOracle (pcPath pc) (pcSource pc))) <> " diagnostic(s)"
+      )
+
+  -- ------------------------------------------------------------- (2) fix
+  putStrLn "[app] launching the live fixer campaigns (one per real cell)"
+  withLoadedAIRuntime $ \air -> do
+    sink <- newIORef []
+    let publishHumanQuery :: AwakeableId -> Eff CampaignEffects ()
+        publishHumanQuery aid = do
+          inserted <- liftIO $ atomicModifyIORef' sink (\p -> if aid `elem` p then (p, False) else (p <> [aid], True))
+          when inserted $ liftIO $ putStrLn ("  published human-query awakeable id: " <> T.unpack (awakeableIdText aid))
+        -- Cells are keyed like every project cell: @projectWorkflowId proj
+        -- path@; the fresh-campaign instance prefix carries the run tag
+        -- (@pcell-app<runTag>-@, admitted by projectCellFromWf) so this run
+        -- launches its own journals instead of resuming a superseded run's
+        -- — a resume-in-place replayed a pre-surgical repair once already.
+        cellKey pc = pcProject pc <> ":" <> pcPath pc
+        instWfId pc =
+          let WorkflowId t = projectWorkflowId (pcProject pc) (pcPath pc)
+           in WorkflowId (T.replace "pcell-" ("pcell-app-" <> runTag <> "-") t)
+        rows = [(pc, campaignStreamNameText projectCampaignWorkflowName (instWfId pc)) | pc <- cells]
+        ourIds = [wfIdText (instWfId pc) | pc <- cells]
+        registry =
+          Map.unions
+            [ campaignRegistry
+                [pc {pcSource = pcSource pc} | pc <- cells]
+                []
+                (\_oracle _cell -> liveEngine air)
+                publishHumanQuery
+            ]
+
+    for_ cells $ \pc -> do
+      let wid = instWfId pc
+          stream = campaignStreamNameText projectCampaignWorkflowName wid
+      withCampaignStore $ \store -> do
+        journal0 <- decodedJournal <$> readJournal store stream
+        if not (null journal0)
+          then putStrLn ("  " <> T.unpack (cellKey pc) <> ": journal exists — resuming in place")
+          else do
+            requireFreshJournal store stream
+            outcome <- requireEither =<< runCampaignStore store
+              (runWorkflowWith defaultWorkflowRunOptions projectCampaignWorkflowName wid
+                ( cellCampaignWorkflow
+                    (liveEngine air)
+                    (raise . publishHumanQuery)
+                    (Cell (CellId (cellKey pc)) (pcPath pc) (pcSource pc) (pcSource pc))
+                    unusedImportOracle
+                    (projectNamespace "mowgli")
+                    defaultMaxAttempts
+                ))
+            putStrLn ("  launch " <> T.unpack (cellKey pc) <> ": " <> show outcome)
+
+    -- Operator hygiene, act 21's rule applied to the app phase: retire any
+    -- unfinished cell-campaign instance this run's registry cannot rebuild —
+    -- the pre-fix doubled-path id among them — with a typed cancellation,
+    -- never a silent delete.
+    withCampaignStore $ \store -> do
+      now <- getCurrentTime
+      pairs <- requireEither =<< runCampaignStore store (findUnfinishedWorkflowIds now)
+      let ours = SSet.fromList (map wfIdText (map instWfId cells))
+      for_ pairs $ \(nameText, idText) ->
+        when (nameText == unWorkflowName' projectCampaignWorkflowName && not (idText `SSet.member` ours)) $ do
+          _ <- requireEither =<< runCampaignStore store (cancelWorkflow projectCampaignWorkflowName (WorkflowId idText))
+          putStrLn ("  retired superseded instance: " <> T.unpack idText)
+
+    -- The drive: settle/cool timers fire (the typed fallback dead-letters
+    -- kioku's own stranded rows), the registry resumes the campaigns, and
+    -- the loop ends when every journal is complete — or the budget is out.
+    -- Completion is judged from the journals, not from discovery: a campaign
+    -- suspended on a settle timer is invisible to the instance query until
+    -- its fire_at passes, and the launch-to-drive gap is smaller than the
+    -- settle delay — gating on discovery alone ends the loop before the
+    -- first timer is ever fired.
+    let driveRound :: IO Bool
+        driveRound = do
+          doneRef <- newIORef False
+          withCampaignStore $ \store -> do
+            fireTime <- addUTCTime 3600 <$> getCurrentTime
+            _ <- requireEither =<< runCampaignStore store
+              (drainWorkflowSleepTimers Nothing fireTime 100 campaignTimerPmFallback)
+            driveResumeOnce store registry
+            driveResumeOnce store registry
+            statuses <- forM rows $ \(_, stream) -> do
+              j <- decodedJournal <$> readJournal store stream
+              pure (journalIsComplete j)
+            writeIORef doneRef (and statuses)
+          readIORef doneRef
+        driveRounds k
+          | k <= (0 :: Int) = pure ()
+          | otherwise = driveRound >>= \done -> unless done (driveRounds (k - 1))
+    driveRounds 10
+    -- The campaigns never park in normal operation (maxAttempts per cell,
+    -- each attempt a proposed deletion the guard re-checks); a parked one
+    -- means the model proposed something the guard kept rejecting, and the
+    -- honest move is to report it, not to answer for it.
+    withCampaignStore $ \store -> do
+      published <- readIORef sink
+      unless (null published) $ putStrLn ("  parked queries (reported, not answered): " <> show (length published))
+
+    -- ------------------------------------------------------- (3) land
+    putStrLn "[app] landing every cleared cell's repair on " >> putStrLn (T.unpack branch)
+    -- The landing gate: a cell's repair lands only when its journal is
+    -- /complete and cleared/ — the last attempt succeeded with zero
+    -- diagnostics after. "Some attempt was accepted" once landed a degenerate
+    -- whole-file wipe: the guard had passed it, the oracle could not see what
+    -- was missing, and the run was honest everywhere except here.
+    repairsRef <- newIORef []
+    withCampaignStore $ \store ->
+      forM_ rows $ \(pc, stream) -> do
+        journal <- decodedJournal <$> readJournal store stream
+        let attempts = journaledAttempts journal
+            ok = journalIsComplete journal
+            cleared = case reverse attempts of
+              (last_ : _) -> faSucceeded last_ && null (faDiagnosticsAfter last_)
+              [] -> False
+        let lastRepair = case reverse attempts of
+              (last_ : _) -> faRepaired last_
+              [] -> Nothing
+        case (ok, cleared, lastRepair) of
+          (False, _, _) -> putStrLn ("  " <> T.unpack (cellKey pc) <> ": journal incomplete — not landed")
+          (_, False, _) -> putStrLn ("  " <> T.unpack (cellKey pc) <> ": closed without clearing — not landed")
+          (_, _, Just r) -> modifyIORef' repairsRef ((pc, r) :)
+          (_, _, Nothing) -> putStrLn ("  " <> T.unpack (cellKey pc) <> ": cleared but no accepted repair recorded — not landed")
+    cellsWithRepairs <- reverse <$> readIORef repairsRef
+
+    dirtyBefore <- parentDirtyCount "mowgli"
+    withCampaignStore $ \store ->
+      forM_ cellsWithRepairs $ \(pc, repair) -> do
+        let wid = landingWorkflowIdFor ("app-" <> runTag) (pcProject pc, pcPath pc)
+            stream = campaignStreamNameText landingWorkflowName wid
+        existing <- decodedJournal <$> readJournal store stream
+        case landingRecordOf existing of
+          (recd : _) -> putStrLn ("  already landed " <> T.unpack (lrProject recd <> ":" <> lrPath recd) <> " — " <> T.unpack (lrCommit recd))
+          [] -> do
+            _ <- requireEither =<< runCampaignStore store
+              (runWorkflowWith defaultWorkflowRunOptions landingWorkflowName wid
+                (landProjectCellWorkflow pc unusedImportOracle branch repair))
+            journal <- decodedJournal <$> readJournal store stream
+            case landingRecordOf journal of
+              (recd : _) ->
+                if lrVerified recd
+                  then putStrLn ("  landed " <> T.unpack (lrProject recd <> ":" <> lrPath recd) <> " — commit " <> T.unpack (lrCommit recd) <> " on " <> T.unpack (lrBranch recd))
+                  else putStrLn ("  NOT LANDED " <> T.unpack (lrProject recd <> ":" <> lrPath recd) <> " — " <> T.unpack (T.intercalate "; " (lrDiagnostics recd)))
+              [] -> fail ("act 22: landing journal has no record for " <> T.unpack (cellKey pc))
+    dirtyAfter <- parentDirtyCount "mowgli"
+    putStrLn ("  parent dirty entries before: " <> show dirtyBefore <> ", after: " <> show dirtyAfter)
+    when (dirtyBefore /= dirtyAfter) $ fail "act 22: the parent checkout was modified — safety rule violated"
+
+    -- The run's work, reviewable — only when there is work: a run that
+    -- lands nothing creates no worktree, so there is no log to show.
+    unless (null cellsWithRepairs) $ do
+      wtLog <- gitCapture (campaignWorktreePath "mowgli" branch) ["log", "--oneline", T.unpack branch]
+      putStrLn ("  branch log (" <> T.unpack branch <> "):")
+      for_ (T.lines wtLog) (putStrLn . ("    " <>) . T.unpack)
+
+    -- --------------------------------------------- (4) scoreboard + memory
+    putStrLn "[app] journal scoreboard — the real corpus, fixed by the real model"
+    withCampaignStore $ \store -> do
+      forM_ rows $ \(pc, stream) -> do
+        journal <- decodedJournal <$> readJournal store stream
+        let attempts = journaledAttempts journal
+            ok = journalIsComplete journal
+            cleared = case reverse attempts of
+              (last_ : _) -> faSucceeded last_ && null (faDiagnosticsAfter last_)
+              [] -> False
+            verdict
+              | not ok = "INCOMPLETE"
+              | cleared = "cleared"
+              | otherwise = "closed without clearing"
+        putStrLn
+          ( "  " <> T.unpack (cellKey pc) <> ": "
+              <> (if ok then "complete" else "INCOMPLETE") <> ", "
+              <> show (length attempts) <> " attempt(s) — " <> verdict
+          )
+      sid <- runKiokuWrite store (startInfraSession "application phase (act 22): mowgli corpus, live, landed")
+      _ <- runKiokuWrite store
+        ( recordFixTurn
+            sid
+            1
+            "assistant"
+            ( "act 22 scanned " <> T.pack (show (length cells)) <> " real cells in mowgli, fixed them live, and landed "
+                <> T.pack (show (length cellsWithRepairs)) <> " repair(s) on " <> branch
+            )
+        )
+      _ <- runKiokuWrite store (completeFixSession sid "the stack applied to a real checkout: scan by oracle, fix by live model, land by worktree, prove by parent-dirty-count")
+      putStrLn "  infra session recorded"
+    putStrLn "[app] done — a real checkout's real defects, decided by the journals"

@@ -31,6 +31,7 @@ module Campaign.Hands
 
     -- * The worktree lifecycle
     campaignBranchFor,
+    appPhaseBranchFor,
     campaignWorktreePath,
     ensureCampaignWorktree,
     applyRepairInWorktree,
@@ -73,6 +74,12 @@ data Landing = Landing
 -- diff against the default branch.
 campaignBranchFor :: Text -> Text
 campaignBranchFor _proj = "campaign/unused-imports"
+
+-- | The application phase's branch: one campaign run, one reviewable branch,
+-- per project — the same convention as act 18's per-run Mercury branches,
+-- so every run replays reviewably and nothing mixes.
+appPhaseBranchFor :: Text -> Text -> Text
+appPhaseBranchFor runTag _proj = "campaign/app-" <> runTag
 
 -- | Where a project's worktree for one campaign branch lives: one worktree
 -- per (project, branch), so each campaign concept lands on its own isolated
