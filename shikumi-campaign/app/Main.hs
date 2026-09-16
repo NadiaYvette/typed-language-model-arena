@@ -116,14 +116,23 @@ import Campaign.Bootstrap
   ( bootstrapCampaignStore
   , bootstrapStore
   , ccDbname
+  , ccPassword
   , createDatabaseIfAbsent
   , defaultCampaignConn
+  , parseCampaignConn
   , dropDatabase
+  , ensureOwnedServer
+  , ownedServerAlive
+  , ownedServerConn
+  , ownedServerStateDir
   , renderCampaignConn
   , scratchConnFor
   , sentinelRelation
+  , stopOwnedServer
+  , serverAnswers
   , storeWorkflowCount
   )
+import System.Exit (exitSuccess)
 import System.FilePath ((</>))
 import System.IO (hClose, openTempFile)
 import Data.UUID.V4 (nextRandom)
@@ -280,6 +289,14 @@ import Data.Aeson (FromJSON, ToJSON)
 
 main :: IO ()
 main = do
+  -- Operator mode: server lifecycle without running acts. The demo binary
+  -- owns the server, so it owns the controls too.
+  serverMode <- lookupEnv "SERVER"
+  case fmap (T.unpack . T.toLower . T.strip . T.pack) serverMode of
+    Just "status" -> serverStatusMode >> exitSuccess
+    Just "stop" -> stopOwnedServer >> exitSuccess
+    Just other -> fail ("SERVER=" <> other <> " — supported: status, stop")
+    _ -> pure ()
   putStrLn "[campaign] verification cells on keiro's durable runtime (shikumi decides, keiro journals, kioku remembers)"
   -- The demo runs all seventeen acts; a filter like ACTS=9 runs one act alone
   -- (against whatever journal state the database already has). The fix
@@ -326,6 +343,39 @@ type CampaignEffects = '[Store, Error StoreError, KirokuStoreResource, IOE]
 newtype CampaignStore = CampaignStore
   { runCampaignStore :: forall a. Eff CampaignEffects a -> IO (Either StoreError a)
   }
+
+-- | Operator mode: report the server picture without running acts — and
+-- without /changing/ it. Status never starts or stops anything: it reports
+-- the owned server's liveness, where its state lives, and which connection
+-- the acts would resolve (the env string when set and answering, the owned
+-- server otherwise).
+serverStatusMode :: IO ()
+serverStatusMode = do
+  stateDir <- ownedServerStateDir
+  alive <- ownedServerAlive
+  envConn <- lookupEnv "PG_CONNECTION_STRING"
+  putStrLn
+    ( "[server] owned server: "
+        <> (if alive then "UP" else "down")
+        <> " (state: "
+        <> stateDir
+        <> ")"
+    )
+  case fmap T.pack envConn of
+    Just raw | not (T.null (T.strip raw)) -> do
+      envAlive <- serverAnswers (parseCampaignConn raw)
+      putStrLn
+        ( "[server] campaign connection (env): "
+            <> T.unpack (T.strip raw)
+            <> if envAlive then " — answering" else " — DOES NOT ANSWER (acts would fail with guidance)"
+        )
+    _ -> do
+      conn <- ownedServerConn
+      putStrLn
+        ( "[server] campaign connection (owned server): "
+            <> T.unpack (renderCampaignConn conn {ccPassword = Nothing})
+            <> (if alive then "" else " — would be started on the next act run")
+        )
 
 -- | The campaign keeps no read models of its own, so it needs no projection
 -- schema of substance: keiro's settings with a campaign projection-schema tag.
@@ -506,9 +556,9 @@ requireFreshJournal store streamName = do
     fail
       ( "journal "
           <> T.unpack streamName
-          <> " already exists; reset the campaign DB first: dropdb campaign"
-          <> " && createdb campaign && DATABASE_URL='host=/tmp dbname=campaign'"
-          <> " cabal run kioku-migrate -- up"
+          <> " already exists; the demo replays completed journals — point "
+          <> "PG_CONNECTION_STRING at a fresh database, or (operator mode) "
+          <> "SERVER=stop and clear the owned server's state directory"
       )
 
 requireCell :: Text -> IO Cell

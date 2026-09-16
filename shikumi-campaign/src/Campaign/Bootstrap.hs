@@ -33,6 +33,13 @@ module Campaign.Bootstrap
     renderCampaignConn,
     defaultCampaignConn,
     campaignConnString,
+    ownedServerStateDir,
+    ownedServerSocketPath,
+    ownedServerConn,
+    ownedServerAlive,
+    ensureOwnedServer,
+    stopOwnedServer,
+    serverAnswers,
     scratchConnFor,
     -- * Boot
     bootstrapCampaignStore,
@@ -48,7 +55,7 @@ where
 
 import Control.Concurrent (threadDelay)
 import Control.Exception (SomeException, bracket, try)
-import Control.Monad (forM, forM_)
+import Control.Monad (forM, forM_, unless, when)
 import Data.Char qualified as Char
 import Data.List (sort)
 import Data.Maybe (fromMaybe)
@@ -61,11 +68,20 @@ import Hasql.Pool qualified as P
 import Hasql.Pool.Config qualified as PC
 import Hasql.Session qualified as Session
 import Hasql.Statement (unpreparable)
-import System.Directory (doesDirectoryExist, listDirectory)
+import System.Directory
+  ( XdgDirectory (XdgState),
+    createDirectoryIfMissing,
+    doesDirectoryExist,
+    doesFileExist,
+    getXdgDirectory,
+    listDirectory,
+    removeFile,
+  )
 import System.Environment (lookupEnv)
-import System.Exit (exitFailure)
+import System.Exit (ExitCode (..), exitFailure)
 import System.FilePath (takeExtension, (</>))
 import System.IO (hPutStrLn, stderr)
+import System.Process (proc, readCreateProcessWithExitCode)
 import Text.Read (readMaybe)
 
 -- ---------------------------------------------------------------------------
@@ -118,12 +134,45 @@ renderCampaignConn c =
       , ["dbname=" <> c.ccDbname]
       ]
 
--- | The campaign's own connection: @$PG_CONNECTION_STRING@ when set, the
--- historical default otherwise.
+-- | The campaign's own connection, three modes:
+--
+--   1. @$PG_CONNECTION_STRING@ set /and answering/ — an operator-owned
+--      server; pass through untouched (the historical contract).
+--   2. unset — the stack owns its own server ('ensureOwnedServer'): initdb
+--      and start one under @$XDG_STATE_HOME/shikumi-campaign@ if needed.
+--   3. set /but dead/ — fail with an actionable message. Silently starting
+--      the owned server would hide the operator's misconfiguration.
 defaultCampaignConn :: IO CampaignConn
 defaultCampaignConn =
-  parseCampaignConn . T.pack . fromMaybe "host=/tmp dbname=campaign"
-    <$> lookupEnv "PG_CONNECTION_STRING"
+  lookupEnv "PG_CONNECTION_STRING" >>= \case
+    Just raw | not (T.null (T.strip (T.pack raw))) -> do
+      let conn = parseCampaignConn (T.pack raw)
+      alive <- serverAnswers conn
+      if alive
+        then pure conn
+        else do
+          stateDir <- ownedServerStateDir
+          fail
+            ( "PG_CONNECTION_STRING names a server that does not answer ("
+                <> T.unpack (renderCampaignConn conn {ccPassword = Nothing})
+                <> "). Start it, fix the string, or unset PG_CONNECTION_STRING "
+                <> "to let the stack own its own server (initdb + pg_ctl under "
+                <> stateDir
+                <> ")."
+            )
+    -- The owned server: silent once up (the acts open dozens of store
+    -- scopes; ensureOwnedServer itself reports initdb/start work, and
+    -- quietness here keeps per-scope noise out of the act logs).
+    _ -> ensureOwnedServer
+
+-- | Does any server answer on this connection's host/port (the @postgres@
+-- database, which every server has)?
+serverAnswers :: CampaignConn -> IO Bool
+serverAnswers conn = do
+  probe <- try (withPool conn {ccDbname = "postgres"} (\p -> usePool p (Session.script "SELECT 1")))
+  case probe of
+    Right () -> pure True
+    Left (_ :: SomeException) -> pure False
 
 -- | The connection string the store layers consume (same resolution as
 -- 'defaultCampaignConn').
@@ -134,6 +183,135 @@ campaignConnString = renderCampaignConn <$> defaultCampaignConn
 -- credentials, a different database. This is act 14's raw material.
 scratchConnFor :: CampaignConn -> T.Text -> CampaignConn
 scratchConnFor main dbname = main {ccDbname = dbname}
+
+-- ---------------------------------------------------------------------------
+-- The owned server: the stack brings its own Postgres
+-- ---------------------------------------------------------------------------
+
+-- | The owned server's state directory: @$XDG_STATE_HOME/shikumi-campaign@
+-- (@~/.local/state/shikumi-campaign@ by default). Everything the server
+-- needs lives here — the @initdb@ cluster, the Unix socket directory, and
+-- @postmaster.pid@ — so a stack-owned server never writes outside its own
+-- directory.
+ownedServerStateDir :: IO FilePath
+ownedServerStateDir = getXdgDirectory XdgState "shikumi-campaign"
+
+-- | The owned server listens on a Unix socket only — no TCP, no port
+-- collisions, reachable only by local processes that can open the socket.
+ownedServerSocketPath :: IO FilePath
+ownedServerSocketPath = (<> "-pg.sock") <$> ownedServerStateDir
+
+-- | The owned server's connection: socket, default port, the @campaign@
+-- database, and the superuser @initdb -U@ created. The user is explicit —
+-- libpq's default (the OS user) would only work if the stack happened to
+-- run as the cluster's superuser name.
+ownedServerConn :: IO CampaignConn
+ownedServerConn = do
+  sock <- ownedServerSocketPath
+  pure (CampaignConn {ccHost = Just (T.pack sock), ccPort = Just ownedServerPort, ccUser = Just "campaign", ccPassword = Nothing, ccDbname = "campaign"})
+
+-- | Run one of the postgres tool binaries (@initdb@, @pg_ctl@, @postgres@),
+-- captured. Stderr is included in failures: pg tooling reports everything
+-- there.
+runPgTool :: FilePath -> [String] -> IO (ExitCode, String, String)
+runPgTool bin args = readCreateProcessWithExitCode (proc bin args) ""
+
+-- | The socket directory must exist before the server starts: postgres's
+-- @-k@ names the /directory/ the socket file (@.s.PGSQL.<port>@) appears in.
+prepareSocketDir :: FilePath -> IO ()
+prepareSocketDir = createDirectoryIfMissing True
+
+-- | Locate the postgres tooling: @$PG_BINDIR@ when set, the @PATH@ default
+-- otherwise (the same resolution @pg_ctl@ users expect).
+findPgBin :: String -> IO FilePath
+findPgBin bin = do
+  mDir <- lookupEnv "PG_BINDIR"
+  pure (maybe bin (</> bin) mDir)
+
+-- | Is a server answering on the owned socket?
+ownedServerAlive :: IO Bool
+ownedServerAlive = do
+  conn <- ownedServerConn
+  probe <- try (withPool conn {ccDbname = "postgres"} (\p -> usePool p (Session.script "SELECT 1")))
+  case probe of
+    Right () -> pure True
+    Left (_ :: SomeException) -> pure False
+
+-- | Ensure the stack's own server is running and its database bootable:
+-- @initdb@ a cluster under the state directory if there is none, @pg_ctl
+-- start@ if nothing answers on the socket, then leave 'createDatabaseIfAbsent'
+-- (the existing boot chain) to make the @campaign@ database itself. Idempotent
+-- and crash-tolerant: a stale @postmaster.pid@ from a killed server is
+-- repaired by @pg_ctl start@'s own conflict handling.
+ensureOwnedServer :: IO CampaignConn
+ensureOwnedServer = do
+  stateDir <- ownedServerStateDir
+  sock <- ownedServerSocketPath
+  createDirectoryIfMissing True stateDir
+  prepareSocketDir sock
+  let dataDir = stateDir </> "pgdata"
+      logFile = stateDir </> "postgres.log"
+  clusterReady <- doesFileExist (dataDir </> "PG_VERSION")
+  unless clusterReady $ do
+    initdb <- findPgBin "initdb"
+    putStrLn ("[server] initdb " <> dataDir)
+    (ec, _out, err) <- runPgTool initdb ["-D", dataDir, "-A", "trust", "-U", "campaign", "--no-instructions"]
+    unless (ec == ExitSuccess) $
+      fail ("[server] initdb failed: " <> err)
+  alive <- ownedServerAlive
+  unless alive $ do
+    pgctl <- findPgBin "pg_ctl"
+    putStrLn ("[server] pg_ctl start (socket dir " <> sock <> ", port " <> show ownedServerPort <> ")")
+    (ec, _out, err) <-
+      runPgTool
+        pgctl
+        [ "-D",
+          dataDir,
+          "-l",
+          logFile,
+          -- Socket-only: no TCP listener at all, so the owned server can
+          -- never collide with an operator's server on the default port.
+          "-o",
+          "-k " <> sock <> " -p " <> show ownedServerPort <> " -c listen_addresses=''",
+          "-w",
+          "-t",
+          "60",
+          "start"
+        ]
+    unless (ec == ExitSuccess) $
+      fail ("[server] pg_ctl start failed: " <> err)
+    -- The socket accepts connections a beat after pg_ctl's own readiness
+    -- check; poll briefly so the very first session never races it.
+    ready <- waitUntil 50 ownedServerAlive
+    unless ready $
+      fail "[server] the owned server never answered on its socket"
+  ownedServerConn
+
+-- | The owned server's port. Fixed (not ephemeral) so repeated starts reuse
+-- the same connection facts; the Unix socket makes it unreachable from off-box.
+ownedServerPort :: Int
+ownedServerPort = 5432
+
+-- | Poll an action until it returns True (or the budget runs out). One tick
+-- is 100ms.
+waitUntil :: Int -> IO Bool -> IO Bool
+waitUntil ticks action
+  | ticks <= (0 :: Int) = pure False
+  | otherwise = do
+      ok <- action
+      if ok then pure True else threadDelay 100000 >> waitUntil (ticks - 1) action
+
+-- | Stop the owned server (operator mode). A server that isn't running is
+-- already stopped — @pg_ctl@'s answer is reported, not hidden.
+stopOwnedServer :: IO ()
+stopOwnedServer = do
+  stateDir <- ownedServerStateDir
+  let dataDir = stateDir </> "pgdata"
+  pgctl <- findPgBin "pg_ctl"
+  (ec, out, err) <- runPgTool pgctl ["-D", dataDir, "-m", "fast", "stop"]
+  putStrLn $ case ec of
+    ExitSuccess -> "[server] stopped"
+    _ -> "[server] pg_ctl stop: " <> unwords (words (out <> err))
 
 -- ---------------------------------------------------------------------------
 -- Migration roots
