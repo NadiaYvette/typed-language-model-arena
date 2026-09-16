@@ -111,6 +111,7 @@ import Kiroku.Store.Types
   )
 import System.Directory (createDirectoryIfMissing, doesFileExist, listDirectory, removeFile)
 import System.Environment (lookupEnv)
+import Data.Function ((&))
 import Data.Maybe (fromMaybe, listToMaybe)
 import Text.Read (readMaybe)
 
@@ -3762,10 +3763,15 @@ runAppPhaseAct = do
   -- ----------------------------------------------------------- (1) scan
   putStrLn ("[app] scanning " <> T.unpack proj <> "'s checkout with the real unused-import oracle")
   cells0 <- scanProjectUnusedImportCells proj
-  -- CAMPAIGN_APP_LIMIT=n: bound one run to n cells (a long checkout is
-  -- chewed over several runs; each run lands its own reviewable branch).
+  -- CAMPAIGN_APP_LIMIT=n / CAMPAIGN_APP_OFFSET=n: one run takes a window of
+  -- the sorted scan (a long checkout is chewed over several runs; each run
+  -- lands its own reviewable branch). The offset exists because the scan
+  -- reads the parent checkout — cells a previous run cleared live only on
+  -- that run's branch — so consecutive runs partition the scan by offset.
   mlimit <- (>>= readMaybe) <$> lookupEnv "CAMPAIGN_APP_LIMIT"
-  let cells = maybe cells0 (\n -> take n cells0) (mlimit :: Maybe Int)
+  moffset <- (>>= readMaybe) <$> lookupEnv "CAMPAIGN_APP_OFFSET"
+  let windowed = maybe cells0 (\o -> drop o cells0) moffset
+      cells = maybe windowed (\n -> take n windowed) (mlimit :: Maybe Int)
   case (mlimit, length cells0) of
     (Just n, total) | n < total -> putStrLn ("  (run limit " <> show n <> " of " <> show total <> " scanned cells — the rest wait for a later run)")
     _ -> pure ()
