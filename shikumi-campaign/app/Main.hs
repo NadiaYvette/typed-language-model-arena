@@ -268,7 +268,7 @@ import Campaign.Mercury
   )
 import Baikai (Context (..), Message (..), Response, TextContent (..), UserContent (..))
 import Baikai.Message (UserPayload (UserPayload))
-import Campaign.Oracle (CellOracle (..), ProjectCell (..), diagLineOf, markerOracle, projectCellSpecs, readProjectCell, scanProjectUnusedImportCells, unusedImportOracle)
+import Campaign.Oracle (CellOracle (..), ProjectCell (..), RepairRules (..), diagLineOf, markerOracle, projectCellSpecs, readProjectCell, repairRulesFor, scanProjectUnusedImportCells, unusedImportOracle)
 import Campaign.ReactFixer (renderSteps, reactEngineFor, scriptedReactEngine)
 import Campaign.Workflow
   ( AttemptEngine,
@@ -1108,22 +1108,32 @@ runDistillAct sid = do
 -- Shared fleet plumbing: the honest responder, concurrent store, timer sweep
 -- ---------------------------------------------------------------------------
 
--- | The honest fleet "model": applies the one lesson each diagnostic needs
--- (delete the flagged line) to the diagnostics the /actual oracle/ computed
--- for the /actual cell/. A live model does the same because the diagnostics
--- and lessons ride the prompt; this stub does it textually. The repair is
--- still checked by the real no-regression guard, and the oracle still
--- re-scores what survived, so a wrong lesson application fails honestly.
+-- | The honest fleet "model": applies the repair contract the diagnostics
+-- imply to the /actual oracle/'s view of the /actual cell/ — delete the
+-- droppable flagged statements, and rewrite a partially-used statement to
+-- exactly the contract's canonical kept-name line. A live model does the
+-- same because the diagnostics and lessons ride the prompt; this stub does
+-- it textually. The repair is still checked by the real no-regression guard
+-- and the surgical contract guard, and the oracle still re-scores what
+-- survived, so a wrong lesson application fails honestly.
 honestEngineFor :: EngineFor
-honestEngineFor oracle cell = stubEngine (\_n _ctx -> markerResponse [("repaired", T.unlines kept)])
+honestEngineFor oracle cell = stubEngine (\_n _ctx -> markerResponse [("repaired", repaired)])
   where
+    orig = cellCurrent cell
     diags = oracleCheck oracle (cellPath cell) (cellCurrent cell)
-    doomed = SSet.fromList (map diagLineOf diags)
+    rules = repairRulesFor orig (map diagLineOf diags)
+    origLines = T.lines (sourceText orig)
     kept =
       [ l
-      | (i, l) <- zip [1 :: Int ..] (T.lines (sourceText (cellCurrent cell))),
-        not (i `SSet.member` doomed)
+      | (i, l) <- zip [1 :: Int ..] origLines,
+        not (i `SSet.member` SSet.fromList (rrDroppableLines rules))
       ]
+    repaired = case rrRewrite rules of
+      -- The rewrite line replaces the original's span (one line here; a
+      -- multi-line span would need the same line arithmetic the guard does,
+      -- and no stub corpus cell has one).
+      Just (rn, txt) -> T.unlines [if i == rn then txt else l | (i, l) <- zip [1 :: Int ..] origLines, i == rn || not (i `SSet.member` SSet.fromList (rrDroppableLines rules))]
+      Nothing -> T.unlines kept
 
 -- | The full text of a rendered request — system prompt plus every user
 -- message's text blocks. A scripted stub may condition its answer on it (the

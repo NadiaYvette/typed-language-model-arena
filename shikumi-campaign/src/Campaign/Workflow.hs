@@ -48,6 +48,9 @@ module Campaign.Workflow
     cellCampaignWorkflow,
     defaultMaxAttempts,
 
+    -- * The surgical guard (the repair contract's enforcement half)
+    surgicalRepair,
+
     -- * The registry
     campaignRegistry,
   )
@@ -66,7 +69,7 @@ import GHC.Generics (Generic)
 
 import Baikai (Context, Response)
 import Campaign.Memory (campaignNamespace, projectNamespace, recallNotesForKeyword)
-import Campaign.Oracle (CellOracle (..), ProjectCell (..), flaggedLinesOf, markerOracle, pythonSyntaxCheck, unusedImportOracle)
+import Campaign.Oracle (CellOracle (..), ProjectCell (..), RepairRules (..), markerOracle, pythonSyntaxCheck, repairRulesFor, unusedImportOracle)
 import Data.Char (isDigit)
 import Data.List (find)
 import Kioku.Api.Scope (Namespace)
@@ -223,41 +226,58 @@ stubEngine responder n prog input _notes = do
 -- in, whole repaired file out) and the no-regression guard stay untouched.
 -- With no lessons this is exactly 'fixSource'; either way the guard is
 -- composed back on, so invented lines are typed errors under every engine.
-guidedFixer :: Source -> [Text] -> Program DiagnosticsIn RepairOut
-guidedFixer orig notes =
-  predict (liveInstruction orig notes)
-    >>> embed (\out -> either throwError (\_ -> pure out) (applyRepair orig out))
+guidedFixer :: Source -> [Text] -> Maybe (Int, Text) -> Program DiagnosticsIn RepairOut
+guidedFixer orig notes mRewrite =
+  predict (liveInstruction orig notes mRewrite)
+    >>> embed
+      ( \out -> case mRewrite of
+          -- The canonical rewrite's line does not exist in the original, so
+          -- the subsequence check would reject it sight unseen; when a
+          -- rewrite is admissible the campaign guard ('surgicalRepair')
+          -- owns admissibility entirely — it admits exactly the canonical
+          -- rewrite or pure deletions of droppable lines, which is a
+          -- strictly tighter floor than the subsequence check.
+          Just _ -> pure out
+          Nothing -> either throwError (\_ -> pure out) (applyRepair orig out)
+      )
 
 -- | 'repairSignature' with the file content and the recalled lessons folded
 -- into its instruction. A live model must /see the file/ to repair it — the
 -- stub engines never needed this (they are scripted per cell), but a real
 -- model asked to "return the complete repaired file" while blind to the file
 -- can only hallucinate. The worked demo pins the wire contract: whole file
--- back, deletions only — and /only the flagged lines/, the constraint the
--- surgical guard enforces (a live run demonstrated why the prose alone is
--- not enough: the model once wiped the file and obeyed the letter of the
--- deletions-only rule).
-liveInstruction :: Source -> [Text] -> Signature DiagnosticsIn RepairOut
-liveInstruction orig notes =
-  setDemos [Demo exampleIn exampleOut] $
+-- back, edits confined to the flagged lines — delete fully-flagged import
+-- statements; rewrite a partially-used one to keep exactly its used names
+-- (the rewrite line is given verbatim; inventing formatting is not a
+-- repair). A live run demonstrated why the prose alone is not enough: the
+-- model once wiped the file and obeyed the letter of the deletions rule.
+liveInstruction :: Source -> [Text] -> Maybe (Int, Text) -> Signature DiagnosticsIn RepairOut
+liveInstruction orig notes mRewrite =
+  setDemos [example] $
     setInstruction
       ( getInstruction repairSignature
           <> "\n\nThe current content of the file being fixed:\n"
           <> sourceText orig
           <> "\nReply with the repaired field holding the complete file after "
-          <> "deleting exactly the flagged lines and nothing else. No commentary, "
-          <> "no fences — the field is the file."
+          <> "deleting exactly the flagged lines and nothing else"
+          <> rewriteClause
+          <> ". No commentary, no fences — the field is the file."
           <> (if null notes then "" else "\n\nLessons learned earlier in this campaign (obey them):\n" <> T.unlines (map ("- " <>) notes))
       )
       repairSignature
   where
-    exampleIn =
-      DiagnosticsIn
-        (Field "widget.py")
-        (Field ["W-unused-import unused import 'os' at line 2"])
-    exampleOut =
-      RepairOut
-        (Field "import sys\n\n\ndef size(w):\n    return len(w)\n")
+    rewriteClause = case mRewrite of
+      Nothing -> ""
+      Just (ln, txt) ->
+        ", except that line " <> T.pack (show ln)
+          <> " must read exactly: " <> txt
+    example =
+      Demo
+        ( DiagnosticsIn
+            (Field "widget.py")
+            (Field ["W-unused-import unused import 'os' at line 2"])
+        )
+        (RepairOut (Field "import sys\n\n\ndef size(w):\n    return len(w)\n"))
 
 -- | Publish a human query's awakeable id to the outside world. Must be
 -- idempotent: like jitsurei's webhook publisher, its action has
@@ -285,14 +305,15 @@ runFixAttempt ::
   (IOE :> es) =>
   AttemptEngine ->
   Source ->
-  [Int] ->
+  -- | the cell's repair contract, as data
+  RepairRules ->
   -- | the cell's path — the syntax check reports against it
   SourcePath ->
   DiagnosticsIn ->
   [Text] ->
   Int ->
   Eff es (Maybe Source)
-runFixAttempt engine orig flagged path input notes n = go notes (0 :: Int)
+runFixAttempt engine orig rules path input notes n = go notes (0 :: Int)
   where
     -- The taught retry: a guard rejection is fed back as an extra lesson
     -- ("obey them" — 'guidedFixer' folds notes into the instruction), so the
@@ -300,16 +321,16 @@ runFixAttempt engine orig flagged path input notes n = go notes (0 :: Int)
     -- inner retries stay blind, as they must: they guard the wire shape and
     -- the subsequence check inside the program, which see no oracle. Two
     -- guards feed back: the surgical guard (deletions outside the flagged
-    -- statements) and the syntax floor ('pythonSyntaxCheck' — the widened
-    -- oracle flags multi-line imports, and a partial deletion can leave the
-    -- file unparseable, which the AST-free oracle cannot see).
+    -- statements, or a non-canonical rewrite) and the syntax floor
+    -- ('pythonSyntaxCheck' — a partial deletion can leave the file
+    -- unparseable, which the AST-free oracle cannot see).
     go ns k
       | k >= 3 = pure Nothing
       | otherwise = do
-          m <- liftIO (engine n (guidedFixer orig ns) input ns)
+          m <- liftIO (engine n (guidedFixer orig ns (rrRewrite rules)) input ns)
           case m of
             Nothing -> pure Nothing
-            Just rep -> case surgicalRepair orig flagged rep of
+            Just rep -> case surgicalRepair orig rules rep of
               Left err -> retryWith ns k (surgicalMsg err)
               Right _ -> do
                 mSyn <- liftIO (pythonSyntaxCheck path rep)
@@ -321,7 +342,7 @@ runFixAttempt engine orig flagged path input notes n = go notes (0 :: Int)
       go
         ( ns
             <> [ "Your previous reply was rejected: " <> why
-                   <> " Return the complete file with ONLY the flagged import statements deleted."
+                   <> " Return the complete file with ONLY the flagged import statements removed (rewriting a partially-used statement to keep its used names is allowed)."
                ]
         )
         (k + 1)
@@ -329,38 +350,63 @@ runFixAttempt engine orig flagged path input notes n = go notes (0 :: Int)
       ValidationFailure t -> t
       _ -> T.pack (show err)
 
--- | The surgical guard: deletions only, and only the lines the oracle
--- flagged — extended to whole import /statements/ ('flaggedLinesOf': a
--- flagged multi-line import must be deleted whole, never half) and blank
--- lines, whose removal is formatting, not semantics. A repair that deletes
--- unflagged code is a degenerate solution: the unused-import oracle cannot
--- see a missing function, so it would happily clear a file the repair
--- gutted. Deleted lines are recovered by aligning the repair against the
--- original (the subsequence guard already ran, so the alignment is exact).
-surgicalRepair :: Source -> [Int] -> Source -> Either ShikumiError Source
-surgicalRepair orig@(Source origLinesT) flagged (Source new)
-  | null flagged = Right (Source new)
-  | all allowed deletions = Right (Source new)
+-- | The surgical guard, as two admissible paths over the cell's repair
+-- contract ('RepairRules', computed by 'repairRulesFor' from the same
+-- parser the oracle flags with):
+--
+--   1. /Pure deletion/ — every deleted line is a droppable line (a
+--      fully-flagged import statement, whole; or a non-import flagged line,
+--      the toy-marker cells' contract) or a blank line; deletions are
+--      recovered by aligning the repair against the original (the
+--      subsequence guard already ran, so the alignment is exact). The
+--      partially-used statement's span is /not/ droppable — deleting it
+--      whole would silently remove used names.
+--   2. /Canonical rewrite/ — when the cell has a partially-used statement,
+--      the repair may equal the original with that statement's span
+--      replaced by the contract's exact rewrite line and the droppable
+--      lines deleted. Nothing else may differ, so the "rewrite" cannot
+--      smuggle in reformatting or invented code.
+--
+-- A repair following neither path is rejected: the unused-import oracle
+-- cannot see a missing function, so a degenerate "repair" that gutted the
+-- file would otherwise clear.
+surgicalRepair :: Source -> RepairRules -> Source -> Either ShikumiError Source
+surgicalRepair orig rules (Source new)
+  | null (rrDroppableLines rules) && rrRewrite rules == Nothing = Right (Source new)
+  | Just ds <- alignment, all allowed ds, not keptLineDeleted = Right (Source new)
   | otherwise =
       Left
         ( ValidationFailure
-            "the repair deletes lines the diagnostics did not flag: only \
-            \the flagged import statements (whole, not half) and blank \
-            \lines may be removed"
+            "the repair is not the contract's minimal edit: delete only the \
+            \flagged lines the contract marks droppable, or replace a \
+            \partially-used import with exactly the prescribed kept-name line"
         )
   where
-    allowedSet = flaggedLinesOf orig flagged
-    origLines = T.lines origLinesT
-    deletions = go 1 origLines (T.lines new)
+    RepairRules {rrDroppableLines = droppable, rrRewrite = mRewrite} = rules
+    origLines = T.lines (sourceText orig)
+    newLines = T.lines new
+    -- Align the repair against the original. A mismatched original line is
+    -- a /deletion/ — unless it is the rewrite target and the repair's next
+    -- line is exactly the canonical text, which is the admissible
+    -- /replacement/. Repair lines left unconsumed are invented content:
+    -- alignment fails outright (Nothing), which is what makes the rewrite
+    -- path strict — the model cannot smuggle edits past the one permitted
+    -- replacement.
+    alignment :: Maybe [Int]
+    alignment = go 1 origLines newLines
       where
-        go _ [] _ = []
-        go n ys [] = [n .. n + length ys - 1]
+        go _ [] ys = if null ys then Just [] else Nothing
         go n (x : xs) (y : ys)
           | x == y = go (n + 1) xs ys
-          | otherwise = n : go (n + 1) xs (y : ys)
-    allowed n =
-      n `elem` allowedSet
-        || T.null (T.strip (origLines !! (n - 1)))
+          | Just (rn, txt) <- mRewrite, n == rn, y == txt = go (n + 1) xs ys
+          | otherwise = (n :) <$> go (n + 1) xs (y : ys)
+    allowed n = n `elem` droppable || T.null (T.strip (origLines !! (n - 1)))
+    -- The rewrite target's line must survive as itself or as the canonical
+    -- replacement (alignment consumes it one way or the other); a repair
+    -- that deletes it whole silently removes the used names.
+    keptLineDeleted = case mRewrite of
+      Just (rn, _) -> maybe True (rn `elem`) alignment
+      Nothing -> False
 
 -- | One attempt, as a step action: recall lessons (a kioku read, journaled
 -- into the record — replay never re-recalls), run the engine, apply the guard.
@@ -377,8 +423,10 @@ attemptRecord cell oracle ns engine n = do
   let orig = oracleOriginal oracle (cellPath cell) (cellCurrent cell)
       beforeDiags = oracleCheck oracle (cellPath cell) (cellCurrent cell)
       before = map showDiagnostic beforeDiags
-      -- The surgical guard's allow-list: the lines the oracle itself flags.
-      flagged = map diagLine beforeDiags
+      -- The repair contract, as data: droppable lines and the canonical
+      -- rewrite for a partially-used statement — computed from the same
+      -- parser the oracle flags with.
+      rules = repairRulesFor orig (map diagLine beforeDiags)
       -- The keywords the diagnostics themselves suggest: the memory consulted
       -- is a function of the task, not of the caller.
       diagKws = concat [keywordsOf d | d <- before]
@@ -387,7 +435,7 @@ attemptRecord cell oracle ns engine n = do
         DiagnosticsIn
           (Field (cellPath cell))
           (Field before)
-  mRepaired <- runFixAttempt engine orig flagged (cellPath cell) input notes n
+  mRepaired <- runFixAttempt engine orig rules (cellPath cell) input notes n
   case mRepaired of
     Nothing ->
       pure

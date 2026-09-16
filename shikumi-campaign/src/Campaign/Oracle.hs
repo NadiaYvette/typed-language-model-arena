@@ -32,9 +32,14 @@ module Campaign.Oracle
     unusedImportOracle,
 
     -- * Import parsing (the surgical guard re-derives spans from these)
+    ImportClause (..),
     ImportSpec (..),
     importSpecsOf,
     flaggedLinesOf,
+
+    -- * The repair contract
+    RepairRules (..),
+    repairRulesFor,
 
     -- * The syntax floor
     pythonSyntaxCheck,
@@ -94,13 +99,26 @@ markerOracle =
 -- ---------------------------------------------------------------------------
 
 -- | One import statement as the oracle sees it: the /span/ it occupies
--- (start line .. end line, inclusive, so a parenthesized multi-line import
--- can be deleted whole) and the names it binds, dotted down to their roots
--- (@import os.path@ binds @os@).
+-- (start line .. end line, inclusive) and its top-level clauses. Each
+-- clause is a source line, the names it binds, and its module text — the
+-- ingredients of both the flag decision and the canonical rewrite
+-- (@repairRulesFor@ rebuilds a partially-used statement from the kept
+-- clauses' module text).
+data ImportClause = ImportClause
+  { icLine :: !Int,
+    icNames :: ![Text],
+    -- | The clause's spec text as written (@sys@, @os.path@, @a as b@) —
+    -- the ingredient a canonical rewrite recombines.
+    icSpec :: !Text
+  }
+  deriving stock (Eq, Show)
+
 data ImportSpec = ImportSpec
   { isStart :: !Int,
     isEnd :: !Int,
-    isNames :: ![Text]
+    -- | @Just mod@ for @from mod import ...@, @Nothing@ for plain imports.
+    isFromMod :: !(Maybe Text),
+    isClauses :: ![ImportClause]
   }
   deriving stock (Eq, Show)
 
@@ -116,8 +134,12 @@ importSpecFrom ls = do
   if "#" `T.isInfixOf` raw || "*" `T.isInfixOf` raw || "__future__" `T.isInfixOf` raw
     then Nothing
     else do
-      names <- parseNames raw
-      pure (ImportSpec 1 (max 1 nLines) names)
+      clauses <- parseClauses raw
+      let isFrom = "from " `T.isPrefixOf` T.strip (head ls)
+          fromMod
+            | isFrom = Just (T.strip (T.takeWhile (/= ' ') (T.strip (T.drop 5 (head (T.lines raw))))))
+            | otherwise = Nothing
+      pure (ImportSpec 1 (max 1 nLines) fromMod clauses)
   where
     chunk :: Maybe (Text, Int)
     chunk = go [] 0 0 ls
@@ -128,30 +150,51 @@ importSpecFrom ls = do
         go acc open i (y : ys)
           | i > 0 && open <= 0 = Just (T.intercalate "\n" (reverse acc), i) -- statement ended
           | otherwise = go (y : acc) (open + T.count "(" y - T.count ")" y) (i + 1) ys
-    parseNames raw =
-      let flat = T.intercalate " " (map T.strip (T.lines raw))
-          s = T.strip flat
+    -- Clauses are the statement split at top-level commas (not commas
+    -- nested in parens — @from x import (a, b)@ is one clause).
+    parseClauses raw =
+      let ls' = T.lines raw
+          s = T.strip (T.intercalate " " (map T.strip ls'))
        in if not ("import" `T.isPrefixOf` s)
             then Nothing
             else
-              let body = T.strip (T.drop 6 s)
-               in case T.breakOn " import " body of
-                    (_modPart, rest)
-                      | not (T.null rest) ->
-                          -- from X import a, b — the module part binds nothing itself
-                          Just [n | spec <- T.splitOn "," (T.strip (T.drop 7 rest)), Just n <- [boundName spec]]
-                    _ -> Just [n | spec <- T.splitOn "," body, Just n <- [boundName spec]]
-    boundName spec =
-      let s = T.strip spec
-       in if T.null s
-            then Nothing
-            else case T.breakOn " as " s of
-              (n, rest)
-                | not (T.null rest) -> Just (T.strip (T.drop 3 rest))
-                | otherwise -> Just (rootName n)
+              let isFrom = "from " `T.isPrefixOf` s
+                  body
+                    | isFrom = T.strip (T.drop 7 (snd (T.breakOn " import " s)))
+                    | otherwise = T.strip (T.drop 6 s)
+                  specs = splitTopCommas body
+                  clauseOf spec =
+                    let st = T.strip spec
+                     in if T.null st
+                          then Nothing
+                          else
+                            let names = case T.breakOn " as " st of
+                                  (n, r)
+                                    | not (T.null r) -> [T.strip (T.drop 3 r)]
+                                    | otherwise -> [rootName n]
+                             in Just (names, st)
+               in Just
+                    [ ImportClause 0 names st
+                    | spec <- specs
+                    , Just (names, st) <- [clauseOf spec]
+                    ]
     rootName n = case T.splitOn "." (T.strip n) of
       (h : _) -> h
       [] -> ""
+    -- Commas at paren depth zero only. The pieces of @T.splitOn ","@ are
+    -- the text /between/ commas, so the comma decision happens after each
+    -- piece: if the paren depth accumulated through the piece is back to
+    -- zero, the comma that followed it was top-level and the piece ends a
+    -- clause; otherwise the piece continues the clause (inside parens).
+    splitTopCommas t = go (T.splitOn "," t) "" 0
+      where
+        go [] cur _ = [T.strip cur | not (T.null (T.strip cur))]
+        go (p : ps) cur depth =
+          let cur' = cur <> p
+              depth' = depth + T.count "(" p - T.count ")" p
+           in if depth' <= 0
+                then [T.strip cur' | not (T.null (T.strip cur'))] <> go ps "" 0
+                else go ps (cur' <> ", ") depth'
 
 -- | Every import statement in the file, with absolute line spans.
 importSpecsOf :: Source -> [ImportSpec]
@@ -195,10 +238,18 @@ importSpecsOf (Source body) = go (zip [1 ..] (T.lines body))
 -- the oracle returns @[]@ — it does not know, so it does not say.
 unusedImportDiags :: SourcePath -> Source -> [Diagnostic]
 unusedImportDiags path (Source body) =
-  [ Diagnostic path (isStart spec) "W-unused-import" ("unused import " <> T.intercalate ", " (isNames spec))
+  [ Diagnostic path (isStart spec) "W-unused-import" msg
   | not abstain,
     spec <- specs,
-    all unused (isNames spec)
+    let unusedClauses = [c | c <- isClauses spec, all unused (icNames c)],
+    not (null unusedClauses),
+    let unusedNames = concatMap (filter unused . icNames) unusedClauses
+        msg
+          | length unusedClauses == length (isClauses spec) =
+              "unused import " <> T.intercalate ", " unusedNames
+          | otherwise =
+              "unused import names " <> T.intercalate ", " unusedNames
+                <> " (statement partially used — rewrite keeping the used names)"
   ]
   where
     numbered = zip [1 :: Int ..] (T.lines body)
@@ -244,6 +295,62 @@ unusedImportOracle =
       oracleCheck = unusedImportDiags,
       oracleOriginal = \_ current -> current
     }
+
+-- | The repair contract for one cell, /as data/: the lines whose deletion
+-- the guard allows (fully-flagged statements and blanks) and, for a
+-- partially-used statement, the canonical rewrite of its first line that
+-- keeps exactly the used clauses. Computed by re-deriving the spans and
+-- clauses from the same parser the oracle flags with, so guard and oracle
+-- can never disagree about what a statement is or what keeping it means.
+--
+-- The rewrite is /canonical/: the model does not get to invent a formatting
+-- for the kept clause — the guard compares against this exact line, so a
+-- "rewrite" that also reformats the neighbors, or keeps the wrong clause,
+-- is not a repair this contract admits.
+data RepairRules = RepairRules
+  { rrDroppableLines :: ![Int],
+    rrRewrite :: !(Maybe (Int, Text))
+  }
+
+repairRulesFor :: Source -> [Int] -> RepairRules
+repairRulesFor src@(Source body) flaggedStarts =
+  RepairRules
+    { -- Droppable: whole spans of fully-flagged import statements, plus any
+      -- flagged line that is not an import statement's start (the toy-marker
+      -- cells' contract: the flagged line is the deletion). The partially-
+      -- used statement's span is /not/ droppable — deleting it whole would
+      -- silently remove its used names; only the rewrite admits it.
+      rrDroppableLines =
+        sort
+          ( nub
+              ( [n | n <- flaggedStarts, n `notElem` map isStart specs]
+                  ++ concat [[isStart s .. isEnd s] | s <- specs, isStart s `elem` flaggedStarts, not (partiallyUsed s)]
+              )
+          ),
+      rrRewrite = rewrite
+    }
+  where
+    specs = importSpecsOf src
+    -- The diagnostic sits on the statement's first line; a partial flag is
+    -- recognizable by clause count: some clause keeps a used name.
+    rewrite = case [spec | spec <- specs, isStart spec `elem` flaggedStarts, partiallyUsed spec] of
+      [spec] ->
+        let keptSpecs = [icSpec c | c <- isClauses spec, not (allNamesUnused (icNames c))]
+            newStmt = case isFromMod spec of
+              Just m -> "from " <> m <> " import " <> T.intercalate ", " keptSpecs
+              Nothing -> "import " <> T.intercalate ", " keptSpecs
+         in Just (isStart spec, newStmt)
+      _ -> Nothing
+    partiallyUsed spec =
+      length (isClauses spec) > length [c | c <- isClauses spec, allNamesUnused (icNames c)]
+        && not (null [c | c <- isClauses spec, allNamesUnused (icNames c)])
+    -- The same use-test the oracle flags with, verbatim: substring search
+    -- in the case-sensitive body below the import block.
+    allNamesUnused = all (\nm -> not (T.null nm) && not (nm `T.isInfixOf` bodyText))
+    bodyText =
+      let maxImportLine = foldl' (\acc s -> max acc (isEnd s)) 0 specs
+       in T.intercalate "\n" [l | (n, l) <- zip [1 :: Int ..] (T.lines body), n > maxImportLine]
+    nub = foldr (\x acc -> x : filter (/= x) acc) []
 
 -- | The lines whose deletion the surgical guard allows for a cell: the
 -- oracle's flagged lines /extended to whole import statements/ (a flagged
