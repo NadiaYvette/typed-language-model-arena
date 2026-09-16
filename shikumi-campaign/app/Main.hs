@@ -105,7 +105,8 @@ import Kiroku.Store.Effect (Store, runStoreResource)
 import Kiroku.Store.Effect.Resource (KirokuStoreResource, withKirokuStore)
 import Kiroku.Store.Error (StoreError)
 import Kiroku.Store.Types
-  ( RecordedEvent (..),
+  ( EventType (..),
+    RecordedEvent (..),
     StreamName (..),
     StreamVersion (..),
   )
@@ -151,6 +152,7 @@ import Kioku.Distill.Extract
     extractSignature,
   )
 import Kioku.Distill.L1 (L1Outcome (..), L1RunMode (..), L1Summary (..), distillSessionL1, scopedScanCandidates)
+import Kioku.Id (parseId)
 import Kioku.Distill.L2 (SceneRow (..), regenerateScene)
 import Kioku.Distill.L3 (PersonaRow (..), getPersonaByScope, regeneratePersona)
 import Kioku.Distill.Persona (PersonaInput (..), PersonaOutput (..), personaProgram, personaSignature)
@@ -328,6 +330,15 @@ main = do
   case fmap (T.unpack . T.toLower . T.strip . T.pack) reviewMode of
     Just mode -> reviewOperatorMode mode >> exitSuccess
     Nothing -> pure ()
+  -- Distillation mode: the operator round's verdict sessions are L0
+  -- evidence; this mode runs kioku's L1 distiller over each of them so the
+  -- approve/reject patterns become memory atoms the planner can recall.
+  reviewDistill <- lookupEnv "REVIEW_DISTILL"
+  case fmap (T.unpack . T.toLower . T.strip . T.pack) reviewDistill of
+    Just "backfill" -> reviewBackfillMode >> exitSuccess
+    Just "run" -> reviewDistillMode >> exitSuccess
+    Just other -> fail ("REVIEW_DISTILL=" <> other <> " — supported: backfill, run")
+    Nothing -> pure ()
   putStrLn "[campaign] verification cells on keiro's durable runtime (shikumi decides, keiro journals, kioku remembers)"
   -- The demo runs all seventeen acts; a filter like ACTS=9 runs one act alone
   -- (against whatever journal state the database already has). The fix
@@ -454,6 +465,133 @@ journalVerdict proj branch verdict detail =
 -- Deterministic, so every verdict for one project lands in one namespace.
 reviewNamespace :: T.Text -> Namespace
 reviewNamespace = projectNamespace . T.replace "/" "." . T.replace "%" "" . T.replace ":" ""
+
+-- ---------------------------------------------------------------------------
+-- Distilling the review verdicts: evidence becomes memory
+-- ---------------------------------------------------------------------------
+
+-- | REVIEW_DISTILL=backfill: journal the verdicts that predate the journal
+-- (islaris's approve crashed on the namespace bug after the merge but before
+-- journaling). The session and its turns are idempotent writes — a re-run
+-- makes no duplicate — so backfill converges exactly like every other step.
+reviewBackfillMode :: IO ()
+reviewBackfillMode = do
+  let proj = "tessera/third_party/islaris" :: T.Text
+      branch = "campaign/app-app1789583141" :: T.Text
+  withCampaignStore $ \store -> do
+    sid <- runKiokuWrite store (startFixSession (reviewNamespace proj) ("review " <> branch))
+    _ <- runKiokuWrite store (recordFixTurn sid 1 "user" "operator verdict: approve")
+    _ <-
+      runKiokuWrite store
+        ( recordFixTurn
+            sid
+            2
+            "assistant"
+            ( T.unlines
+                [ "merged as 408a879",
+                  "generate_data.py",
+                  "Backfilled: the verdict was carried out live (merge 408a879 on main, branch retired) but its journaling crashed on the namespace slash before the fix; this session records it for the distiller."]
+            )
+        )
+    _ <- runKiokuWrite store (completeFixSession sid "verdict approve: merged as 408a879 (backfilled)")
+    putStrLn "[review] backfilled islaris verdict session"
+
+-- | REVIEW_DISTILL=run: distill every review verdict session in the journal.
+-- The verdicts live in the store's own $all log (SessionStarted events
+-- carrying a "review " focus), so the store itself says what is distillable —
+-- the same read-state-not-assumptions rule the planner's journal walk uses.
+-- Each pass runs kioku's stock L1 distiller with the campaign's shape-contract
+-- extract runner; per-session verdicts become scoped atoms, and the
+-- consolidate step may promote a cross-session pattern (e.g. the vendored-pin
+-- reject rule) when the extracted atoms support one.
+reviewDistillMode :: IO ()
+reviewDistillMode = do
+  cfgJSON <- campaignAIConfigJSON
+  (cfgPath, cfgHandle) <- openTempFile "/tmp" "campaign-ai.json"
+  BL.hPut cfgHandle cfgJSON
+  hClose cfgHandle
+  air <- loadAIRuntime False (Just cfgPath)
+  removeFile cfgPath
+  let distillRT =
+        withTestRunners
+          (newDistillRuntime air Nothing)
+          ( \tr ->
+              tr
+                { runExtract = campaignExtractRunner air,
+                  runConsolidate = campaignConsolidateRunner air
+                }
+          )
+  withCampaignStore $ \store -> do
+    events <-
+      requireEither
+        =<< runCampaignStore
+          store
+          (Store.readAllForward (Store.GlobalPosition 0) 10000)
+    -- The verdict sessions, oldest first: SessionStarted events whose focus
+    -- names a review, from the store's own log.
+    let verdictSessions =
+          [ (sidText, focus)
+          | ev <- Vector.toList events,
+            EventType etext <- [ev.eventType],
+            etext == "SessionStarted",
+            Just pv <- [payloadValue ev],
+            Just inner <- [objAt "data" pv],
+            Just (Aeson.String focus) <- [objAt "focus" inner],
+            -- startFixSession renders the focus as "fix <path>", and the
+            -- verdict sessions' path is "review <branch>" — hence the
+            -- double prefix here.
+            "fix review " `T.isPrefixOf` focus,
+            Just (Aeson.String sidText) <- [objAt "sessionId" inner]
+          ]
+        -- The payload type varies across kiroku versions (Value vs KeyMap);
+        -- the JSON round-trip normalizes it, and the DB's jsonb shape —
+        -- {"data": {sessionId, focus, ...}} — is what both produce.
+        payloadValue ev = Aeson.decode (Aeson.encode ev.payload)
+        objAt k v = case v of
+          Aeson.Object o -> KeyMap.lookup (Key.fromText k) o
+          _ -> Nothing
+        -- Vector.toList is $all-forward (oldest first), so the verdicts
+        -- arrive in verdict order with no extra sort.
+    putStrLn
+      ( "[review] " <> show (length [() | ev <- Vector.toList events, EventType et <- [ev.eventType], et == "SessionStarted"]) 
+          <> " session event(s) in the journal, "
+          <> show (length verdictSessions) <> " verdict session(s) to distill"
+      )
+    for_ verdictSessions $ \(sidText, focus) ->
+      case parseId sidText of
+        Left err ->
+          putStrLn ("  skip " <> T.unpack focus <> " (unparseable id: " <> T.unpack err <> ")")
+        Right sid -> do
+          result <-
+            runCampaignStore store $
+              distillSessionL1
+                campaignAccessContext
+                -- Forced: re-running each session re-extracts and feeds the
+                -- overlapping atoms through consolidation, so paraphrase
+                -- clusters (six rejects stating one vendored-pin rule)
+                -- deduplicate instead of accumulating.
+                IgnoreWatermark
+                distillRT
+                (scopedScanCandidates 8)
+                sid
+          case result of
+            Left err -> putStrLn ("  store error on " <> T.unpack focus <> ": " <> show err)
+            Right (Left err) -> putStrLn ("  distill failed on " <> T.unpack focus <> ": " <> show err)
+            Right (Right L1SkippedUpToDate) ->
+              putStrLn ("  up-to-date: " <> T.unpack focus)
+            Right (Right (L1Distilled summary)) ->
+              putStrLn
+                ( "  distilled " <> T.unpack focus <> ": "
+                    <> show summary.extracted <> " extracted, "
+                    <> show summary.stored <> " stored, "
+                    <> show summary.merged <> " merged, "
+                    <> show summary.skipped <> " skipped"
+                )
+    -- The proof: what memory now holds about reviews.
+    for_ ["mowgli", "tessera.third_party.sail", "tessera.third_party.islaris", "tessera.third_party.sail-x86-from-acl2"] $ \ns -> do
+      notes <- requireEither =<< runCampaignStore store (recallNotes (projectNamespace ns))
+      putStrLn ("  memory[" <> T.unpack ns <> "]: " <> show (length notes) <> " note(s)")
+      for_ notes (TIO.putStrLn . ("    - " <>))
 
 -- ---------------------------------------------------------------------------
 -- Store plumbing (jitsurei's shape; no projection schema — the journal is
