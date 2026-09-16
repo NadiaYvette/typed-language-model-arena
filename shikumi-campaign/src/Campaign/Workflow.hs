@@ -141,8 +141,8 @@ projectWorkflowId proj path = WorkflowId ("pcell-" <> proj <> ":" <> path)
 projectCellFromWf :: WorkflowId -> Maybe (Text, SourcePath)
 projectCellFromWf (WorkflowId t0) = do
   -- "pcell-<proj>:<path>" or "pcell-<prefixes><proj>:<path>" where <prefixes>
-  -- is any run of the fresh-campaign instance prefixes ("react-", "live-")
-  -- the acts put in front of the same cells.
+  -- is any run of the fresh-campaign instance prefixes ("react-", "live-",
+  -- "dispatch-") the acts put in front of the same cells.
   t <- T.stripPrefix "pcell-" t0
   let t1 = stripInstancePrefixes t
       (proj, pathRest) = T.breakOn ":" t1
@@ -151,7 +151,7 @@ projectCellFromWf (WorkflowId t0) = do
     Just path -> pure (proj, path)
   where
     stripInstancePrefixes u =
-      case T.stripPrefix "react-" u <|> T.stripPrefix "live-" u of
+      case T.stripPrefix "react-" u <|> T.stripPrefix "live-" u <|> T.stripPrefix "dispatch-" u of
         Just u' -> stripInstancePrefixes u'
         Nothing -> u
 

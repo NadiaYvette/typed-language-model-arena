@@ -37,6 +37,7 @@ library
     Campaign.Aggregate
     Campaign.Bootstrap
     Campaign.Cell
+    Campaign.Dispatch
     Campaign.Fanout
     Campaign.Hands
     Campaign.Landing

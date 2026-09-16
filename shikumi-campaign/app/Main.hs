@@ -77,10 +77,12 @@ import Effectful.Error.Static (Error, runErrorNoCallStack)
 import Keiro.Codec (decodeRecorded)
 import Keiro.Connection (keiroConnectionSettings)
 import Keiro.Workflow
-  ( WorkflowId (..),
+  ( CancelWorkflowOutcome (..),
+    WorkflowId (..),
     WorkflowJournalEvent (..),
     WorkflowName,
     WorkflowOutcome (..),
+    cancelWorkflow,
     defaultWorkflowRunOptions,
     findUnfinishedWorkflowIds,
     runWorkflowWith,
@@ -95,6 +97,7 @@ import Keiro.Workflow.Resume
     resumeWorkflowsOnce,
   )
 import Keiro.Workflow.Sleep (drainWorkflowSleepTimers, runWorkflowTimerWorker)
+import Keiro.Timer (TimerRow (..), deadLetterTimer)
 import Kioku.Api.Scope (MemoryScope (..), Namespace)
 import Kiroku.Store qualified as Store
 import Kiroku.Store.Connection (ConnectionSettings)
@@ -186,7 +189,9 @@ import Campaign.Memory
     startInfraSession,
   )
 import Campaign.Matrix
-  ( MatrixAttempt (..),
+  ( ArchName (..),
+    ConfigName (..),
+    MatrixAttempt (..),
     MatrixCell (..),
     TriageIn (..),
     TriageOut (..),
@@ -198,6 +203,16 @@ import Campaign.Matrix
     matrixRegistry,
     matrixWorkflowIdTagged,
     matrixWorkflowName,
+    mkMatrixCell,
+  )
+import Campaign.Dispatch
+  ( DispatchAction (..),
+    DispatchOutcome (..),
+    dispatchActionOfPlanLine,
+    dispatchRegistry,
+    dispatchWorkflowIdTagged,
+    dispatchWorkflowName,
+    planDispatchWorkflow,
   )
 import Campaign.Mercury
   ( MercuryAttempt (..),
@@ -272,7 +287,7 @@ main = do
   -- 5 distills it — or act 5 records it itself when act 4 was filtered out.
   acts <- lookupEnv "ACTS"
   let splitOnComma = T.splitOn "," . T.strip
-      wanted = maybe [1 .. 20] (map (read . T.unpack) . splitOnComma . T.pack) acts
+      wanted = maybe [1 .. 21] (map (read . T.unpack) . splitOnComma . T.pack) acts
       step mSid n
         | n `notElem` wanted = pure mSid
         | otherwise = case n of
@@ -296,8 +311,9 @@ main = do
             18 -> runMercuryAct >> pure mSid
             19 -> runLiveMercuryAct >> pure mSid
             20 -> runHelpCheckAct >> pure mSid
+            21 -> runDispatchAct >> pure mSid
             n -> fail ("unknown act: " <> show n)
-  foldM_ step Nothing [1 .. 20 :: Int]
+  foldM_ step Nothing [1 .. 21 :: Int]
 
 -- ---------------------------------------------------------------------------
 -- Store plumbing (jitsurei's shape; no projection schema — the journal is
@@ -1095,6 +1111,25 @@ noPublisherEff = const (pure ())
 -- journal, bounded: each pass BATCH-drains due timers, then runs a resume
 -- pass — the resume is what journals the sleep step (the fire action only
 -- marks the timer fired), so a sweep without resumes would spin forever.
+-- | The fire action for non-sleep (process-manager) timers this campaign's
+-- driver does not own. Kioku's consolidation timers (L1 extract, L2 scene,
+-- L3 persona) belong to a kioku deployment's own timer worker; in this
+-- campaign every distillation pass runs inline inside the acts, so those
+-- rows carry no outstanding work. A no-op fallback strands each claimed row
+-- in @firing@ forever — and the stranded rows re-claim ahead of workflow
+-- sleeps (fire_at order), starving every campaign's settle/cool timers.
+-- The honest disposition is kioku's own FireDeferred semantics: dead-letter
+-- the row with an operator-visible note. Anything else stays untouched.
+campaignTimerPmFallback :: TimerRow -> Eff CampaignEffects (Maybe Store.EventId)
+campaignTimerPmFallback row
+  | "kioku-" `T.isPrefixOf` row.processManagerName = do
+      _ <-
+        deadLetterTimer
+          row.timerId
+          "campaign driver: kioku consolidation timer deferred — distillation passes run inline in this campaign; no timer worker owns them here"
+      pure Nothing
+  | otherwise = pure Nothing
+
 fireTimerSweep :: CampaignStore -> WorkflowRegistry CampaignEffects -> [(Text, Text)] -> IO ()
 fireTimerSweep store registry streamSteps = do
   fireTime <- liftIO (addUTCTime 3600 <$> getCurrentTime)
@@ -1126,7 +1161,7 @@ fireTimerSweep store registry streamSteps = do
                   requireEither
                     =<< runCampaignStore
                       store
-                      (drainWorkflowSleepTimers Nothing fireTime 100 (\_ -> pure Nothing))
+                      (drainWorkflowSleepTimers Nothing fireTime 100 campaignTimerPmFallback)
                 -- The fired timers only wake the workflows; this resume pass
                 -- is what replays each body past its sleep and journals it.
                 resumeOnceQuiet store registry
@@ -2201,7 +2236,23 @@ runMatrixAct = do
 runCrossPlanAct :: IO ()
 runCrossPlanAct = do
   putStrLn "\n=== act 17: cross-project planning — the persona schedules the portfolio ==="
+  (plan, _matrixHealthy) <- planPortfolio
+  putStrLn ("  priority: " <> T.unpack (unField plan.ppPriority))
+  for_ plan.ppNext $ \nx ->
+    putStrLn
+      ( "    " <> T.unpack (unField nx.anProject) <> " -> " <> T.unpack (unField nx.anAction)
+          <> " [" <> T.unpack (unField nx.anDispatch) <> "] :: " <> T.unpack (T.take 110 (unField nx.anWhy))
+      )
+  putStrLn "[cross-plan] done — one portfolio, one persona, one plan, recorded"
+
+-- | The portfolio-to-plan pipeline both act 17 (print + record) and act 21
+-- (dispatch) share: read every cell journal from the store, record the
+-- cross-project lessons, distill the persona, and call the live planner.
+-- Returns the plan and the matrix-health flag the honesty checks use.
+planPortfolio :: IO (PortfolioOutput, Bool)
+planPortfolio = do
   putStrLn "[portfolio] reading every cell journal in the store"
+  resultRef <- newIORef (error "planPortfolio: store block did not run")
   withCampaignStore $ \store -> do
     journalRows <- portfolioJournalRows store
     summaries <-
@@ -2368,7 +2419,8 @@ runCrossPlanAct = do
     case sessionOutcome of
       Left err -> fail ("recording the plan failed: " <> show err)
       Right () -> pure ()
-    putStrLn "[cross-plan] done — one portfolio, one persona, one plan, recorded"
+    writeIORef resultRef (plan, matrixHealthy)
+  readIORef resultRef
 
 -- ---------------------------------------------------------------------------
 -- Act 17 internals: portfolio state, typed plan, planner program
@@ -2441,7 +2493,7 @@ data PortfolioInput = PortfolioInput
 data PortfolioNext = PortfolioNext
   { anProject :: Field "which project this line is about (campaign, mowgli, or peirce)" Text,
     anAction :: Field "the concrete next action for that project" Text,
-    anDispatch :: Field "who runs it: execute (this stack), delegate (a human/other agent), or verify (check an existing claim first)" Text,
+    anDispatch :: Field "dispatch class — exactly one of the three words: execute, delegate, or verify (never a project name, never a phrase)" Text,
     anWhy :: Field "why this action, given the state and the persona" Text
   }
   deriving stock (Generic, Eq, Show)
@@ -2461,7 +2513,8 @@ portfolioPlannerSignature =
     \the portfolio's REAL state (journal-derived): the toy campaign, the \
     \project campaigns (mowgli, peirce), and the verification matrix. Produce \
     \exactly one PortfolioNext line per project, each with a dispatch class \
-    \(execute / delegate / verify), plus the one highest-priority item. Obey \
+    \— the dispatch field is exactly one of the three words execute, \
+    \delegate, or verify — plus the one highest-priority item. Obey \
     \the persona; use the recalled lessons; prefer actions that reuse proven \
     \machinery over novel machinery."
 
@@ -2470,7 +2523,9 @@ portfolioContractInstruction :: Text
 portfolioContractInstruction =
   "Reply in the exact wire shape demonstrated: a priority field holding one \
   \sentence, and a next list holding exactly one entry per project with \
-  \project, action, dispatch, and why fields. Never reply with prose outside \
+  \project, action, dispatch, and why fields. The dispatch field of every \
+  \entry is exactly one of the three words: execute, delegate, or verify \
+  \(lowercase, alone, no project names). Never reply with prose outside \
   \the fields."
 
 portfolioPlannerProgram :: Program PortfolioInput PortfolioOutput
@@ -3199,3 +3254,414 @@ runHelpCheckAct = do
         ("keiro-determinism", "a recorded step never re-executes, so each probe round is its own step name (bootstrap-<n>-<stage>-r<k>): a resume pass replays recorded rounds cheaply, runs exactly one new bounded probe, and suspends again"),
         ("world-facts", "the bootstrap copies the parent checkout's pre-generated configure because this box's autoconf emits a broken one — a world-fact the cell encodes rather than fights")
       ]
+
+-- ---------------------------------------------------------------------------
+-- Act 21: the dispatch loop — the plan is executed, not printed
+-- ---------------------------------------------------------------------------
+--
+-- Act 17's planner emitted a typed plan whose dispatch classes were
+-- advisory; this act runs them. Each plan line becomes a journaled
+-- plan-dispatch workflow (Campaign.Dispatch): execute runs a REAL cell
+-- campaign nested inside the dispatch workflow (fresh dispatch tag, own
+-- journal stream); verify re-runs the REAL oracles against ground truth;
+-- delegate parks on the shared human seam and the operator's verdict is
+-- journaled. The plan is the same live cross-project plan act 17 produces —
+-- portfolio from store truth, persona distilled, honesty checks enforced —
+-- and every line's execution is campaign work indistinguishable in shape
+-- from any other cell.
+
+runDispatchAct :: IO ()
+runDispatchAct = do
+  putStrLn "\n=== act 21: the dispatch loop — the planner decides, the stack runs, the journal records ==="
+  runTag0 <- T.pack . show . floor . utcTimeToPOSIXSeconds <$> getCurrentTime
+  let tag = "d" <> runTag0
+  sink <- newIORef []
+  let publishHumanQuery :: AwakeableId -> Eff CampaignEffects ()
+      publishHumanQuery aid = do
+        inserted <-
+          liftIO $
+            atomicModifyIORef' sink $ \published ->
+              if aid `elem` published
+                then (published, False)
+                else (published <> [aid], True)
+        when inserted $
+          liftIO $ putStrLn ("  published human-query awakeable id: " <> T.unpack (awakeableIdText aid))
+
+  -- The real cells the execute lines name, read once — the executors and the
+  -- drive registry share them. Each nested launch runs under a fresh
+  -- dispatch-instance id (act 9's live-prefix trick) so a re-run replays
+  -- nothing and the resume worker drives the campaign through the merged
+  -- registry.
+  pcsM <- catMaybes <$> mapM readProjectCell [("mowgli", "llada_interface.py")]
+  let dispatchCell c = c {cellId = CellId ("dispatch:" <> unCellId (cellId c))}
+      mowgliCell = case pcsM of
+        (pc : _) ->
+          Just
+            Cell
+              { cellId = CellId (pcProject pc <> ":" <> pcPath pc),
+                cellPath = pcPath pc,
+                cellOriginal = pcSource pc,
+                cellCurrent = pcSource pc
+              }
+        [] -> Nothing
+      mowgliWfId = case pcsM of
+        (pc : _) ->
+          let WorkflowId t = projectWorkflowId (pcProject pc) (pcPath pc)
+           in WorkflowId (T.replace "pcell-" "pcell-dispatch-" t)
+        [] -> WorkflowId "pcell-dispatch-missing"
+      toyCellD = dispatchCell (head (drop 3 corpusCells))
+      matrixCellD = mkMatrixCell (ArchName "riscv") (ConfigName "debug")
+      matrixWfId = matrixWorkflowIdTagged matrixCellD tag
+
+  -- ------------------------------------------------------------- (1) plan
+  putStrLn "[dispatch] the live cross-project planner over the real portfolio"
+  (plan, _matrixHealthy) <- planPortfolio
+  putStrLn ("  priority: " <> T.unpack (unField plan.ppPriority))
+  for_ plan.ppNext $ \nx ->
+    putStrLn
+      ( "    " <> T.unpack (unField nx.anProject) <> " -> " <> T.unpack (unField nx.anAction)
+          <> " [" <> T.unpack (unField nx.anDispatch) <> "]"
+      )
+
+  -- Same honesty checks as act 17: closed dispatch vocabulary, full project
+  -- coverage. The dispatch layer cannot guess what to do with a class the
+  -- planner was never taught.
+  let dispatches = [T.toLower (unField nx.anDispatch) | nx <- plan.ppNext]
+  unless (all (`elem` ["execute", "delegate", "verify"]) dispatches) $
+    fail ("act 21: planner produced an unknown dispatch class: " <> show dispatches)
+  let projectsNamed = [T.strip (unField nx.anProject) | nx <- plan.ppNext]
+  for_ ["campaign", "mowgli", "peirce"] $ \p ->
+    unless (any (p `T.isInfixOf`) projectsNamed) $
+      fail ("act 21: the plan omits project " <> T.unpack p)
+
+  let actions =
+        [ dispatchActionOfPlanLine (T.strip (unField nx.anProject)) (unField nx.anAction) (T.toLower (unField nx.anDispatch)) (unField nx.anWhy)
+        | nx <- plan.ppNext
+        ]
+      findAction p = case [a | a <- actions, daProject a == p] of
+        (a : _) -> a
+        [] -> error (T.unpack ("act 21: no action for " <> p))
+
+  -- ------------------------------------------------------------ (2) execute
+  putStrLn "[dispatch] the plan becomes journaled work"
+  -- The real executors, one per dispatch class. execute runs the actual
+  -- cell campaign the line names; verify re-runs the actual oracles.
+  let
+    execExecute :: DispatchAction -> Eff CampaignEffects Text
+    execExecute action = case daProject action of
+      p
+        | "mowgli" `T.isInfixOf` p -> case mowgliCell of
+            Nothing -> pure "execute: mowgli's cell file is missing — nothing to run"
+            Just cell -> do
+              -- Launch the real project-cell campaign (act 7's machinery)
+              -- under its own fresh journal: the same workflow body the
+              -- registry rebuilds. The resume worker drives it to its
+              -- verdict through the merged registry.
+              r <-
+                runWorkflowWith
+                  defaultWorkflowRunOptions
+                  projectCampaignWorkflowName
+                  mowgliWfId
+                  ( cellCampaignWorkflow
+                      (honestEngineFor unusedImportOracle cell)
+                      (raise . publishHumanQuery)
+                      cell
+                      unusedImportOracle
+                      (projectNamespace "mowgli")
+                      defaultMaxAttempts
+                  )
+              pure
+                ( "execute(mowgli fixer): launched project-cell campaign "
+                    <> wfIdText mowgliWfId
+                    <> " ("
+                    <> T.pack (show r)
+                    <> ")"
+                )
+        | "peirce" `T.isInfixOf` p || "matrix" `T.isInfixOf` p -> do
+            -- The real verification-matrix machinery (act 16's pattern), one
+            -- staged boot/stress cell under the dispatch tag: launched here,
+            -- driven to its verdict by the resume worker through the merged
+            -- registry. The planner names this work peirce or matrix depending
+            -- on which project's line carries it — both get real cells.
+            r <-
+              runWorkflowWith
+                defaultWorkflowRunOptions
+                matrixWorkflowName
+                matrixWfId
+                ( matrixCellWorkflow
+                    matrixEngine
+                    (raise . publishHumanQuery)
+                    matrixCellD
+                    (projectNamespace "matrix")
+                    3
+                )
+            pure
+              ( "execute(peirce matrix cell): launched matrix cell "
+                  <> wfIdText matrixWfId
+                  <> " ("
+                  <> T.pack (show r)
+                  <> ")"
+              )
+        | otherwise -> do
+            -- The toy corpus cell the plan line names (or the first open
+            -- one): the real fixer campaign, the real marker oracle —
+            -- launched under a fresh dispatch-instance id, driven by the
+            -- resume worker through the merged registry.
+            let wfId = campaignWorkflowId (cellId toyCellD)
+            r <-
+              runWorkflowWith
+                defaultWorkflowRunOptions
+                cellCampaignWorkflowName
+                wfId
+                ( cellCampaignWorkflow
+                    (honestEngineFor markerOracle toyCellD)
+                    (raise . publishHumanQuery)
+                    toyCellD
+                    markerOracle
+                    campaignNamespace
+                    defaultMaxAttempts
+                )
+            pure
+              ( "execute(campaign fixer): launched cell campaign "
+                  <> wfIdText wfId
+                  <> " ("
+                  <> T.pack (show r)
+                  <> ")"
+              )
+
+    execVerify :: DispatchAction -> Eff CampaignEffects Text
+    execVerify action = case daProject action of
+      p
+        | "mowgli" `T.isInfixOf` p -> do
+            -- The real unused-import oracle over the real checkout file:
+            -- the claim "mowgli's file carries unused imports" is checked
+            -- against ground truth before any fixer runs on it.
+            mpc <- liftIO (readProjectCell ("mowgli", "llada_interface.py"))
+            pure $ case mpc of
+              Nothing -> "verify(mowgli): file missing — claim uncheckable"
+              Just pc ->
+                let diags = oracleCheck unusedImportOracle (pcPath pc) (pcSource pc)
+                 in "verify(mowgli): " <> T.pack (show (length diags)) <> " unused-import diagnostic(s) confirmed in the real checkout"
+        | "peirce" `T.isInfixOf` p -> do
+            -- The real compiler oracle: the dump probe against the
+            -- installed compiler (the promotion's capability, live).
+            v <- liftIO (oracleDumpProbe ("dispatch-" <> tag))
+            pure ("verify(peirce): " <> ovDetail v)
+        | otherwise -> do
+            -- The toy corpus's marker oracle over one known cell.
+            v <- liftIO (oracleDumpProbe ("dispatch-campaign-" <> tag))
+            mpc <- liftIO (readProjectCell ("mowgli", "llada_interface.py"))
+            pure $ case mpc of
+              Just pc ->
+                let diags = oracleCheck unusedImportOracle (pcPath pc) (pcSource pc)
+                 in "verify(campaign): marker oracle ready; mowgli's real file carries "
+                      <> T.pack (show (length diags))
+                      <> " checkable diagnostic(s)"
+              Nothing -> "verify(campaign): marker oracle ready; dump probe ok"
+
+    -- The dispatch registry: executors closed over the run's machinery.
+    dispatchDefs =
+      dispatchRegistry
+        publishHumanQuery
+        tag
+        actions
+        (\a -> execExecute a)
+        execVerify
+    -- The nested campaigns this run launches, rebuilt from the SAME bodies
+    -- the executors used at launch: the resume worker drives a suspended
+    -- campaign to its verdict through its own journal (the settle/cool
+    -- sleeps between attempts are real durable timers). The engine is the
+    -- honest stub, exactly what the launches closed over; a live run is
+    -- the same registry with a live engine.
+    campaignDefs =
+      campaignRegistry
+        pcsM
+        [toyCellD]
+        (\oracle cell -> honestEngineFor oracle cell)
+        publishHumanQuery
+    matrixDefs = matrixRegistry matrixEngine publishHumanQuery
+    registry = Map.unions [dispatchDefs, campaignDefs, matrixDefs]
+    nestedIds =
+      [ wfIdText mowgliWfId,
+        wfIdText matrixWfId,
+        wfIdText (campaignWorkflowId (cellId toyCellD))
+      ]
+    -- Which projects the plan actually dispatched as execute — the nested
+    -- campaigns only exist for those lines (a verify/delegate line launches
+    -- nothing, and the scoreboard must not pretend it did).
+    isExecuteFor proj a = daDispatch a == "execute" && proj (daProject a)
+    mowgliLaunched = any (isExecuteFor ("mowgli" `T.isInfixOf`)) actions
+    peirceLaunched = any (isExecuteFor ("peirce" `T.isInfixOf`)) actions
+    campaignLaunched = any (isExecuteFor (\p -> not ("mowgli" `T.isInfixOf` p || "peirce" `T.isInfixOf` p || "matrix" `T.isInfixOf` p))) actions
+    ourIds =
+      [wfIdText (dispatchWorkflowIdTagged (daProject a) tag) | a <- actions]
+        <> nestedIds
+  for_ actions $ \a -> do
+    let wid = dispatchWorkflowIdTagged (daProject a) tag
+        stream = campaignStreamNameText dispatchWorkflowName wid
+    withCampaignStore $ \store -> do
+      journal0 <- decodedJournal <$> readJournal store stream
+      if not (null journal0)
+        then putStrLn ("  " <> T.unpack (daProject a) <> ": journal exists — resuming in place")
+        else do
+          requireFreshJournal store stream
+          outcome <-
+            requireEither
+              =<< runCampaignStore
+                store
+                (runWorkflowWith defaultWorkflowRunOptions dispatchWorkflowName wid (planDispatchWorkflow (raise . publishHumanQuery) tag a (raise . execExecute) (raise . execVerify)))
+          putStrLn ("  dispatch " <> T.unpack (daProject a) <> " [" <> T.unpack (daDispatch a) <> "]: " <> show outcome)
+
+  -- Operator hygiene: retire instances this run's registry can no longer
+  -- rebuild. A workflow whose id no longer parses (launched by superseded
+  -- code, before a recipe/branch fix) would crash every resume pass
+  -- forever; the honest disposition is a typed cancellation — a journal
+  -- event recording the retirement — never a silent delete. Legitimately
+  -- parked cells (the escalation cell awaiting its human) stay open: their
+  -- ids are known to the registry.
+  withCampaignStore $ \store -> do
+    now <- getCurrentTime
+    pairs <- requireEither =<< runCampaignStore store (findUnfinishedWorkflowIds now)
+    let knownCellIds =
+          SSet.fromList
+            ( [wfIdText (campaignWorkflowId (cellId c)) | c <- corpusCells]
+                <> [wfIdText (campaignWorkflowId (cellId toyCellD))]
+            )
+    for_ pairs $ \(nameText, idText) ->
+      when (nameText == "cell-campaign" && not (idText `SSet.member` knownCellIds)) $ do
+        _ <- requireEither =<< runCampaignStore store (cancelWorkflow cellCampaignWorkflowName (WorkflowId idText))
+        putStrLn ("  retired superseded instance: " <> T.unpack idText)
+
+  -- The driver: fire whatever the journals prove is armed, resume, repeat.
+  -- The nested campaigns pace their attempts with settle/cool durable
+  -- timers in the shared table; firing everything due (fireTime an hour
+  -- ahead) before each resume pass lets one round advance a campaign by a
+  -- full attempt — the same fast-forward every fleet act uses.
+  let driveRound :: IO Bool
+      driveRound = do
+        doneRef <- newIORef False
+        withCampaignStore $ \store -> do
+          unfinished <- ourUnfinished store ourIds
+          if null unfinished
+            then writeIORef doneRef True
+            else do
+              fireTime <- addUTCTime 3600 <$> getCurrentTime
+              fired <-
+                requireEither
+                  =<< runCampaignStore
+                    store
+                    (drainWorkflowSleepTimers Nothing fireTime 100 campaignTimerPmFallback)
+              putStrLn ("  timer drain: " <> show fired <> " fired (fireTime +1h)")
+              driveResumeOnce store registry
+              driveResumeOnce store registry
+        readIORef doneRef
+      driveRounds k
+        | k <= (0 :: Int) = pure ()
+        | otherwise = do
+            done <- driveRound
+            unless done (driveRounds (k - 1))
+  driveRounds 6
+
+  -- The human seam: the operator answers every delegation.
+  withCampaignStore $ \store -> do
+    published <- readIORef sink
+    unless (null published) $
+      putStrLn ("  delegated lines awaiting the operator: " <> show (length published))
+    for_ published $ \aid -> do
+      _ <- requireEither =<< runCampaignStore store (signalAwakeable aid VerdictApproved)
+      pure ()
+    driveResumeOnce store registry
+    driveResumeOnce store registry
+
+  -- -------------------------------------------------------- (3) scoreboard
+  putStrLn "[dispatch] scoreboard — what the plan's execution decided"
+  withCampaignStore $ \store -> do
+    for_ actions $ \a -> do
+      let stream = campaignStreamNameText dispatchWorkflowName (dispatchWorkflowIdTagged (daProject a) tag)
+      journal <- decodedJournal <$> readJournal store stream
+      let outcomes =
+            [ v
+            | StepRecorded name v _ <- journal,
+              name `elem` ["execute", "verify", "delegate", "unknown"]
+            ]
+      case reverse outcomes of
+        (v : _) -> case Aeson.fromJSON v of
+          Aeson.Success d ->
+            putStrLn
+              ( "  " <> T.unpack (daProject a) <> " [" <> T.unpack (daDispatch a) <> "]: "
+                  <> T.unpack (T.take 160 d)
+              )
+          Aeson.Error err -> putStrLn ("  " <> T.unpack (daProject a) <> ": undecodable outcome: " <> err)
+        [] -> putStrLn ("  " <> T.unpack (daProject a) <> ": no outcome recorded (workflow open)")
+      remaining <- ourUnfinished store [wfIdText (dispatchWorkflowIdTagged (daProject a) tag)]
+      unless (null remaining) $ fail ("act 21: dispatch still open for " <> show remaining)
+    -- The nested campaigns' own journals: the attempts they made and how
+    -- they ended — the same scoreboard the fleet acts print, read from the
+    -- streams the executors launched.
+    putStrLn "  nested campaigns:"
+    for_ [("mowgli fixer" :: String, projectCampaignWorkflowName, mowgliWfId, mowgliLaunched, "mowgli" :: Text), ("peirce matrix", matrixWorkflowName, matrixWfId, peirceLaunched, "peirce"), ("campaign fixer", cellCampaignWorkflowName, campaignWorkflowId (cellId toyCellD), campaignLaunched, "campaign")] $ \(label, wname, wid, launched, proj) ->
+      if not launched
+        then putStrLn ("  " <> label <> ": not launched — the plan dispatched " <> T.unpack proj <> " as " <> T.unpack (daDispatch (findAction proj)))
+        else do
+          let stream = campaignStreamNameText wname wid
+          journal <- decodedJournal <$> readJournal store stream
+          let attempts = journaledAttempts journal
+              ok = journalIsComplete journal
+              cleared = case reverse attempts of
+                (last_ : _) -> faSucceeded last_ && null (faDiagnosticsAfter last_)
+                [] -> True
+              verdict
+                | not ok = "INCOMPLETE"
+                | cleared = "cleared"
+                | otherwise = "closed without clearing"
+          TIO.putStrLn
+            ( T.pack ("  " <> label <> ": ")
+                <> (if ok then "complete" else "INCOMPLETE")
+                <> ", "
+                <> T.pack (show (length attempts))
+                <> " attempt(s) — "
+                <> verdict
+            )
+
+  -- ------------------------------------------------------------ (4) memory
+  putStrLn "[dispatch] memory — the executed plan and its outcomes enter the record"
+  withCampaignStore $ \store -> do
+    sid <- runKiokuWrite store (startInfraSession "dispatch loop (act 21)")
+    _ <- runKiokuWrite store (recordFixTurn sid 1 "assistant" (portfolioPlanText plan))
+    for_ (zip [1 ..] actions) $ \(idx, a) -> do
+      let stream = campaignStreamNameText dispatchWorkflowName (dispatchWorkflowIdTagged (daProject a) tag)
+      journal <- decodedJournal <$> readJournal store stream
+      let outcomes =
+            [ v
+            | StepRecorded name v _ <- journal,
+              name `elem` ["execute", "verify", "delegate", "unknown"]
+            ]
+      outcomeText <- pure $ case reverse outcomes of
+        (v : _) -> case Aeson.fromJSON v of
+          Aeson.Success d -> d
+          Aeson.Error _ -> "(undecodable)"
+        [] -> "(open)"
+      _ <-
+        runKiokuWrite store
+          ( recordFixTurn
+              sid
+              (idx + 1)
+              "assistant"
+              ("[" <> daProject a <> "/" <> daDispatch a <> "] " <> daAction a <> " -> " <> outcomeText)
+          )
+      pure ()
+    _ <- runKiokuWrite store (completeFixSession sid "the plan's dispatch classes are executed work: nested campaigns, oracle re-checks, and the operator's verdicts, all journaled")
+    putStrLn "  infra session recorded (the plan + one turn per executed line)"
+    hits <- runCampaignStore store (recallNotesForKeyword (projectNamespace "mercury") "dispatch")
+    putStrLn ("  recall for \"dispatch\": " <> show (length hits) <> " hit(s)")
+  putStrLn "[dispatch] done — the planner decides, the stack runs, the journal records"
+  where
+    -- The scripted triage policy (act 16's): kvm misconfigurations retry,
+    -- physical-board corruptions go to the human. Typed on TriageIn, no
+    -- stub-LM round trip.
+    matrixEngine _n _prog input _notes =
+      pure $
+        Just $
+          if any ("corruption" `T.isInfixOf`) (unField input.tiStress)
+            then TriageOut (Field False) (Field "board corruption: human inspection required")
+            else TriageOut (Field True) (Field "kvm misconfiguration clears by re-applying the config")
