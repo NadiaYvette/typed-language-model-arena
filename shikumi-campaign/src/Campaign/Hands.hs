@@ -39,6 +39,7 @@ module Campaign.Hands
     commitLanding,
 
     -- * Parent-repo observation (read-only)
+    parentRepoPath,
     parentDirtyCount,
     gitCapture,
   )

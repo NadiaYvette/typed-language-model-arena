@@ -135,7 +135,7 @@ import Campaign.Bootstrap
   , serverAnswers
   , storeWorkflowCount
   )
-import System.Exit (exitSuccess)
+import System.Exit (exitFailure, exitSuccess)
 import System.FilePath ((</>))
 import System.IO (hClose, openTempFile)
 import Data.UUID.V4 (nextRandom)
@@ -268,7 +268,25 @@ import Campaign.Mercury
   )
 import Baikai (Context (..), Message (..), Response, TextContent (..), UserContent (..))
 import Baikai.Message (UserPayload (UserPayload))
-import Campaign.Oracle (CellOracle (..), ProjectCell (..), RepairRules (..), diagLineOf, markerOracle, projectCellSpecs, readProjectCell, repairRulesFor, scanProjectUnusedImportCells, unusedImportOracle)
+import Campaign.Oracle
+  ( CellOracle (..),
+    ProjectCell (..),
+    RepairRules (..),
+    diagLineOf,
+    markerOracle,
+    projectCellSpecs,
+    readProjectCell,
+    repairRulesFor,
+    scanProjectUnusedImportCells,
+    unusedImportOracle,
+  )
+import Campaign.Review
+  ( ApprovalOutcome (..),
+    ReviewBranch (..),
+    approveBranch,
+    listReviewBranches,
+    rejectBranch,
+  )
 import Campaign.ReactFixer (renderSteps, reactEngineFor, scriptedReactEngine)
 import Campaign.Workflow
   ( AttemptEngine,
@@ -302,6 +320,14 @@ main = do
     Just "stop" -> stopOwnedServer >> exitSuccess
     Just other -> fail ("SERVER=" <> other <> " — supported: status, stop")
     _ -> pure ()
+  -- Operator mode: the human merge seam. The application phase lands
+  -- repairs on campaign/<run> branches and stops — on purpose. REVIEW=list
+  -- inventories the branches; REVIEW=approve|reject carries the operator's
+  -- verdict on CAMPAIGN_REVIEW_BRANCH, journaled like every campaign event.
+  reviewMode <- lookupEnv "REVIEW"
+  case fmap (T.unpack . T.toLower . T.strip . T.pack) reviewMode of
+    Just mode -> reviewOperatorMode mode >> exitSuccess
+    Nothing -> pure ()
   putStrLn "[campaign] verification cells on keiro's durable runtime (shikumi decides, keiro journals, kioku remembers)"
   -- The demo runs all seventeen acts; a filter like ACTS=9 runs one act alone
   -- (against whatever journal state the database already has). The fix
@@ -337,6 +363,97 @@ main = do
             22 -> runAppPhaseAct >> pure mSid
             n -> fail ("unknown act: " <> show n)
   foldM_ step Nothing [1 .. 22 :: Int]
+
+-- ---------------------------------------------------------------------------
+-- The human merge seam: operator verdicts over landed campaign branches
+-- ---------------------------------------------------------------------------
+
+-- | REVIEW=list | approve | reject over CAMPAIGN_REVIEW_BRANCH. Every
+-- verdict is journaled into kioku — as a fix session whose turns are the
+-- operator's actions — so memory holds the seam's history the same way it
+-- holds every attempt and lesson.
+reviewOperatorMode :: String -> IO ()
+reviewOperatorMode mode = do
+  mproj <- lookupEnv "CAMPAIGN_APP_PROJECT"
+  let proj = maybe "mowgli" T.strip (T.pack <$> mproj)
+  case mode of
+    "list" -> do
+      putStrLn ("[review] campaign branches of " <> T.unpack proj <> ":")
+      branches <- listReviewBranches proj
+      if null branches
+        then putStrLn "  (none)"
+        else
+          mapM_
+            ( \b ->
+                putStrLn
+                  ( "  " <> T.unpack (rbBranch b)
+                      <> "  +" <> show (rbCommitsAhead b)
+                      <> (if rbMerged b then "  [merged — safe to prune]" else "  [open]")
+                  )
+            )
+            branches
+    _ -> do
+      mbranch <- lookupEnv "CAMPAIGN_REVIEW_BRANCH"
+      branch <- maybe (fail ("REVIEW=" <> mode <> " needs CAMPAIGN_REVIEW_BRANCH=campaign/<run>")) (pure . T.strip . T.pack) mbranch
+      when (not ("campaign/" `T.isPrefixOf` branch)) $
+        fail ("CAMPAIGN_REVIEW_BRANCH must be a campaign/<run> branch, got: " <> T.unpack branch)
+      case mode of
+        "approve" -> reviewApprove proj branch
+        "reject" -> reviewReject proj branch
+        other -> fail ("REVIEW=" <> other <> " — supported: list, approve, reject")
+
+-- | Approve: oracle re-verification of the branch's bytes, then the
+-- --no-ff merge in the parent checkout (the human sanction lifts the
+-- landing phase's never-touch-the-parent rule), then the verdict journaled.
+reviewApprove :: T.Text -> T.Text -> IO ()
+reviewApprove proj branch = do
+  outcome <- approveBranch unusedImportOracle proj branch
+  mapM_
+    ( \d -> TIO.putStrLn ("  [gate] " <> d) )
+    (aoDiagnostics outcome)
+  if T.null (aoMergeCommit outcome)
+    then do
+      putStrLn ("[review] " <> T.unpack branch <> " NOT merged — see gate lines above")
+      exitFailure
+    else do
+      putStrLn
+        ( "[review] " <> T.unpack branch <> " merged as "
+            <> T.unpack (aoMergeCommit outcome)
+            <> " (" <> show (length (aoFiles outcome)) <> " file(s), re-verified clean before merge)"
+        )
+      mapM_ (TIO.putStrLn . ("    " <>)) (aoFiles outcome)
+      journalVerdict proj branch "approve" . T.unlines $
+        [ "merged as " <> aoMergeCommit outcome,
+          T.intercalate ", " (aoFiles outcome)
+        ]
+
+-- | Reject: the branch and its worktree go away; the reason the operator
+-- gives lives in the kioku session, not in git history.
+reviewReject :: T.Text -> T.Text -> IO ()
+reviewReject proj branch = do
+  rejectBranch proj branch
+  putStrLn ("[review] " <> T.unpack branch <> " rejected — branch and worktree removed")
+  mreason <- lookupEnv "CAMPAIGN_REVIEW_REASON"
+  journalVerdict proj branch "reject" $
+    maybe "(no reason given)" T.strip (T.pack <$> mreason)
+
+-- | The verdict, journaled: one fix session named for the verdict, its
+-- turns the operator's actions. Kioku's distillers can promote these the
+-- same way they promote any fix evidence.
+journalVerdict :: T.Text -> T.Text -> T.Text -> T.Text -> IO ()
+journalVerdict proj branch verdict detail =
+  withCampaignStore $ \store -> do
+    sid <- runKiokuWrite store (startFixSession (reviewNamespace proj) ("review " <> branch))
+    _ <- runKiokuWrite store (recordFixTurn sid 1 "user" ("operator verdict: " <> verdict))
+    _ <- runKiokuWrite store (recordFixTurn sid 2 "assistant" detail)
+    _ <- runKiokuWrite store (completeFixSession sid ("verdict " <> verdict <> ": " <> detail))
+    putStrLn "[review] verdict journaled to kioku"
+
+-- | Kioku namespaces forbid %, / and : — a slash-y project path like
+-- @tessera/third_party/islaris@ becomes @tessera.third_party.islaris@.
+-- Deterministic, so every verdict for one project lands in one namespace.
+reviewNamespace :: T.Text -> Namespace
+reviewNamespace = projectNamespace . T.replace "/" "." . T.replace "%" "" . T.replace ":" ""
 
 -- ---------------------------------------------------------------------------
 -- Store plumbing (jitsurei's shape; no projection schema — the journal is

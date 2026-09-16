@@ -46,6 +46,7 @@ library
     Campaign.Mercury
     Campaign.Oracle
     Campaign.ReactFixer
+    Campaign.Review
     Campaign.Workflow
   hs-source-dirs: src
   build-depends:
