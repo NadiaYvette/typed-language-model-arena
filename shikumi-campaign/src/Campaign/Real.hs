@@ -319,7 +319,7 @@ runRealUnit u outDir
         readProcess (proc "make" ["-C", T.unpack (realWorkDir u), "verify"])
       let body = TL.toStrict (TLE.decodeUtf8 out) <> "\n" <> TL.toStrict (TLE.decodeUtf8 err)
       TIO.writeFile (T.unpack logPath) body
-      pure (verdictFrom ec body, logPath)
+      pure (hostVerdictFrom ec body, logPath)
   | otherwise = do
       let logPath = realLogPath u outDir
           args = T.unpack (realWorkDir u) : map T.unpack (ruArch u : ruArgs u <> [T.pack outDir])
@@ -332,6 +332,18 @@ runRealUnit u outDir
       "skipped" -> "skipped"
       "passed" | ec == ExitSuccess -> "passed"
       _ -> "failed"
+
+-- | A make target has no subtotal banners: make's exit code /is/ the
+-- verdict (it propagates cargo and fmt failures), and the @verify@ target's
+-- own @Telix-side checks passed.@ marker — printed only after both
+-- prerequisites succeeded — corroborates a /complete/ run. Success without
+-- the marker is conservatively failed (a truncated or redefined target);
+-- the journaled log tells the operator which.
+hostVerdictFrom :: ExitCode -> Text -> Text
+hostVerdictFrom ExitSuccess body
+  | "Telix-side checks passed." `T.isInfixOf` body = "passed"
+  | otherwise = "failed"
+hostVerdictFrom _ _ = "failed"
 
 -- ---------------------------------------------------------------------------
 -- The journaled attempt
