@@ -4268,7 +4268,20 @@ runRealAct = do
   let modeText = case mode of RealPlan -> "plan"; RealLive -> "live"
   putStrLn ("\n=== act 23: real verification processes — " <> modeText <> " mode ===")
 
-  units <- realUnitCells
+  units0 <- realUnitCells
+  -- REAL_UNIT=<project/arch@config> restricts the act to one cell — the
+  -- live one-cell proof pays for one QEMU boot, not seventy.
+  mSel <- maybe Nothing (Just . T.strip . T.pack) <$> lookupEnv "REAL_UNIT"
+  units <- case mSel of
+    Nothing -> pure units0
+    Just sel -> do
+      let hits = filter (\u -> realCellKey u == sel) units0
+      when (null hits) $
+        error
+          ( "REAL_UNIT=" <> T.unpack sel <> " matches no discovered unit. Discovered:\n"
+              <> T.unpack (T.intercalate "\n" (map realCellKey units0))
+          )
+      pure hits
   let pgclUnits = [u | u <- units, ruProject u == "pgcl"]
       telixUnits = [u | u <- units, ruProject u == "telix"]
   putStrLn
@@ -4318,12 +4331,13 @@ runRealAct = do
       modifyIORef' verdictsRef ((u, realAttemptsOf (decodedJournal journal)) :)
   verdicts <- reverse <$> readIORef verdictsRef
   for_ verdicts $ \(u, attempts) ->
-    for_ attempts $ \a ->
+    for_ attempts $ \a -> do
       putStrLn
         ( "  " <> T.unpack (realCellKey u) <> " [" <> T.unpack a.raMode <> "] "
             <> T.unpack a.raVerdict
             <> (if T.null a.raLog then "" else "  log: " <> T.unpack a.raLog)
         )
+      when (mode == RealLive) $ putStrLn ("    cmd: " <> T.unpack a.raCommand)
 
   -- Memory: only live verdicts record lessons — a plan is not evidence.
   when (mode == RealLive) $
