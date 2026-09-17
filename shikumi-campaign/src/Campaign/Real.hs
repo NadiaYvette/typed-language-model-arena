@@ -39,6 +39,13 @@ module Campaign.Real
     realWorkflowIdTagged,
     realCellFromWf,
     classifyCellLog,
+    -- * Scheduling from memory
+    RealScheduleEntry (..),
+    RealSchedule (..),
+    CellEvidence (..),
+    evidenceFromLessons,
+    scheduleFromEvidence,
+    lessonAdviceFor,
     -- * Execution
     RealMode (..),
     realModeFromEnv,
@@ -63,6 +70,7 @@ import Data.Text.IO qualified as TIO
 import Data.Text.Lazy qualified as TL
 import Data.Text.Lazy.Encoding qualified as TLE
 import Control.Exception qualified as E
+import Data.Time (NominalDiffTime, diffUTCTime, getCurrentTime)
 import Effectful (Eff, IOE, liftIO, (:>))
 import GHC.Generics (Generic)
 import Keiro.Workflow (StepName (..), WorkflowId (..), step)
@@ -357,7 +365,11 @@ data RealAttempt = RealAttempt
     raCommand :: !Text,
     raMode :: !Text,
     raVerdict :: !Text,
-    raLog :: !Text
+    raLog :: !Text,
+    raSeconds :: !(Maybe NominalDiffTime)
+    -- ^ Driver-measured wall time of a live run; offline plans carry
+    -- @Nothing@. In-band so the lesson line can carry cost, and cost then
+    -- feeds the scheduler like any other evidence.
   }
   deriving stock (Eq, Show, Generic)
   deriving anyclass (Aeson.ToJSON, Aeson.FromJSON)
@@ -375,12 +387,15 @@ realAttemptRecord u outDir mode n = do
   let cmd = commandText u outDir
   case mode of
     RealPlan ->
-      pure (RealAttempt n cmd "plan" "planned (offline; set REAL_LIVE=1)" "")
+      pure (RealAttempt n cmd "plan" "planned (offline; set REAL_LIVE=1)" "" Nothing)
     RealLive -> do
+      t0 <- liftIO getCurrentTime
       er <- liftIO (E.try (runRealUnit u outDir))
+      t1 <- liftIO getCurrentTime
+      let dt = Just (diffUTCTime t1 t0)
       pure $ case er of
-        Left (_ :: IOError) -> RealAttempt n cmd "live" "failed (execution error)" ""
-        Right (verdict, logP) -> RealAttempt n cmd "live" verdict logP
+        Left (_ :: IOError) -> RealAttempt n cmd "live" "failed (execution error)" "" dt
+        Right (verdict, logP) -> RealAttempt n cmd "live" verdict logP dt
 
 -- ---------------------------------------------------------------------------
 -- The workflow and its registry
@@ -472,3 +487,139 @@ mapMaybeA f = foldr step' []
     step' x acc = case f x of
       Just v -> v : acc
       Nothing -> acc
+
+-- ---------------------------------------------------------------------------
+-- Scheduling from memory: evidence-ordered cells
+-- ---------------------------------------------------------------------------
+
+-- | What memory knows (so far) about one cell.
+data CellEvidence = CellEvidence
+  { ceKey :: !Text,
+    ceVerdict :: !VerdictClass,
+    ceSeconds :: !(Maybe Double),
+    ceAttempts :: !Int
+  }
+  deriving stock (Eq, Show)
+
+-- | The three evidence classes a cell can have. Constructor order is the
+-- severity order: @max@ /derives/ it, so the worst outcome wins when
+-- lessons merge (passed < unknown < failed).
+data VerdictClass = VCPassed | VCUnknown | VCFailed
+  deriving stock (Eq, Ord, Show)
+
+-- | Fold lessons into per-cell evidence: only the worst outcome (failed >
+-- unknown > passed) and the slowest run survive — the scheduler plans for
+-- the worst thing the cell has ever done, at its slowest.
+evidenceFromLessons :: [Text] -> Map.Map Text CellEvidence
+evidenceFromLessons = foldr step Map.empty
+  where
+    step lesson acc = case parseAdvice lesson of
+      Nothing -> acc
+      Just (key, vc, msecs) ->
+        Map.insertWith merge key (CellEvidence key vc msecs 1) acc
+      where
+        merge new old =
+          CellEvidence
+            { ceKey = ceKey old,
+              ceVerdict = max (ceVerdict new) (ceVerdict old),
+              ceSeconds = maxMay (ceSeconds new) (ceSeconds old),
+              ceAttempts = ceAttempts old + ceAttempts new
+            }
+    maxMay (Just a) (Just b) = Just (max a b)
+    maxMay x _ = x
+
+-- | Parse one lesson's advice into evidence. The lesson format is the one
+-- the act writes: @cell <key> [live] <verdict>[ (Ns); …]@. The bracketed
+-- segment is the /mode/; the verdict text follows it. A prefix is not
+-- enough — @pgcl/arm@ must not match @pgcl/arm-lpae@ — so the key is the
+-- token between @cell @ and @ [@. Only @live@ attempts count as evidence:
+-- a plan knows nothing about the cell.
+parseAdvice :: Text -> Maybe (Text, VerdictClass, Maybe Double)
+parseAdvice lesson = do
+  rest0 <- T.stripPrefix "cell " lesson
+  let (key, rest1) = T.breakOn " [" rest0
+  rest1' <- T.stripPrefix " [" rest1
+  let (mode, rest2) = T.breakOn "]" rest1'
+      rest3 = T.stripStart (T.drop 1 rest2)
+      vc = classOf rest3
+      -- The measured duration, if present, is a parenthesized "(Ns)"
+      -- /after/ the verdict words ("failed (execution error)" has no
+      -- trailing 's' count and won't parse as one).
+      beforeSemi = T.takeWhile (/= ';') rest3
+      secs = case T.breakOn "(" beforeSemi of
+        (_, parenRest) | "(" `T.isPrefixOf` parenRest ->
+          readDouble (T.takeWhile (/= 's') (T.drop 1 parenRest))
+        _ -> Nothing
+  if mode == "live" then Just (key, vc, secs) else Nothing
+  where
+    classOf v
+      | "failed" `T.isPrefixOf` v = VCFailed
+      | "passed" `T.isPrefixOf` v = VCPassed
+      | otherwise = VCUnknown
+    readDouble t = case reads (T.unpack t) of
+      [(d, "")] -> Just (d :: Double)
+      _ -> Nothing
+
+-- | One row of the journaled schedule: the unit, where it sits, and why.
+-- The rationale is /data/, not prose — it journals the scheduler's inputs
+-- alongside its output.
+data RealScheduleEntry = RealScheduleEntry
+  { seUnit :: !RealUnit,
+    seRank :: !Int,
+    seWhy :: !Text
+  }
+  deriving stock (Eq, Show)
+
+-- | The schedule: ordered rows plus the evidence map that ordered them.
+data RealSchedule = RealSchedule
+  { schRows :: ![RealScheduleEntry],
+    schEvidence :: !(Map.Map Text CellEvidence)
+  }
+  deriving stock (Eq, Show)
+
+-- | Order cells by evidence: failed first (reproduce while fresh), then
+-- unknown, then passed — cheapest-first within each tier. A cell with no
+-- evidence is /unknown/, not /passed/: absence of failure is not success.
+-- Within a tier, cost orders only among cells that /have/ measured cost
+-- (never-run and unknown-cost cells sort by key for stability).
+scheduleFromEvidence :: [RealUnit] -> Map.Map Text CellEvidence -> RealSchedule
+scheduleFromEvidence units ev =
+  RealSchedule
+    { schRows = zipWith (\n (u, why) -> RealScheduleEntry u n why) [1 ..] ordered,
+      schEvidence = ev
+    }
+  where
+    ordered = concat [tierOf VCFailed, tierOf VCUnknown, tierOf VCPassed]
+    tierOf vc = List.sortOn (\(u, _) -> (costOf u, realCellKey u)) [(u, whyOf u) | u <- units, tierClassOf u == vc]
+    tierClassOf u = maybe VCUnknown ceVerdict (Map.lookup (realCellKey u) ev)
+    costOf u = case Map.lookup (realCellKey u) ev >>= ceSeconds of
+      Just s -> (0, s)
+      Nothing -> (1, 0)
+    whyOf u = case Map.lookup (realCellKey u) ev of
+      Nothing -> "no evidence yet"
+      Just e ->
+        (case ceVerdict e of
+           VCFailed -> "worst outcome failed"
+           VCUnknown -> "unclassified"
+           VCPassed -> "worst outcome passed")
+          <> (case ceSeconds e of
+                Just s -> ", worst run " <> T.pack (showR1 s) <> "s"
+                Nothing -> "")
+          <> (if ceAttempts e > 1 then ", " <> T.pack (show (ceAttempts e)) <> " live runs" else "")
+
+-- | One decimal place, without pulling in printf formatting.
+showR1 :: Double -> String
+showR1 x = show (fromIntegral (round (x * 10) :: Int) / 10 :: Double)
+
+-- | The lesson line the act writes after a live run — exactly the format
+-- 'evidenceFromLessons' parses back. Duration in-band so the scheduler
+-- sees cost without reading journals.
+lessonAdviceFor :: RealUnit -> Text -> Maybe NominalDiffTime -> Text -> Text
+lessonAdviceFor u verdict msecs logPath =
+  "cell "
+    <> realCellKey u
+    <> " [live] "
+    <> verdict
+    <> maybe "" (\d -> " (" <> T.pack (showR1 (realToFrac d)) <> "s)") msecs
+    <> "; log at "
+    <> logPath

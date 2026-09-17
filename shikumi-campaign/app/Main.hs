@@ -4272,7 +4272,7 @@ runRealAct = do
   -- REAL_UNIT=<project/arch@config> restricts the act to one cell — the
   -- live one-cell proof pays for one QEMU boot, not seventy.
   mSel <- maybe Nothing (Just . T.strip . T.pack) <$> lookupEnv "REAL_UNIT"
-  units <- case mSel of
+  selected <- case mSel of
     Nothing -> pure units0
     Just sel -> do
       let hits = filter (\u -> realCellKey u == sel) units0
@@ -4282,6 +4282,40 @@ runRealAct = do
               <> T.unpack (T.intercalate "\n" (map realCellKey units0))
           )
       pure hits
+  -- The schedule is memory-driven: recall each project's lessons, fold
+  -- them into per-cell evidence, and order cells failed-first (reproduce
+  -- while fresh), then unknown, then passed — cheapest-first within tier.
+  -- The same evidence block drives the toy matrix's boot-tier plan (act
+  -- 16) via recallNotesForKeyword — here the /real/ cells get the same
+  -- treatment, and the rationale is journaled as data alongside the order.
+  lessonsRef <- newIORef (Map.empty :: Map.Map Text [Text])
+  withCampaignStore $ \store ->
+    for_ ["pgcl", "telix"] $ \proj -> do
+      notes <- requireEither =<< runCampaignStore store (recallNotes (projectNamespace proj))
+      modifyIORef' lessonsRef (Map.insert proj notes)
+  lessonsByProject <- readIORef lessonsRef
+  let evidence = evidenceFromLessons (concat (Map.elems lessonsByProject))
+      schedule = scheduleFromEvidence selected evidence
+      units = map seUnit (schRows schedule)
+  putStrLn
+    ( "[real] schedule from " <> show (Map.size lessonsByProject) <> " namespace(s) of memory: "
+        <> show (Map.size evidence) <> " cell(s) with evidence"
+    )
+  let rows = schRows schedule
+  for_ (take 8 rows) $ \row ->
+    putStrLn
+      ( "  #" <> show (seRank row) <> " " <> T.unpack (realCellKey (seUnit row))
+          <> " — " <> T.unpack (seWhy row)
+      )
+  -- A long schedule hides its passed tier at the tail — show it: the tail
+  -- is where the evidence (and the money) actually sits.
+  when (length rows > 11) $ do
+    putStrLn "  …"
+    for_ (drop (length rows - 3) rows) $ \row ->
+      putStrLn
+        ( "  #" <> show (seRank row) <> " " <> T.unpack (realCellKey (seUnit row))
+            <> " — " <> T.unpack (seWhy row)
+        )
   let pgclUnits = [u | u <- units, ruProject u == "pgcl"]
       telixUnits = [u | u <- units, ruProject u == "telix"]
   putStrLn
@@ -4345,9 +4379,7 @@ runRealAct = do
       for_ verdicts $ \(u, attempts) ->
         for_ attempts $ \a -> do
           let v = a.raVerdict
-              advice =
-                "cell " <> realCellKey u <> " [" <> a.raMode <> "] " <> v
-                  <> (if T.null a.raLog then "" else "; log at " <> a.raLog)
+              advice = lessonAdviceFor u v a.raSeconds a.raLog
           _ <- runKiokuWrite store (recordLesson (projectNamespace (ruProject u)) (realCellKey u) advice)
           pure ()
 
@@ -4361,7 +4393,8 @@ runRealAct = do
             1
             "assistant"
             ( "dispatched " <> T.pack (show (length rows)) <> " real cells in "
-                <> T.pack modeText <> " mode: "
+                <> T.pack modeText <> " mode, scheduled from memory ("
+                <> T.pack (show (Map.size evidence)) <> " cell(s) with evidence): "
                 <> T.intercalate ", " [realCellKey u | (u, _) <- rows]
             )
         )
