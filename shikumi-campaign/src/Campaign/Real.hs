@@ -49,6 +49,8 @@ module Campaign.Real
     -- * Execution
     RealMode (..),
     realModeFromEnv,
+    realBudgetFromEnv,
+    budgetedMode,
     realLogPath,
     realAttemptRecord,
     runRealUnit,
@@ -83,6 +85,7 @@ import System.Directory (doesDirectoryExist, doesFileExist)
 import System.Environment (lookupEnv)
 import System.Exit (ExitCode (..))
 import System.Process.Typed (proc, readProcess)
+import Text.Read (readMaybe)
 
 import Campaign.Cell (CellId (..))
 
@@ -297,6 +300,38 @@ realModeFromEnv = do
     Just t | t `elem` ["1", "true", "yes", "on"] -> RealLive
     _ -> RealPlan
 
+-- | @REAL_LIMIT=@\<n\> — the pacing budget for a live run: only the first
+-- @n@ cells in schedule order execute; the rest plan, journaling
+-- @planned (beyond REAL_LIMIT=@\<n\>@)@ — an honest, machine-parseable
+-- account, not a fake verdict. Absent means no limit; @0@ is the
+-- deliberate dry-run (gate lifted, nothing executes). A /present but
+-- invalid/ value is an operator error and fails loudly — a budget that
+-- silently meant "unlimited" would fail open, and the whole point of a
+-- budget is to fail closed.
+realBudgetFromEnv :: IO (Maybe Int)
+realBudgetFromEnv = do
+  v <- lookupEnv "REAL_LIMIT"
+  case v of
+    Nothing -> pure Nothing
+    Just s -> case readMaybe (T.unpack (T.strip (T.pack s))) of
+      Just n | n >= 0 -> pure (Just n)
+      _ ->
+        error
+          ( "REAL_LIMIT=" <> s <> " is not a non-negative integer"
+              <> " (live cells this invocation; 0 = plan only)"
+          )
+
+-- | The mode one cell runs under, given the run's mode, the budget, and
+-- the cell's schedule rank (1-indexed, from 'seRank'). Live beyond the
+-- budget would defeat the budget's point; plan inside it would defeat
+-- the run's. A plan run stays plan everywhere — the budget only
+-- distributes an already-lifted gate.
+budgetedMode :: RealMode -> Maybe Int -> Int -> RealMode
+budgetedMode RealPlan _ _ = RealPlan
+budgetedMode RealLive mlim rank = case mlim of
+  Just n | rank > n -> RealPlan
+  _ -> RealLive
+
 -- | The working tree a unit builds from: derived, not stored — a pgcl
 -- cell's tree follows its config (mainline cells build mainline), telix
 -- builds its own checkout.
@@ -381,13 +416,14 @@ realAttemptRecord ::
   RealUnit ->
   FilePath ->
   RealMode ->
+  Text ->
   Int ->
   Eff es RealAttempt
-realAttemptRecord u outDir mode n = do
+realAttemptRecord u outDir mode planWhy n = do
   let cmd = commandText u outDir
   case mode of
     RealPlan ->
-      pure (RealAttempt n cmd "plan" "planned (offline; set REAL_LIVE=1)" "" Nothing)
+      pure (RealAttempt n cmd "plan" ("planned (" <> planWhy <> ")") "" Nothing)
     RealLive -> do
       t0 <- liftIO getCurrentTime
       er <- liftIO (E.try (runRealUnit u outDir))
@@ -408,11 +444,12 @@ realCellWorkflow ::
   (KeiroWorkflow.Workflow :> es, IOE :> es, KirokuStoreResource :> es, Store :> es) =>
   RealUnit ->
   RealMode ->
+  Text ->
   FilePath ->
   Eff es Text
-realCellWorkflow u mode outDir = do
+realCellWorkflow u mode planWhy outDir = do
   _plan <- step (StepName "verify-plan") (pure (commandText u outDir))
-  attempt <- step (StepName "run-cell") (realAttemptRecord u outDir mode 1)
+  attempt <- step (StepName "run-cell") (realAttemptRecord u outDir mode planWhy 1)
   pure (raVerdict attempt)
 
 -- | The workflow id embeds the cell key and the run tag, separated by @__@
@@ -450,10 +487,10 @@ realWorkflowName = WorkflowName "real-cell-campaign"
 
 realRegistry ::
   (IOE :> es, KirokuStoreResource :> es, Store :> es) =>
-  RealMode ->
+  (RealUnit -> (RealMode, Text)) ->
   FilePath ->
   WorkflowRegistry es
-realRegistry mode outDir =
+realRegistry modeFor outDir =
   Map.fromList
     [ ( realWorkflowName,
         WorkflowDef $ \wid ->
@@ -463,7 +500,8 @@ realRegistry mode outDir =
                 ( "realRegistry: malformed real workflow id "
                     <> T.unpack (T.take 96 (idTextOf wid))
                 )
-            Just u -> realCellWorkflow u mode outDir
+            Just u -> case modeFor u of
+              (m, planWhy) -> realCellWorkflow u m planWhy outDir
       )
     ]
   where

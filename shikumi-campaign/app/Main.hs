@@ -4291,7 +4291,10 @@ runAppPhaseFixAndLand proj runTag branch cells = do
 runRealAct :: IO ()
 runRealAct = do
   mode <- realModeFromEnv
-  let modeText = case mode of RealPlan -> "plan"; RealLive -> "live"
+  mlim <- realBudgetFromEnv
+  let modeText = case mode of
+        RealPlan -> "plan"
+        RealLive -> "live" <> maybe "" (\n -> " (budget " <> show n <> ")") mlim
   putStrLn ("\n=== act 23: real verification processes — " <> modeText <> " mode ===")
 
   units0 <- realUnitCells
@@ -4342,7 +4345,18 @@ runRealAct = do
         ( "  #" <> show (seRank row) <> " " <> T.unpack (realCellKey (seUnit row))
             <> " — " <> T.unpack (seWhy row)
         )
-  let pgclUnits = [u | u <- units, ruProject u == "pgcl"]
+  -- The pacing gate: with REAL_LIMIT=n, exactly the first n schedule
+  -- ranks go live and the rest plan — the mode is decided per cell, from
+  -- the schedule itself, so what executes is what memory ranked first.
+  -- The registry must see the same mapping: a resumed cell replays the
+  -- mode its rank earned.
+  let modeFor u = budgetedMode mode mlim (seRankOf u)
+      planWhyFor u = case budgetedMode mode mlim (seRankOf u) of
+        RealLive -> "REAL_LIVE=1"
+        RealPlan | mode == RealLive -> "beyond REAL_LIMIT=" <> T.pack (show (fromMaybe (0 :: Int) mlim))
+        RealPlan -> "offline; set REAL_LIVE=1"
+      seRankOf u = maybe 1 seRank (find ((== realCellKey u) . realCellKey . seUnit) rows)
+      pgclUnits = [u | u <- units, ruProject u == "pgcl"]
       telixUnits = [u | u <- units, ruProject u == "telix"]
   putStrLn
     ( "[real] discovered " <> show (length pgclUnits) <> " pgcl cell(s) across "
@@ -4360,7 +4374,7 @@ runRealAct = do
   let outDir = "/tmp/real-cells-" <> T.unpack ts
       rows = [(u, realWorkflowIdTagged u ts) | u <- units]
       streamOf wid = campaignStreamNameText realWorkflowName wid
-      registry = realRegistry mode outDir :: WorkflowRegistry CampaignEffects
+      registry = realRegistry (\u -> (modeFor u, planWhyFor u)) outDir :: WorkflowRegistry CampaignEffects
   createDirectoryIfMissing True outDir
 
   -- Launch every cell. Offline the workflow completes immediately (its run
@@ -4375,7 +4389,7 @@ runRealAct = do
         requireEither
           =<< runCampaignStore
             store
-            (runWorkflowWith defaultWorkflowRunOptions realWorkflowName wid (realCellWorkflow u mode outDir))
+            (runWorkflowWith defaultWorkflowRunOptions realWorkflowName wid (realCellWorkflow u (modeFor u) (planWhyFor u) outDir))
       putStrLn ("  " <> T.unpack (realCellKey u) <> ": " <> show outcome)
 
   -- One resume pass: a no-op when every workflow completed at launch, but
@@ -4397,13 +4411,16 @@ runRealAct = do
             <> T.unpack a.raVerdict
             <> (if T.null a.raLog then "" else "  log: " <> T.unpack a.raLog)
         )
-      when (mode == RealLive) $ putStrLn ("    cmd: " <> T.unpack a.raCommand)
+      when (a.raMode == "live") $ putStrLn ("    cmd: " <> T.unpack a.raCommand)
 
   -- Memory: only live verdicts record lessons — a plan is not evidence.
+  -- The gate is the attempt's own mode, not the run's: under REAL_LIMIT,
+  -- budgeted cells plan while the run is live, and a plan must not
+  -- pollute the evidence the next schedule reads.
   when (mode == RealLive) $
     withCampaignStore $ \store ->
       for_ verdicts $ \(u, attempts) ->
-        for_ attempts $ \a -> do
+        for_ attempts $ \a -> when (a.raMode == "live") $ do
           let v = a.raVerdict
               advice = lessonAdviceFor u v a.raSeconds a.raLog
           _ <- runKiokuWrite store (recordLesson (projectNamespace (ruProject u)) (realCellKey u) advice)
