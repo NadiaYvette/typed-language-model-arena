@@ -54,7 +54,7 @@ where
 
 import Control.Applicative ((<|>))
 import Control.Monad (filterM, foldM_, forM, forM_, unless, when)
-import Data.List (find, nub, partition, sort, sortOn)
+import Data.List (find, groupBy, nub, partition, sort, sortOn)
 import Data.Map.Strict qualified as Map
 import Data.Aeson qualified as Aeson
 import Data.Aeson.Key qualified as Key
@@ -289,6 +289,7 @@ import Campaign.Review
     listReviewBranches,
     rejectBranch,
   )
+import Campaign.Real
 import Campaign.ReactFixer (renderSteps, reactEngineFor, scriptedReactEngine)
 import Campaign.Workflow
   ( AttemptEngine,
@@ -372,8 +373,9 @@ main = do
             20 -> runHelpCheckAct >> pure mSid
             21 -> runDispatchAct >> pure mSid
             22 -> runAppPhaseAct >> pure mSid
+            23 -> runRealAct >> pure mSid
             n -> fail ("unknown act: " <> show n)
-  foldM_ step Nothing [1 .. 22 :: Int]
+  foldM_ step Nothing [1 .. 23 :: Int]
 
 -- ---------------------------------------------------------------------------
 -- The human merge seam: operator verdicts over landed campaign branches
@@ -4245,3 +4247,118 @@ runAppPhaseFixAndLand proj runTag branch cells = do
       _ <- runKiokuWrite store (completeFixSession sid "the stack applied to a real checkout: scan by oracle, fix by live model, land by worktree, prove by parent-dirty-count")
       putStrLn "  infra session recorded"
     putStrLn "[app] done — a real checkout's real defects, decided by the journals"
+
+-- | Act 23: the dispatch shape over the /real/ verification processes —
+-- pgcl's (arch × config) kernel boot matrix and telix's host verification.
+--
+--   1. @discover@ — the units this host can actually run, probed from
+--      ground truth (toolchains, emulators, kernel trees, checkouts). The
+--      plan says why absent capability is absent.
+--   2. @dispatch@ — one keiro workflow per unit. @verify-plan@ journals the
+--      exact command; @run-cell@ journals the outcome. Offline (default)
+--      the command is recorded and nothing executes: the plan is the
+--      product. REAL_LIVE=1 lifts the gate and verdicts are read from the
+--      logs the tools wrote.
+--   3. @scoreboard@ — per-unit verdicts straight off the journals, plus
+--      the run recorded as infra memory (live runs only — plans pollute
+--      nothing).
+runRealAct :: IO ()
+runRealAct = do
+  mode <- realModeFromEnv
+  let modeText = case mode of RealPlan -> "plan"; RealLive -> "live"
+  putStrLn ("\n=== act 23: real verification processes — " <> modeText <> " mode ===")
+
+  units <- realUnitCells
+  let pgclUnits = [u | u <- units, ruProject u == "pgcl"]
+      telixUnits = [u | u <- units, ruProject u == "telix"]
+  putStrLn
+    ( "[real] discovered " <> show (length pgclUnits) <> " pgcl cell(s) across "
+        <> show (length (nub (map ruArch pgclUnits))) <> " arch(es), "
+        <> show (length telixUnits) <> " telix unit(s)"
+    )
+  for_ (groupSortOn ruProject units) $ \group ->
+    let keyOf u = ruArch u <> "@" <> ruConfig u
+     in putStrLn
+          ( "  " <> T.unpack (ruProject (head group)) <> ": "
+              <> T.unpack (T.intercalate ", " (sort (nub (map keyOf group))))
+          )
+
+  ts <- T.pack . show . (floor :: Double -> Int) . realToFrac . utcTimeToPOSIXSeconds <$> getCurrentTime
+  let outDir = "/tmp/real-cells-" <> T.unpack ts
+      rows = [(u, realWorkflowIdTagged u ts) | u <- units]
+      streamOf wid = campaignStreamNameText realWorkflowName wid
+      registry = realRegistry mode outDir :: WorkflowRegistry CampaignEffects
+  createDirectoryIfMissing True outDir
+
+  -- Launch every cell. Offline the workflow completes immediately (its run
+  -- step is a pure record); live it runs the tool synchronously inside the
+  -- step and completes the same way — either way no timers, so one launch
+  -- sweep per run and one resume pass to drain.
+  putStrLn ("[real] dispatching " <> show (length rows) <> " cell workflow(s) into keiro")
+  for_ rows $ \(u, wid) ->
+    withCampaignStore $ \store -> do
+      requireFreshJournal store (streamOf wid)
+      outcome <-
+        requireEither
+          =<< runCampaignStore
+            store
+            (runWorkflowWith defaultWorkflowRunOptions realWorkflowName wid (realCellWorkflow u mode outDir))
+      putStrLn ("  " <> T.unpack (realCellKey u) <> ": " <> show outcome)
+
+  -- One resume pass: a no-op when every workflow completed at launch, but
+  -- it drives any cell left pending by a crashed prior run — the durable
+  -- property the whole shape exists for.
+  withCampaignStore $ \store -> driveResumeOnce store registry
+
+  putStrLn "[real] scoreboard — from the journals:"
+  verdictsRef <- newIORef []
+  forM_ rows $ \(u, wid) ->
+    withCampaignStore $ \store -> do
+      journal <- readJournal store (streamOf wid)
+      modifyIORef' verdictsRef ((u, realAttemptsOf (decodedJournal journal)) :)
+  verdicts <- reverse <$> readIORef verdictsRef
+  for_ verdicts $ \(u, attempts) ->
+    for_ attempts $ \a ->
+      putStrLn
+        ( "  " <> T.unpack (realCellKey u) <> " [" <> T.unpack a.raMode <> "] "
+            <> T.unpack a.raVerdict
+            <> (if T.null a.raLog then "" else "  log: " <> T.unpack a.raLog)
+        )
+
+  -- Memory: only live verdicts record lessons — a plan is not evidence.
+  when (mode == RealLive) $
+    withCampaignStore $ \store ->
+      for_ verdicts $ \(u, attempts) ->
+        for_ attempts $ \a -> do
+          let v = a.raVerdict
+              advice =
+                "cell " <> realCellKey u <> " [" <> a.raMode <> "] " <> v
+                  <> (if T.null a.raLog then "" else "; log at " <> a.raLog)
+          _ <- runKiokuWrite store (recordLesson (projectNamespace (ruProject u)) (realCellKey u) advice)
+          pure ()
+
+  -- The run itself, as infra evidence for the distiller.
+  withCampaignStore $ \store -> do
+    sid <- runKiokuWrite store (startInfraSession "act 23: real verification dispatch")
+    _ <-
+      runKiokuWrite store
+        ( recordFixTurn
+            sid
+            1
+            "assistant"
+            ( "dispatched " <> T.pack (show (length rows)) <> " real cells in "
+                <> T.pack modeText <> " mode: "
+                <> T.intercalate ", " [realCellKey u | (u, _) <- rows]
+            )
+        )
+    _ <-
+      runKiokuWrite store
+        (completeFixSession sid ("real-cell dispatch (" <> T.pack modeText <> ") over pgcl and telix: verdicts from the tools' own logs"))
+    putStrLn "  infra session recorded"
+
+  putStrLn "[real] done — the dispatch shape over the processes that actually exist"
+
+-- | Sort-and-group a list by one key, the tiny helper the scoreboard's
+-- grouped listing wants (Data.List.groupOn is not in base).
+groupSortOn :: (Ord b) => (a -> b) -> [a] -> [[a]]
+groupSortOn f = groupBy (\x y -> f x == f y) . sortOn f
