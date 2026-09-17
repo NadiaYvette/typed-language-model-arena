@@ -413,7 +413,8 @@ reviewOperatorMode mode = do
       case mode of
         "approve" -> reviewApprove proj branch
         "reject" -> reviewReject proj branch
-        other -> fail ("REVIEW=" <> other <> " — supported: list, approve, reject")
+        "answer" -> reviewAnswer proj branch
+        other -> fail ("REVIEW=" <> other <> " — supported: list, approve, reject, answer")
 
 -- | Approve: oracle re-verification of the branch's bytes, then the
 -- --no-ff merge in the parent checkout (the human sanction lifts the
@@ -439,6 +440,31 @@ reviewApprove proj branch = do
         [ "merged as " <> aoMergeCommit outcome,
           T.intercalate ", " (aoFiles outcome)
         ]
+
+-- | Answer: respond to a parked workflow's human-query awakeable — the
+-- answering half of the escalation seam (act 2 proved the asking half).
+-- CAMPAIGN_HUMAN_VERDICT=approve|reject (default approve), the awakeable id
+-- from the @awkid:human-verdict@ journal step. The answer is journaled like
+-- every operator act.
+reviewAnswer :: T.Text -> T.Text -> IO ()
+reviewAnswer proj branch = do
+  maid <- lookupEnv "CAMPAIGN_HUMAN_AWAKEABLE"
+  aidText <- maybe (fail "REVIEW=answer needs CAMPAIGN_HUMAN_AWAKEABLE=<uuid>") (pure . T.strip . T.pack) maid
+  verdict <- do
+    v <- lookupEnv "CAMPAIGN_HUMAN_VERDICT"
+    pure $ case fmap (T.toLower . T.strip . T.pack) v of
+      Just "reject" -> VerdictRejected
+      _ -> VerdictApproved
+  aid <- case Aeson.fromJSON (Aeson.String aidText) of
+    Aeson.Success a -> pure (a :: AwakeableId)
+    Aeson.Error e -> fail ("CAMPAIGN_HUMAN_AWAKEABLE is not a uuid: " <> e)
+  withCampaignStore $ \store -> do
+    signalled <- requireEither =<< runCampaignStore store (signalAwakeable aid verdict)
+    if signalled
+      then putStrLn ("[review] awakeable " <> T.unpack aidText <> " answered: " <> show verdict)
+      else fail ("awakeable " <> T.unpack aidText <> " unknown or already signalled")
+  journalVerdict proj branch "answer" $
+    "answered parked human query " <> aidText <> " with " <> T.pack (show verdict)
 
 -- | Reject: the branch and its worktree go away; the reason the operator
 -- gives lives in the kioku session, not in git history.
