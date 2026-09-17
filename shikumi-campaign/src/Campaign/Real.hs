@@ -36,6 +36,8 @@ module Campaign.Real
     realCellId,
     realCellKey,
     realUnitCells,
+    PgclArchRow (..),
+    pgclArchRowsFromDriver,
     realWorkflowIdTagged,
     realCellFromWf,
     classifyCellLog,
@@ -121,68 +123,66 @@ realCellId u =
 realCellKey :: RealUnit -> Text
 realCellKey u = ruProject u <> "/" <> ruArch u <> "@" <> ruConfig u
 
--- | The pgcl arch/config vocabulary the driver speaks. A host's
--- /available/ units are this vocabulary intersected with reality.
-pgclArchCatalog :: [Text]
-pgclArchCatalog =
-  [ "x86_64", "aarch64", "riscv64", "ppc64", "s390x", "sparc64",
-    "loongarch64", "alpha", "riscv32", "m68k", "hppa", "mips64",
-    "arm", "arm-lpae", "hppa64", "microblaze", "or1k", "xtensa", "sh4", "csky"
-  ]
+-- | One parsed row of the driver's per-arch @case@ block: the arch key,
+-- the cross toolchain prefix (@""@ = host compiler), and the emulator
+-- binary (the first word of the driver's @QEMU=@ column).
+data PgclArchRow = PgclArchRow
+  { paArch :: !Text,
+    paToolchain :: !Text,
+    paQemuBin :: !Text
+  }
+  deriving stock (Eq, Show)
+
+-- | Parse the driver's per-arch vocabulary straight out of 'pgclDriverPath'
+-- — /the/ source of truth. The live alpha batch failed fast on
+-- @ERROR: unknown arch alpha@ because this module carried hand-mirrored
+-- tables with arches the driver does not speak; the mirror drifted, the
+-- driver refused, and the journal caught it. Parsing the driver itself
+-- makes drift impossible: discovery can only plan arches the driver
+-- actually accepts. Each case row is a line like
+-- @  aarch64)  LA=arm64;  CC=aarch64-linux-gnu-;  ...  QEMU="qemu-system-aarch64 ...";  ...;;@
+-- parsed by shape: an @\<arch\>)@ head, a @CC=@ field before the next @;@,
+-- a first word inside @QEMU="@. Nothing else in the script has that shape,
+-- and keys are restricted to @[@a-z0-9-@]@ so the @*)@ catch-all and bash
+-- constructs never match. A missing or row-less driver plans no pgcl cells.
+pgclArchRowsFromDriver :: FilePath -> IO [PgclArchRow]
+pgclArchRowsFromDriver path = do
+  exists <- doesFileExist path
+  if not exists
+    then pure []
+    else do
+      body <- TIO.readFile path
+      -- First occurrence per arch wins: the driver's opening case block is
+      -- the canonical per-arch table; later case blocks re-use keys like
+      -- @ppc64)@ as multi-line specialization arms, and only the first
+      -- row carries the full LA/CC/QEMU columns.
+      pure (List.nubBy (\a b -> paArch a == paArch b) [row | l <- T.lines body, Just row <- [parseArchRow (T.stripStart l)]])
+  where
+    parseArchRow l = do
+      let (key, rest) = T.breakOn ")" l
+          keyT = T.strip key
+      guardKey keyT
+      after <- T.stripPrefix ")" rest
+      let fields = map T.strip (T.splitOn ";" after)
+          ccOf = case [T.drop 3 f | f <- fields, "CC=" `T.isPrefixOf` f] of
+            -- the driver writes the host compiler as CC="" — quotes out
+            (v : _) -> T.dropAround (== '"') (T.strip v)
+            [] -> ""
+          qemuOf = case [T.drop 5 f | f <- fields, "QEMU=" `T.isPrefixOf` f] of
+            (v : _) ->
+              T.takeWhile (\c -> c /= '"' && c /= ' ') (T.dropWhile (== '"') (T.strip v))
+            [] -> ""
+      pure (PgclArchRow keyT ccOf qemuOf)
+    guardKey k
+      | T.null k = Nothing
+      -- underscore lives in real arch keys (x86_64, loongarch64 has none
+      -- but riscv32's neighbors do); the class stays narrow enough that
+      -- the @*)@ catch-all and bash constructs never match.
+      | T.all (\c -> ('a' <= c && c <= 'z') || ('0' <= c && c <= '9') || c == '-' || c == '_') k = Just ()
+      | otherwise = Nothing
 
 pgclConfigCatalog :: [Text]
 pgclConfigCatalog = ["mainline", "0", "2", "4", "6"]
-
--- | The cross toolchain prefix each pgcl arch needs on PATH (the driver's
--- own @CC=@ column). @\"\"@ = builds with the host compiler.
-pgclArchToolchain :: Text -> Text
-pgclArchToolchain a = case a of
-  "x86_64" -> ""
-  "aarch64" -> "aarch64-linux-gnu-"
-  "riscv64" -> "riscv64-linux-gnu-"
-  "riscv32" -> "riscv32-linux-gnu-"
-  "ppc64" -> "powerpc64le-linux-gnu-"
-  "s390x" -> "s390x-linux-gnu-"
-  "sparc64" -> "sparc64-linux-gnu-"
-  "loongarch64" -> "loongarch64-linux-gnu-"
-  "alpha" -> "alpha-linux-gnu-"
-  "m68k" -> "m68k-linux-gnu-"
-  "hppa" -> "hppa-linux-gnu-"
-  "hppa64" -> "hppa64-linux-gnu-"
-  "mips64" -> "mips64-linux-gnu-"
-  "arm" -> "arm-linux-gnueabihf-"
-  "arm-lpae" -> "arm-linux-gnueabihf-"
-  "microblaze" -> "microblaze-linux-gnu-"
-  "or1k" -> "or1k-linux-gnu-"
-  "xtensa" -> "xtensa-dc233c-linux-uclibc-"
-  "sh4" -> "sh4-linux-"
-  "csky" -> "csky-linux-"
-  _ -> "\1unmatched"
-
--- | The emulator each pgcl arch needs.
-pgclArchQemu :: Text -> Text
-pgclArchQemu a = case a of
-  "x86_64" -> "qemu-system-x86_64"
-  "aarch64" -> "qemu-system-aarch64"
-  "riscv64" -> "qemu-system-riscv64"
-  "riscv32" -> "qemu-system-riscv32"
-  "ppc64" -> "qemu-system-ppc64"
-  "s390x" -> "qemu-system-s390x"
-  "sparc64" -> "qemu-system-sparc64"
-  "loongarch64" -> "qemu-system-loongarch64"
-  "alpha" -> "qemu-system-alpha"
-  "m68k" -> "qemu-system-m68k"
-  "hppa" -> "qemu-system-hppa"
-  "hppa64" -> "qemu-system-hppa"
-  "mips64" -> "qemu-system-mips64"
-  "arm" -> "qemu-system-arm"
-  "arm-lpae" -> "qemu-system-arm"
-  "microblaze" -> "qemu-system-microblaze"
-  "or1k" -> "qemu-system-or1k"
-  "xtensa" -> "qemu-system-xtensa"
-  "sh4" -> "qemu-system-sh4"
-  "csky" -> "qemu-system-cskyv2"
-  _ -> "\1unmatched"
 
 -- | @command -v@ probe; False on lookup failure.
 availableOnPath :: Text -> IO Bool
@@ -202,19 +202,19 @@ pgclWorkDir _ = "/home/nyc/src/linux"
 -- existence only) — it plans, it never builds.
 realUnitCells :: IO [RealUnit]
 realUnitCells = do
-  drvExists <- doesFileExist pgclDriverPath
+  archRows <- pgclArchRowsFromDriver pgclDriverPath
   hasPgclTree <- doesDirectoryExist "/home/nyc/src/linux"
   hasMainlineTree <- doesDirectoryExist "/home/nyc/src/linux-mainline"
   archAvail <-
     mapM
-      ( \a -> do
-          ccOk <- case pgclArchToolchain a of
+      ( \row -> do
+          ccOk <- case paToolchain row of
             "" -> availableOnPath "gcc"
             cc -> availableOnPath (cc <> "gcc")
-          qemuOk <- availableOnPath (pgclArchQemu a)
-          pure (a, ccOk && qemuOk)
+          qemuOk <- availableOnPath (paQemuBin row)
+          pure (paArch row, ccOk && qemuOk)
       )
-      (if drvExists then pgclArchCatalog else [])
+      archRows
   let usableArches = [a | (a, ok) <- archAvail, ok]
       -- mainline cells build the mainline tree; PGCL config cells build the
       -- PGCL development tree — each cell's tree must exist.
