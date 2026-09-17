@@ -25,6 +25,7 @@ module Campaign.Memory
     campaignNamespace,
     campaignInfraNamespace,
     projectNamespace,
+    projectNamespaceSafe,
     campaignAccessContext,
     cellScope,
     cellScopeIn,
@@ -99,6 +100,17 @@ campaignMemorySpace = either (error . T.unpack) id (mkMemorySpaceId "shikumi-cam
 -- | The namespace of one project: @"toy"@, @"mowgli"@, @"peirce"@, …
 projectNamespace :: Text -> Namespace
 projectNamespace name = either (error . T.unpack) id (mkNamespace name)
+
+-- | 'projectNamespace' for names that may carry kioku's forbidden
+-- characters (@%@, @/@, @:@): they are stripped/replaced /deterministically/
+-- so every session for one project lands in one namespace — a slash-y
+-- project like @tessera/third_party/sail@ becomes
+-- @tessera.third_party.sail@. The vendored-submodule round crashed the
+-- lexing cell on the raw name; every project-cell fix session now goes
+-- through this.
+projectNamespaceSafe :: Text -> Namespace
+projectNamespaceSafe =
+  projectNamespace . T.replace "/" "." . T.replace "%" "" . T.replace ":" ""
 
 -- | The toy corpus's namespace (the original single-project demo).
 campaignNamespace :: Namespace

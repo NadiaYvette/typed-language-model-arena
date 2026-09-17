@@ -68,7 +68,7 @@ import Effectful.Error.Static (throwError)
 import GHC.Generics (Generic)
 
 import Baikai (Context, Response)
-import Campaign.Memory (campaignNamespace, projectNamespace, recallNotesForKeyword)
+import Campaign.Memory (campaignNamespace, projectNamespace, projectNamespaceSafe, recallNotesForKeyword)
 import Campaign.Oracle (CellOracle (..), ProjectCell (..), RepairRules (..), markerOracle, pythonSyntaxCheck, repairRulesFor, unusedImportOracle)
 import Data.Char (isDigit)
 import Data.List (find)
@@ -580,7 +580,7 @@ campaignRegistry projectCells extraCells engine publishHumanQuery =
                         (raise . publishHumanQuery)
                         pcell
                         unusedImportOracle
-                        (projectNamespace proj)
+                        (projectNamespaceSafe proj)
                         defaultMaxAttempts
       )
     ]
