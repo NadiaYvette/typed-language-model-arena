@@ -55,6 +55,7 @@ where
 import Control.Applicative ((<|>))
 import Control.Monad (filterM, foldM_, forM, forM_, unless, when)
 import Data.List (find, groupBy, nub, partition, sort, sortOn)
+import Data.Maybe (mapMaybe)
 import Data.Map.Strict qualified as Map
 import Data.Aeson qualified as Aeson
 import Data.Aeson.Key qualified as Key
@@ -200,6 +201,7 @@ import Campaign.Memory
     recallNotesForKeyword,
     recordFixTurn,
     recordGlobalLesson,
+    recordGlobalLessonSuperseding,
     recordLesson,
     startFixSession,
     startInfraSession,
@@ -374,8 +376,9 @@ main = do
             21 -> runDispatchAct >> pure mSid
             22 -> runAppPhaseAct >> pure mSid
             23 -> runRealAct >> pure mSid
+            24 -> runEscalationDistillAct >> pure mSid
             n -> fail ("unknown act: " <> show n)
-  foldM_ step Nothing [1 .. 23 :: Int]
+  foldM_ step Nothing [1 .. 24 :: Int]
 
 -- ---------------------------------------------------------------------------
 -- The human merge seam: operator verdicts over landed campaign branches
@@ -4452,3 +4455,92 @@ runRealAct = do
 -- grouped listing wants (Data.List.groupOn is not in base).
 groupSortOn :: (Ord b) => (a -> b) -> [a] -> [[a]]
 groupSortOn f = groupBy (\x y -> f x == f y) . sortOn f
+
+-- ---------------------------------------------------------------------------
+-- Act 24: distill the human-seam escalation pattern
+-- ---------------------------------------------------------------------------
+
+-- | Mine the journals for human-seam escalations and keep one campaign-wide
+-- pattern atom in kioku's infra namespace, record-on-change.
+--
+-- The pattern is the queue item that earned this act: when a project cell's
+-- repair attempts are exhausted, the durable workflow parks on an awakeable
+-- ('humanQueryStepName' — the journal fingerprint is a step
+-- @awkid:human-verdict@ whose result is the awakeable's UUID). The
+-- operator's answer arrives through 'signalAwakeable', and the resumed
+-- workflow records the verdict as a step named @awk:@\<aid\>@@ whose result
+-- is @VerdictApproved@ / @VerdictRejected@. This act folds those two step
+-- shapes out of kiroku's @$all@ stream — the same codec-only discipline the
+-- fan-out uses — into /evidence/, and the evidence into /advice/:
+--
+--   * the observed escalation count and per-verdict tally,
+--   * the operational lesson twice confirmed live: partially-specified
+--     repairs (a rewrite, not a pure deletion) exhaust their attempt budget
+--     more often; the parked workflow holds honestly (no false repair), and
+--     a fresh run clears the cell after the verdict without inventing
+--     anything the operator did not sanction.
+--
+-- The atom is /revised, not duplicated/: on content change the new atom
+-- carries 'RecordMemoryData.supersedes' pointing at the old, so kioku's
+-- lineage holds the pattern's history. On no change the act is a no-op.
+runEscalationDistillAct :: IO ()
+runEscalationDistillAct = do
+  putStrLn "\n=== act 24: distill the human-seam escalation pattern ==="
+  withCampaignStore $ \store -> do
+    evsE <- runCampaignStore store (Store.readAllForward (Store.GlobalPosition 0) 100000)
+    events <- requireEither evsE
+    let wjes = [wje | Right wje <- decodeRecorded workflowJournalCodec <$> Vector.toList events]
+        textOf v = case Aeson.fromJSON v of
+          Aeson.Success t -> Just (t :: Text)
+          Aeson.Error _ -> Nothing
+        publishes =
+          [ (aid, recordedAt)
+          | StepRecorded name result recordedAt <- wjes,
+            name == "awkid:human-verdict",
+            Just aid <- [textOf result]
+          ]
+        verdictOf ev = case ev of
+          StepRecorded name result _
+            | "awk:" `T.isPrefixOf` name,
+              Just v <- textOf result,
+              v `elem` ["VerdictApproved", "VerdictRejected"] ->
+              Just (T.drop 4 name, v)
+          _ -> Nothing
+        verdicts = mapMaybe verdictOf wjes
+        answeredCount = length verdicts
+        approvedCount = length [() | (_, "VerdictApproved") <- verdicts]
+        n = length publishes
+    putStrLn
+      ( "[escalation] " <> show n <> " human query(ies) published, "
+          <> show answeredCount <> " answered ("
+          <> show approvedCount <> " approved, " <> show (answeredCount - approvedCount) <> " rejected)"
+      )
+    for_ publishes $ \(aid, at) ->
+      putStrLn ("  query " <> T.unpack aid <> " @ " <> show at)
+    for_ verdicts $ \(aid, v) ->
+      putStrLn ("  verdict " <> T.unpack v <> " for " <> T.unpack aid)
+    when (n > 0) $ do
+      let advice =
+            "when a repair is partially specified (a rewrite, not a pure deletion), attempts exhaust more often; \
+            \the parked workflow holds honestly (no false repair), and a fresh run clears the cell after the \
+            \operator verdict through the human seam ("
+              <> T.pack (show n)
+              <> " escalations observed, "
+              <> T.pack (show approvedCount)
+              <> " approved, "
+              <> T.pack (show (answeredCount - approvedCount))
+              <> " rejected)"
+      written <-
+        runKiokuWrite
+          store
+          ( recordGlobalLessonSuperseding
+              campaignInfraNamespace
+              "human-seam-escalation"
+              advice
+          )
+      putStrLn
+        ( if written
+            then "[escalation] pattern atom written to the infra namespace (supersedes the prior revision if any)"
+            else "[escalation] pattern atom already current — no change"
+        )
+  putStrLn "[escalation] done — memory holds the seam's pattern, evidence holds its history"

@@ -37,6 +37,7 @@ module Campaign.Memory
     -- * Writes (driver side; full write effect row)
     recordLesson,
     recordGlobalLesson,
+    recordGlobalLessonSuperseding,
     startFixSession,
     startInfraSession,
     recordFixTurn,
@@ -48,6 +49,7 @@ module Campaign.Memory
   )
 where
 
+import Data.Maybe (listToMaybe)
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -74,7 +76,7 @@ import Kioku.Api.Scope
     scopeNamespaceText,
   )
 import Kioku.Api.Types (Confidence (..), MemoryRecord (..), MemoryType (..))
-import Kioku.Id (SessionId, genMemoryId, genSessionId, idText)
+import Kioku.Id (SessionId, genMemoryId, genSessionId, idText, parseId)
 import Kioku.Memory (MemoryWriteError, recordWithContext)
 import Kioku.Memory.Domain (RecordMemoryData (..))
 import Kioku.Recall (getActiveInNamespace)
@@ -224,6 +226,65 @@ recordGlobalLesson ns advice = do
           recordedAt = now
         }
   pure (const () <$> result)
+
+-- | 'recordGlobalLesson' for /revisable/ knowledge: the new atom carries
+-- 'RecordMemoryData.supersedes' pointing at the active atom it replaces
+-- (matched by content prefix), so kioku's lineage — not a deletion — keeps
+-- the history. A no-op when the active atom already says the same thing,
+-- so the act is idempotent. Returns @Just ()@ when a new atom was written.
+recordGlobalLessonSuperseding ::
+  (IOE :> es, KirokuStoreResource :> es, Store :> es, Error StoreError :> es) =>
+  -- | the project namespace
+  Namespace ->
+  -- | the tag the pattern lives under (the content-prefix match key)
+  Text ->
+  -- | the advice text
+  Text ->
+  Eff es (Either MemoryWriteError Bool)
+recordGlobalLessonSuperseding ns tag advice = do
+  active <- getActiveInNamespace campaignMemorySpace ns
+  let mOld = case active of
+        Right records ->
+          listToMaybe
+            [ r
+            | r@MemoryRecord {content} <- records,
+              ("lesson: " <> tag <> ":") `T.isPrefixOf` content
+            ]
+        Left _ -> Nothing
+      newContent = lessonText (tag <> ": " <> advice)
+  case mOld of
+    Just old@MemoryRecord {content = oldContent, memoryId = oldMid}
+      | oldContent == newContent -> pure (Right False)
+      -- An unparsable id would break lineage; since these ids are minted by
+      -- this very module (idText round-trips parseId), treat failure as the
+      -- degenerate no-lineage write rather than an error the caller can't
+      -- act on.
+      | otherwise -> write (either (const Nothing) Just (parseId oldMid))
+    Nothing -> write Nothing
+  where
+    write mSupersedes = do
+      mid <- genMemoryId
+      now <- liftIO getCurrentTime
+      let ctx = campaignAccessContext
+      result <-
+        recordWithContext ctx
+          RecordMemoryData
+            { memoryId = mid,
+              memorySpaceId = campaignMemorySpace,
+              actorPrincipal = memoryContextRecordedActor ctx,
+              ownerPrincipal = Nothing,
+              agentId = "campaign-driver",
+              sessionId = Nothing,
+              scope = ScopeGlobal ns,
+              memoryType = MemoryPattern,
+              content = lessonText (tag <> ": " <> advice),
+              priority = 100,
+              confidence = HighConfidence,
+              tags = Set.fromList ["fix-lesson", "pattern:" <> tag, "project:" <> scopeNamespaceText (ScopeGlobal ns)],
+              supersedes = mSupersedes,
+              recordedAt = now
+            }
+      pure (const True <$> result)
 
 -- | Start one fix session for a cell (L0 evidence container).
 startFixSession ::
