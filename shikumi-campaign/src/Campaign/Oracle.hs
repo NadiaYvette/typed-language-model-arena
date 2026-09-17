@@ -46,6 +46,7 @@ module Campaign.Oracle
 
     -- * The use test (the oracle's, exposed for probes and rules)
     nameUsedIn,
+    executableBodyText,
 
     -- * Real project cells (read from the checkouts at runtime)
     ProjectCell (..),
@@ -202,7 +203,7 @@ importSpecFrom ls = do
 
 -- | Every import statement in the file, with absolute line spans.
 importSpecsOf :: Source -> [ImportSpec]
-importSpecsOf (Source body) = go (zip [1 ..] (T.lines body))
+importSpecsOf src = go (executableLines src)
   where
     go [] = []
     go ws@((n, l) : rest)
@@ -287,8 +288,12 @@ unusedImportDiags path (Source body) =
     maxImportLine = foldl' (\acc s -> max acc (isEnd s)) 0 specs
     -- Case-sensitive, as Python identifiers are. (Lowercasing the body — an
     -- early shortcut — made every CamelCase import unmatchable: a used
-    -- `analyseOutput` read as unused. The tessera run caught it.)
-    bodyText = T.intercalate "\n" [l | (n, l) <- numbered, n > maxImportLine]
+    -- `analyseOutput` read as unused. The tessera run caught it.) The body
+    -- is comment-stripped ('executableBodyText'): a name mentioned only in
+    -- a comment is not a use.
+    bodyText =
+      let maxImportLine = foldl' (\acc s -> max acc (isEnd s)) 0 specs
+       in T.intercalate "\n" [l | (n, l) <- executableBodyLines (Source body), n > maxImportLine]
     unused nm = not (nameUsedIn nm bodyText)
 
 -- | Is a bound name /used/ in the body text? The precise test: the name
@@ -319,6 +324,100 @@ nameUsedIn nm body
           (pre, hit)
             | T.null hit -> []
             | otherwise -> (base + T.length pre) : go (base + T.length pre + 1) (T.drop 1 hit)
+
+-- | The body with comments and docstrings removed — the text the use test
+-- reads, shared by the oracle and the repair rules so they can never
+-- disagree about what counts as a use.
+--
+-- What is stripped, and why it is safe:
+--
+--   * /End-of-line @#@ comments/ — a name mentioned in a comment is not a
+--     use (socketFuncs.py's @import socket@ was held by a comment alone).
+--   * /Multi-line triple-quoted spans/ — docstrings and long string
+--     statements. A name in a docstring is never a code use (the AST
+--     reference counts only Name nodes); deleting an import cannot break
+--     a docstring.
+--
+-- What deliberately stays: string contents on ordinary lines — a
+-- @getattr(o, "name")@ style use is real, so counting them keeps the
+-- conservative direction: we may still hold a name for a string mention,
+-- never delete a used import.
+--
+-- Line-scoped and parity-based: a line with an odd triple-quote count
+-- opens or closes a span and is dropped /whole/ (the corner: a real use
+-- sharing a line with an unmatched triple quote would be missed — no such
+-- line exists in any scanned checkout, and the scan-only validation
+-- against the AST detector is the standing check). Quoting opened and
+-- closed on one line (@"""a"""@) is even and the line is kept.
+executableBodyLines :: Source -> [(Int, Text)]
+executableBodyLines src = [(n, stripEol l) | (n, l) <- executableLines src]
+  where
+    nOf l = T.length l
+    -- Cut at the first # outside single/double quotes on this line. A
+    -- line with an unterminated quote resolves Nothing and stays verbatim
+    -- (the conservative direction: a comment mention still reads as use).
+    stripEol l = case scan 0 of
+      Just i -> T.take i l
+      Nothing -> l
+      where
+        scan i
+          | i >= nOf l = Nothing
+          | c == '#' = Just i
+          | c == '"' = scanPast (i + 1) '"'
+          | c == '\'' = scanPast (i + 1) '\''
+          | otherwise = scan (i + 1)
+          where c = T.index l i
+        scanPast j close
+          | j >= nOf l = Nothing
+          | T.index l j == close = scan (j + 1)
+          | otherwise = scanPast (j + 1) close
+
+-- | The executable body as one text ('executableBodyLines', numbering
+-- preserved — the pair form is what region tests need).
+executableBodyText :: Source -> Text
+executableBodyText = T.intercalate "\n" . map snd . executableBodyLines
+
+-- | The @(lineNumber, line)@ pairs /outside/ triple-quoted spans — the
+-- file's executable text with original numbering. The parity rule lives
+-- here, once, and both consumers share it: the use test
+-- ('executableBodyText') so a docstring mention is never a use, and the
+-- span parser ('importSpecsOf') so a docstring line is never an import
+-- statement (socketFuncs.py's @from ACL2 instance …@ docstring line once
+-- parsed as an indented import and vetoed the whole file through the
+-- abstention rule).
+executableLines :: Source -> [(Int, Text)]
+executableLines (Source body) = go 0 (zip [1 ..] (T.lines body))
+  where
+    go _ [] = []
+    go quotes ((n, l) : rest)
+      | odd quotes = go (quotes + qcount l) rest -- inside a triple-quoted span
+      | odd (qcount l) = go (quotes + qcount l) rest -- opens/closes a span on this line
+      | otherwise = (n, l) : go quotes rest
+      where
+        qcount x = T.count "\"\"\"" x + T.count "'''" x
+    -- Cut at the first # that is outside single/double quotes on this line.
+    -- A line with an odd quote count at scan end (apostrophes in words, an
+    -- unterminated literal) resolves nothing: keep the line verbatim.
+    stripEol l = case scan 0 0 of
+      Just i -> T.take i l
+      Nothing -> l
+      where
+        n = T.length l
+        scan i q
+          | i >= n = Nothing
+          | c == '#', q == 0 = Just i
+          | c == '"' = scanPast (i + 1) '"'
+          | c == '\'' = scanPast (i + 1) '\''
+          | otherwise = scan (i + 1) q
+          where
+            c = T.index l i
+        -- Scan past a quoted span (q = which quote kind, unused beyond
+        -- readability) and resume normal scanning after its close. An
+        -- unterminated span resolves Nothing: the line stays verbatim.
+        scanPast j close
+          | j >= n = Nothing
+          | T.index l j == close = scan (j + 1) 0
+          | otherwise = scanPast (j + 1) close
 
 -- | The real oracle over a checkout's files.
 unusedImportOracle :: CellOracle
@@ -378,12 +477,12 @@ repairRulesFor src@(Source body) flaggedStarts =
       length (isClauses spec) > length [c | c <- isClauses spec, allNamesUnused (icNames c)]
         && not (null [c | c <- isClauses spec, allNamesUnused (icNames c)])
     -- The same use-test the oracle flags with, verbatim: whole-word,
-    -- attribute-disqualified occurrences in the case-sensitive body below
-    -- the import block.
+    -- attribute-disqualified occurrences in the case-sensitive,
+    -- comment-stripped body below the import block.
     allNamesUnused = all (\nm -> not (T.null nm) && not (nameUsedIn nm bodyText))
     bodyText =
       let maxImportLine = foldl' (\acc s -> max acc (isEnd s)) 0 specs
-       in T.intercalate "\n" [l | (n, l) <- zip [1 :: Int ..] (T.lines body), n > maxImportLine]
+       in T.intercalate "\n" [l | (n, l) <- executableBodyLines (Source body), n > maxImportLine]
     nub = foldr (\x acc -> x : filter (/= x) acc) []
 
 -- | The lines whose deletion the surgical guard allows for a cell: the
