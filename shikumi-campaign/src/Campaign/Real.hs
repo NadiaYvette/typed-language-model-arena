@@ -41,6 +41,8 @@ module Campaign.Real
     realWorkflowIdTagged,
     realCellFromWf,
     classifyCellLog,
+    classifyCellLogArch,
+    knownFailuresFor,
     -- * Scheduling from memory
     RealScheduleEntry (..),
     RealSchedule (..),
@@ -67,6 +69,7 @@ where
 
 import Data.Aeson qualified as Aeson
 import Data.List qualified as List
+import Data.Maybe (mapMaybe)
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -249,14 +252,26 @@ pgclDriverPath = "/home/nyc/src/pgcl/matrix-driver.sh"
 -- powers off (observed in the historical 80-cell logs), so /any/ passed/
 -- failed subtotal line counts, the last one winning. The driver prints
 -- @SKIP: no …@ for a missing toolchain or emulator; a log with no subtotal
--- at all is a boot/timeout failure. Returns @passed@ / @failed@ / @skipped@.
-classifyCellLog :: Text -> Text
-classifyCellLog logText
+-- at all is a boot/timeout failure. Returns @passed@ / @failed@ /
+-- @passed-waived@ / @skipped@. The waived verdict applies only when /every/
+-- failure the log names is on the arch's documented known-failure baseline
+-- (see 'knownFailuresFor') — any unnamed or novel failure still fails the
+-- cell. Not arch-scoped for @host-verify@ units, whose logs carry no LTP.
+classifyCellLogArch :: Text -> Text -> Text
+classifyCellLogArch arch logText
   | any (\l -> "SKIP: no " `T.isPrefixOf` T.strip l) (T.lines logText) = "skipped"
   | Just fails <- lastSubtotalFails logText =
-      if fails == 0 && not (kernelWarned logText) then "passed" else "failed"
+      if fails == 0 && not (kernelWarned logText) then "passed"
+      else if fails > 0 && waivedByBaseline fails then "passed-waived" else "failed"
   | otherwise = "failed"
   where
+    waivedByBaseline n = case ltpFailList logText of
+      Just names ->
+        not (null names)
+          && names == List.nub names
+          && length names == n
+          && all (`elem` knownFailuresFor arch) names
+      Nothing -> False
     -- The failed count of the last "… N passed, M failed[ …]" line.
     lastSubtotalFails t = go Nothing (T.lines t)
       where
@@ -274,10 +289,48 @@ classifyCellLog logText
     readIntT t = case reads (T.unpack t) of
       [(n, "")] -> Just (n :: Int)
       _ -> Nothing
+
     kernelWarned t =
       -- The init's own dmesg audit banner (precise: only prints when the
       -- kernel log matches its BUG/Oops/Bad-page-state patterns).
       any ("WARNING: kernel log contains errors" `T.isInfixOf`) (T.lines t)
+    -- The init's compact fail list — @LTP FAIL LIST: name1 name2 …@ — printed
+    -- exactly when /tmp/ltp-fail-names.txt is non-empty, so presence of the
+    -- line and of the subtotal are the same condition; the name multiset must
+    -- then match the subtotal's failed count.
+    ltpFailList t = case mapMaybe ltpNames (T.lines t) of
+      [] -> Nothing
+      lists -> Just (concat lists)
+    -- Console lines carry kernel timestamp prefixes ("[   48.227898]   LTP
+    -- FAIL LIST: …"), so anchor on the marker as a substring, not a line
+    -- prefix — the same discipline that lets the word-based subtotal scan
+    -- survive the prefixes.
+    ltpNames l = case T.breakOn "LTP FAIL LIST:" l of
+      (_, rest) | not (T.null rest) -> Just (filter (not . T.null) (T.words (T.drop (T.length ("LTP FAIL LIST:" :: Text)) rest)))
+      _ -> Nothing
+
+-- | Documented known-failure baselines, per arch: test names the project's
+-- own repeated boots show failing identically on the /current/ stack — the
+-- kernel-CI /known-fails/ pattern. A cell whose failures are exactly these
+-- names (all named, none extra, none duplicated) is not a regression: its
+-- verdict is @passed-waived@, priced and journaled like a pass.
+--
+-- loongarch64 evidence: three consecutive hand-boots (2026-09-18, 5.15-tree
+-- defconfig + current initramfs) fail the identical set @fork07 fork09
+-- fork13 mmap3@ — fork/mmap timing-stress tests under la464 emulation (the
+-- init itself notes fork-heavy tests trip LTP alarms on slow QEMU targets).
+-- The April matrix's musl-SIGSEGV trio (madvise12, mmap18, munmap01) is
+-- /history/: those were musl bugs, since fixed — a baseline must track the
+-- stack it judges, not its archive. Empty for arches with no documented
+-- baseline: their cells verdict strictly.
+knownFailuresFor :: Text -> [Text]
+knownFailuresFor "loongarch64" = ["fork07", "fork09", "fork13", "mmap3"]
+knownFailuresFor _ = []
+
+-- | The un-scoped classifier kept for callers without an arch in hand
+-- (probe scripts, log archaeology): baseline waiving disabled.
+classifyCellLog :: Text -> Text
+classifyCellLog = classifyCellLogArch ""
 
 -- | Where the driver writes this unit's log (under the run's output dir).
 realLogPath :: RealUnit -> FilePath -> Text
@@ -371,7 +424,7 @@ runRealUnit u outDir
       body <- if exists then T.pack <$> readFile (T.unpack logPath) else pure ""
       pure (verdictFrom ec body, logPath)
   where
-    verdictFrom ec t = case classifyCellLog t of
+    verdictFrom ec t = case classifyCellLogArch (ruArch u) t of
       "skipped" -> "skipped"
       "passed" | ec == ExitSuccess -> "passed"
       _ -> "failed"

@@ -342,6 +342,13 @@ main = do
     Just "run" -> reviewDistillMode >> exitSuccess
     Just other -> fail ("REVIEW_DISTILL=" <> other <> " — supported: backfill, run")
     Nothing -> pure ()
+  -- Verdict-probe mode: classify real logs through the same classifier act
+  -- 23 uses, so an oracle change is validated against ground truth (archived
+  -- matrix logs, hand-boot transcripts) before any cell pays for it.
+  classifyMode <- lookupEnv "CLASSIFY"
+  case classifyMode of
+    Just spec -> classifyProbeMode spec >> exitSuccess
+    Nothing -> pure ()
   putStrLn "[campaign] verification cells on keiro's durable runtime (shikumi decides, keiro journals, kioku remembers)"
   -- The demo runs all seventeen acts; a filter like ACTS=9 runs one act alone
   -- (against whatever journal state the database already has). The fix
@@ -4544,3 +4551,15 @@ runEscalationDistillAct = do
             else "[escalation] pattern atom already current — no change"
         )
   putStrLn "[escalation] done — memory holds the seam's pattern, evidence holds its history"
+
+-- | The verdict probe: @CLASSIFY=arch:path[,arch:path…]@ (arch empty for the
+-- un-scoped classifier) runs each log through 'classifyCellLogArch' — the
+-- exact classifier the dispatch act uses — printing one verdict per file.
+classifyProbeMode :: String -> IO ()
+classifyProbeMode spec =
+  for_ (T.splitOn "," (T.strip (T.pack spec))) $ \item ->
+    if T.null item then pure () else do
+      let (archT, rest) = T.breakOn ":" item
+          (arch, path) = if T.null rest then ("", item) else (T.unpack archT, T.drop 1 rest)
+      body <- T.pack <$> readFile (T.unpack path)
+      putStrLn ("  " <> arch <> ":" <> T.unpack path <> " -> " <> T.unpack (classifyCellLogArch (T.pack arch) body))
