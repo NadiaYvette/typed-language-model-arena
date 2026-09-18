@@ -39,10 +39,10 @@ module Campaign.Real
     PgclArchRow (..),
     pgclArchRowsFromDriver,
     realWorkflowIdTagged,
-    realCellFromWf,
-    classifyCellLog,
-    classifyCellLogArch,
-    knownFailuresFor,
+    realCellFromWf,     classifyCellLog,
+     classifyCellLogArch,
+     verdictFrom,
+     knownFailuresFor,
     -- * Scheduling from memory
     RealScheduleEntry (..),
     RealSchedule (..),
@@ -403,6 +403,23 @@ commandText u outDir
       "bash " <> T.pack pgclDriverPath <> " " <> realWorkDir u <> " "
         <> T.intercalate " " (ruArch u : ruArgs u <> [T.pack outDir])
 
+-- | The verdict gate for a driver-run pgcl cell: the log classifier (which
+-- owns ground truth about the /guest/) crossed with the driver's own exit
+-- code (which owns whether the /harness/ completed: rc=0 means the guest
+-- powered off cleanly; rc=124 is the boot timeout). Kept top-level and
+-- exported so the CLASSIFY probe exercises the exact pipeline act 23 runs —
+-- when this gate learned about @passed-waived@, its last consumer learned
+-- at the same time.
+verdictFrom :: ExitCode -> Text -> Text -> Text
+verdictFrom ec arch t = case classifyCellLogArch arch t of
+  "skipped" -> "skipped"
+  "passed" | ec == ExitSuccess -> "passed"
+  -- A baseline-waived cell is priced and journaled like a pass — but
+  -- only when the guest actually exited cleanly (rc=0, the poweroff
+  -- completed); a timeout wearing a waived log is still a failure.
+  "passed-waived" | ec == ExitSuccess -> "passed-waived"
+  _ -> "failed"
+
 -- | Execute one unit for real. pgcl cells invoke the driver (which manages
 -- its own PATH, build dir, QEMU and timeouts); telix runs make. Returns
 -- (verdict, logPath) — the verdict read from the log the tool wrote, never
@@ -422,12 +439,7 @@ runRealUnit u outDir
       (ec, _, _) <- readProcess (proc "bash" (pgclDriverPath : args))
       exists <- doesFileExist (T.unpack logPath)
       body <- if exists then T.pack <$> readFile (T.unpack logPath) else pure ""
-      pure (verdictFrom ec body, logPath)
-  where
-    verdictFrom ec t = case classifyCellLogArch (ruArch u) t of
-      "skipped" -> "skipped"
-      "passed" | ec == ExitSuccess -> "passed"
-      _ -> "failed"
+      pure (verdictFrom ec (ruArch u) body, logPath)
 
 -- | A make target has no subtotal banners: make's exit code /is/ the
 -- verdict (it propagates cargo and fmt failures), and the @verify@ target's

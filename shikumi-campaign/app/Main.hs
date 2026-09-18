@@ -137,7 +137,7 @@ import Campaign.Bootstrap
   , serverAnswers
   , storeWorkflowCount
   )
-import System.Exit (exitFailure, exitSuccess)
+import System.Exit (ExitCode (..), exitFailure, exitSuccess)
 import System.FilePath ((</>))
 import System.IO (hClose, openTempFile)
 import Data.UUID.V4 (nextRandom)
@@ -4553,8 +4553,11 @@ runEscalationDistillAct = do
   putStrLn "[escalation] done — memory holds the seam's pattern, evidence holds its history"
 
 -- | The verdict probe: @CLASSIFY=arch:path[,arch:path…]@ (arch empty for the
--- un-scoped classifier) runs each log through 'classifyCellLogArch' — the
--- exact classifier the dispatch act uses — printing one verdict per file.
+-- un-scoped classifier) runs each log through 'verdictFrom' — the exact
+-- classifier × exit-code pipeline act 23 uses — printing one verdict per
+-- file. rc=0 is assumed for every entry (a probe replays logs, not
+-- processes); the pipeline's timeout/exit-code arms are exercised by the
+-- synthetic-variant checks in the repo's probe notes.
 classifyProbeMode :: String -> IO ()
 classifyProbeMode spec =
   for_ (T.splitOn "," (T.strip (T.pack spec))) $ \item ->
@@ -4562,4 +4565,5 @@ classifyProbeMode spec =
       let (archT, rest) = T.breakOn ":" item
           (arch, path) = if T.null rest then ("", item) else (T.unpack archT, T.drop 1 rest)
       body <- T.pack <$> readFile (T.unpack path)
-      putStrLn ("  " <> arch <> ":" <> T.unpack path <> " -> " <> T.unpack (classifyCellLogArch (T.pack arch) body))
+      putStrLn ("  " <> arch <> ":" <> T.unpack path <> " -> "
+                <> T.unpack (verdictFrom ExitSuccess (T.pack arch) body))
