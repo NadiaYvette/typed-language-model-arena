@@ -208,6 +208,11 @@ External interlocutors and reviewers evaluating the portfolio should be able to 
   - `mowgli`: `rad:z2jiunVzMrWnfcefCFN52VRo5mudp`
 
 ### Recent Ledger
+- **arena** — Built and verified complete AI Assistant REPL & Reviewer integration:
+  - Landed [`scripts/campaign-mcp.py`](file:///home/nyc/src/typed-language-model-arena/scripts/campaign-mcp.py) and [`scripts/campaign-cli.py`](file:///home/nyc/src/typed-language-model-arena/scripts/campaign-cli.py) exposing 7 typed tools (`status`, `discover`, `schedule`, `verify`, `evidence`, `review`, `classify`).
+  - Added native JSON query modes to `shikumi-campaign` (`DISCOVER=json`, `SCHEDULE=json`, `EVIDENCE_FORMAT=json`, `REVIEW_FORMAT=json`, `SERVER_FORMAT=json`) with clean stderr log separation.
+  - Packaged Antigravity workspace skill ([`.agents/skills/shikumi-campaign/SKILL.md`](file:///home/nyc/src/typed-language-model-arena/.agents/skills/shikumi-campaign/SKILL.md)), Antigravity plugin ([`.agents/plugins/shikumi-campaign/`](file:///home/nyc/src/typed-language-model-arena/.agents/plugins/shikumi-campaign/)), and cross-assistant MCP configs ([`.mcp.json`](file:///home/nyc/src/typed-language-model-arena/.mcp.json), [`.cursor/mcp.json`](file:///home/nyc/src/typed-language-model-arena/.cursor/mcp.json)).
+  - Verified live execution of all 4 domain host units (`telix`, `tessera`, `organ-bank`, `mowgli`) through the CLI and MCP stdio protocols.
 - **arena** — Multi-project real verification dispatch landed in [`Campaign.Real`](file:///home/nyc/src/typed-language-model-arena/shikumi-campaign/src/Campaign/Real.hs): discovered and verified `telix`, `tessera`, `organ-bank`, and `mowgli` host units live.
 - **arena** — Extended [`scripts/reconstitute.sh`](file:///home/nyc/src/typed-language-model-arena/scripts/reconstitute.sh) to pin all 7 portfolio domain repositories alongside the 9 Shinzui framework repositories.
 - **arena** — Added `knownFailuresFor "alpha" = ["mmap3"]` and arch-scoped classifier to `Campaign.Real.hs` and `real-validate`.

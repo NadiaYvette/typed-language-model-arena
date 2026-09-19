@@ -157,11 +157,20 @@ External interlocutors and reviewers evaluating the portfolio often work directl
 
 ## 4. Implementation Roadmap
 
-| Phase | Milestone | Objective |
-| :--- | :--- | :--- |
-| **Phase 1** | In-Tree Target Manifests | Support `.campaign-target.yaml` discovery alongside hardcoded definitions |
-| **Phase 2** | Standardized Oracle DSL | Implement structured log assertion rules (exit code, markers, JSON schema) |
-| **Phase 3** | Reviewer MCP Server & Skill | Package MCP tools and assistant skill (`/campaign`) for frictionless reviewer evaluation |
-| **Phase 4** | Autonomous Git Bisection | Add automated bisection workflows triggered on pass-to-fail regressions |
-| **Phase 5** | Remote Worker Leasing | Connect `pgmq` queue consumers for distributed multi-machine execution |
-| **Phase 6** | Radicle Attestation Seam | Emit signed cryptographic verification receipts to Radicle seed nodes |
+| Phase | Milestone | Objective | Status |
+| :--- | :--- | :--- | :--- |
+| **Phase 1** | In-Tree Target Manifests | Support `.campaign-target.yaml` discovery alongside hardcoded definitions | Planned |
+| **Phase 2** | Standardized Oracle DSL | Implement structured log assertion rules (exit code, markers, JSON schema) | In Progress |
+| **Phase 3** | Reviewer MCP Server & Skill | Package MCP tools and assistant skill (`/campaign`) for frictionless reviewer evaluation | **COMPLETE** |
+| **Phase 4** | Autonomous Git Bisection | Add automated bisection workflows triggered on pass-to-fail regressions | Planned |
+| **Phase 5** | Remote Worker Leasing | Connect `pgmq` queue consumers for distributed multi-machine execution | Planned |
+| **Phase 6** | Radicle Attestation Seam | Emit signed cryptographic verification receipts to Radicle seed nodes | Planned |
+
+### Phase 3 Landed Artifacts
+* **MCP Server & CLI Bridge**: [`scripts/campaign-mcp.py`](file:///home/nyc/src/typed-language-model-arena/scripts/campaign-mcp.py) and [`scripts/campaign-cli.py`](file:///home/nyc/src/typed-language-model-arena/scripts/campaign-cli.py) exposing 7 typed tools (`campaign_status`, `campaign_discover`, `campaign_schedule`, `campaign_verify`, `campaign_evidence`, `campaign_review`, `campaign_classify`).
+* **Clean Binary Interop**: `shikumi-campaign` binary natively supports `DISCOVER=json`, `SCHEDULE=json`, `EVIDENCE_FORMAT=json`, `REVIEW_FORMAT=json`, and redirects connection logging to `stderr`.
+* **Packaged Assistant Skill & Plugin**:
+  * [`.agents/skills/shikumi-campaign/SKILL.md`](file:///home/nyc/src/typed-language-model-arena/.agents/skills/shikumi-campaign/SKILL.md)
+  * [`.agents/plugins/shikumi-campaign/`](file:///home/nyc/src/typed-language-model-arena/.agents/plugins/shikumi-campaign/)
+  * [`.mcp.json`](file:///home/nyc/src/typed-language-model-arena/.mcp.json) (Claude Code / open standard)
+  * [`.cursor/mcp.json`](file:///home/nyc/src/typed-language-model-arena/.cursor/mcp.json) (Cursor)

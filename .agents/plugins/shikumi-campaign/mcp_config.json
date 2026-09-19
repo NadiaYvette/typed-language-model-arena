@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "shikumi-campaign": {
+      "command": "/usr/bin/python3",
+      "args": [
+        "/home/nyc/src/typed-language-model-arena/scripts/campaign-mcp.py",
+        "--mcp"
+      ],
+      "env": {
+        "PG_CONNECTION_STRING": "host=/home/nyc/.local/state/shikumi-campaign-pg.sock port=5432 user=campaign dbname=campaign"
+      }
+    }
+  }
+}

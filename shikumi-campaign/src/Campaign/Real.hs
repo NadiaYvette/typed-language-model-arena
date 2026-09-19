@@ -50,6 +50,7 @@ module Campaign.Real
     RealScheduleEntry (..),
     RealSchedule (..),
     CellEvidence (..),
+    VerdictClass (..),
     evidenceFromLessons,
     scheduleFromEvidence,
     lessonAdviceFor,
@@ -678,13 +679,15 @@ data CellEvidence = CellEvidence
     ceSeconds :: !(Maybe Double),
     ceAttempts :: !Int
   }
-  deriving stock (Eq, Show)
+  deriving stock (Eq, Show, Generic)
+  deriving anyclass (Aeson.ToJSON, Aeson.FromJSON)
 
 -- | The three evidence classes a cell can have. Constructor order is the
 -- severity order: @max@ /derives/ it, so the worst outcome wins when
 -- lessons merge (passed < unknown < failed).
 data VerdictClass = VCPassed | VCUnknown | VCFailed
-  deriving stock (Eq, Ord, Show)
+  deriving stock (Eq, Ord, Show, Generic)
+  deriving anyclass (Aeson.ToJSON, Aeson.FromJSON)
 
 -- | Fold lessons into per-cell evidence: only the worst outcome (failed >
 -- unknown > passed) and the slowest run survive — the scheduler plans for
@@ -747,14 +750,16 @@ data RealScheduleEntry = RealScheduleEntry
     seRank :: !Int,
     seWhy :: !Text
   }
-  deriving stock (Eq, Show)
+  deriving stock (Eq, Show, Generic)
+  deriving anyclass (Aeson.ToJSON, Aeson.FromJSON)
 
 -- | The schedule: ordered rows plus the evidence map that ordered them.
 data RealSchedule = RealSchedule
   { schRows :: ![RealScheduleEntry],
     schEvidence :: !(Map.Map Text CellEvidence)
   }
-  deriving stock (Eq, Show)
+  deriving stock (Eq, Show, Generic)
+  deriving anyclass (Aeson.ToJSON, Aeson.FromJSON)
 
 -- | Order cells by evidence: failed first (reproduce while fresh), then
 -- unknown, then passed — cheapest-first within each tier. A cell with no

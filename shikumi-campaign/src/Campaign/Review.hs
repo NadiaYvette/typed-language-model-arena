@@ -46,6 +46,9 @@ import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
 import System.Process.Typed (proc, readProcess)
 
+import Data.Aeson qualified as Aeson
+import GHC.Generics (Generic)
+
 import Campaign.Hands (campaignWorktreePath, gitCapture, parentRepoPath)
 import Campaign.Oracle (CellOracle (..))
 import Toy.Fixer.Domain (Source (..), showDiagnostic)
@@ -57,7 +60,8 @@ data ReviewBranch = ReviewBranch
     rbCommitsAhead :: !Int,
     rbMerged :: !Bool
   }
-  deriving stock (Eq, Show)
+  deriving stock (Eq, Show, Generic)
+  deriving anyclass (Aeson.ToJSON, Aeson.FromJSON)
 
 -- | Run git in a directory, capturing trimmed stdout; fail with stderr
 -- ('gitCapture' does both — re-bound here for a local name).
@@ -113,7 +117,8 @@ data ApprovalOutcome = ApprovalOutcome
     aoFiles :: ![Text],
     aoDiagnostics :: ![Text]
   }
-  deriving stock (Eq, Show)
+  deriving stock (Eq, Show, Generic)
+  deriving anyclass (Aeson.ToJSON, Aeson.FromJSON)
 
 -- | Approve one review branch: re-verify every touched file with the real
 -- oracle against the /branch's own bytes/ (read from its worktree — the

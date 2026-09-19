@@ -141,7 +141,7 @@ import Campaign.Bootstrap
 import System.Exit (ExitCode (..), exitFailure, exitSuccess)
 import Control.Exception (try, SomeException)
 import System.FilePath ((</>))
-import System.IO (hClose, openTempFile)
+import System.IO (hClose, hPutStrLn, openTempFile, stderr)
 import Data.UUID.V4 (nextRandom)
 
 import Kioku.AI.Config (AIExecutionError (..), AIFeature (..))
@@ -328,7 +328,29 @@ main = do
     Just "status" -> serverStatusMode >> exitSuccess
     Just "stop" -> stopOwnedServer >> exitSuccess
     Just other -> fail ("SERVER=" <> other <> " — supported: status, stop")
-    _ -> pure ()
+    Nothing -> pure ()
+  -- Discover mode: inspect verification units across all portfolio projects
+  discoverMode <- lookupEnv "DISCOVER"
+  case fmap (T.unpack . T.toLower . T.strip . T.pack) discoverMode of
+    Just "json" -> discoverJsonMode >> exitSuccess
+    Just "text" -> discoverTextMode >> exitSuccess
+    Just other -> fail ("DISCOVER=" <> other <> " — supported: json, text")
+    Nothing -> pure ()
+
+  -- Schedule mode: compute and print memory-ranked schedule from Kioku lessons
+  scheduleMode <- lookupEnv "SCHEDULE"
+  case fmap (T.unpack . T.toLower . T.strip . T.pack) scheduleMode of
+    Just "json" -> scheduleJsonMode >> exitSuccess
+    Just "text" -> scheduleTextMode >> exitSuccess
+    Just other -> fail ("SCHEDULE=" <> other <> " — supported: json, text")
+    Nothing -> pure ()
+
+  -- Evidence mode: query Kioku memory lessons and baselines
+  evidenceMode <- lookupEnv "EVIDENCE"
+  case fmap (T.unpack . T.strip . T.pack) evidenceMode of
+    Just target -> evidenceOperatorMode target >> exitSuccess
+    Nothing -> pure ()
+
   -- Operator mode: the human merge seam. The application phase lands
   -- repairs on campaign/<run> branches and stops — on purpose. REVIEW=list
   -- inventories the branches; REVIEW=approve|reject carries the operator's
@@ -405,6 +427,72 @@ main = do
   foldM_ step Nothing [1 .. 24 :: Int]
 
 -- ---------------------------------------------------------------------------
+-- Operator modes: discovery, scheduling, and evidence queries
+-- ---------------------------------------------------------------------------
+
+discoverJsonMode :: IO ()
+discoverJsonMode = do
+  units <- realUnitCells
+  BL.putStr (Aeson.encode units <> "\n")
+
+discoverTextMode :: IO ()
+discoverTextMode = do
+  units <- realUnitCells
+  for_ units $ \u ->
+    TIO.putStrLn (realCellKey u <> " (" <> ruKind u <> ")")
+
+scheduleJsonMode :: IO ()
+scheduleJsonMode = do
+  units <- realUnitCells
+  lessonsRef <- newIORef (Map.empty :: Map.Map Text [Text])
+  withCampaignStore $ \store ->
+    for_ ["pgcl", "telix", "tessera", "organ-bank", "mowgli"] $ \proj -> do
+      notes <- requireEither =<< runCampaignStore store (recallNotes (projectNamespace proj))
+      modifyIORef' lessonsRef (Map.insert proj notes)
+  lessonsByProject <- readIORef lessonsRef
+  let evidence = evidenceFromLessons (concat (Map.elems lessonsByProject))
+      schedule = scheduleFromEvidence units evidence
+  BL.putStr (Aeson.encode schedule <> "\n")
+
+scheduleTextMode :: IO ()
+scheduleTextMode = do
+  units <- realUnitCells
+  lessonsRef <- newIORef (Map.empty :: Map.Map Text [Text])
+  withCampaignStore $ \store ->
+    for_ ["pgcl", "telix", "tessera", "organ-bank", "mowgli"] $ \proj -> do
+      notes <- requireEither =<< runCampaignStore store (recallNotes (projectNamespace proj))
+      modifyIORef' lessonsRef (Map.insert proj notes)
+  lessonsByProject <- readIORef lessonsRef
+  let evidence = evidenceFromLessons (concat (Map.elems lessonsByProject))
+      schedule = scheduleFromEvidence units evidence
+  for_ (schRows schedule) $ \row ->
+    TIO.putStrLn ("#" <> T.pack (show (seRank row)) <> " " <> realCellKey (seUnit row) <> " — " <> seWhy row)
+
+evidenceOperatorMode :: String -> IO ()
+evidenceOperatorMode target = do
+  let targets = case target of
+        "all" -> ["pgcl", "telix", "tessera", "organ-bank", "mowgli", "peirce", "mercury", "infra", "campaign"]
+        other -> [T.pack other]
+  withCampaignStore $ \store -> do
+    resultsRef <- newIORef ([] :: [(Text, [Text])])
+    for_ targets $ \proj -> do
+      let ns = case proj of
+            "infra" -> campaignInfraNamespace
+            "campaign" -> campaignNamespace
+            _ -> projectNamespace proj
+      notes <- requireEither =<< runCampaignStore store (recallNotes ns)
+      modifyIORef' resultsRef ((proj, notes) :)
+    results <- reverse <$> readIORef resultsRef
+    outputMode <- lookupEnv "EVIDENCE_FORMAT"
+    case outputMode of
+      Just "json" -> BL.putStr (Aeson.encode (Map.fromList results) <> "\n")
+      _ -> for_ results $ \(proj, notes) -> do
+        TIO.putStrLn ("[evidence] " <> proj <> " (" <> T.pack (show (length notes)) <> " notes):")
+        if null notes
+          then putStrLn "  (none)"
+          else for_ notes (\n -> TIO.putStrLn ("  - " <> n))
+
+-- ---------------------------------------------------------------------------
 -- The human merge seam: operator verdicts over landed campaign branches
 -- ---------------------------------------------------------------------------
 
@@ -418,20 +506,24 @@ reviewOperatorMode mode = do
   let proj = maybe "mowgli" T.strip (T.pack <$> mproj)
   case mode of
     "list" -> do
-      putStrLn ("[review] campaign branches of " <> T.unpack proj <> ":")
       branches <- listReviewBranches proj
-      if null branches
-        then putStrLn "  (none)"
-        else
-          mapM_
-            ( \b ->
-                putStrLn
-                  ( "  " <> T.unpack (rbBranch b)
-                      <> "  +" <> show (rbCommitsAhead b)
-                      <> (if rbMerged b then "  [merged — safe to prune]" else "  [open]")
-                  )
-            )
-            branches
+      mfmt <- lookupEnv "REVIEW_FORMAT"
+      case mfmt of
+        Just "json" -> BL.putStr (Aeson.encode branches <> "\n")
+        _ -> do
+          putStrLn ("[review] campaign branches of " <> T.unpack proj <> ":")
+          if null branches
+            then putStrLn "  (none)"
+            else
+              mapM_
+                ( \b ->
+                    putStrLn
+                      ( "  " <> T.unpack (rbBranch b)
+                          <> "  +" <> show (rbCommitsAhead b)
+                          <> (if rbMerged b then "  [merged — safe to prune]" else "  [open]")
+                      )
+                )
+                branches
     _ -> do
       mbranch <- lookupEnv "CAMPAIGN_REVIEW_BRANCH"
       branch <- maybe (fail ("REVIEW=" <> mode <> " needs CAMPAIGN_REVIEW_BRANCH=campaign/<run>")) (pure . T.strip . T.pack) mbranch
@@ -703,7 +795,7 @@ campaignConnectionSettings connString = keiroConnectionSettings connString "camp
 -- (act 14's scratch store uses this directly).
 withCampaignStoreAt :: T.Text -> (CampaignStore -> IO ()) -> IO ()
 withCampaignStoreAt connString action = do
-  putStrLn ("[campaign] connecting to " <> T.unpack connString)
+  hPutStrLn stderr ("[campaign] connecting to " <> T.unpack connString)
   runEff $
     withKirokuStore (campaignConnectionSettings connString) $
       withEffToIO SeqUnlift \unlift -> do
@@ -723,7 +815,7 @@ withCampaignStore :: (CampaignStore -> IO ()) -> IO ()
 withCampaignStore action = do
   conn <- defaultCampaignConn
   applied <- bootstrapCampaignStore conn
-  putStrLn
+  hPutStrLn stderr
     ( if applied == 0
         then "[bootstrap] store current (schema present, nothing to apply)"
         else

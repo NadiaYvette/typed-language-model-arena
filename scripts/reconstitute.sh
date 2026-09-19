@@ -75,6 +75,11 @@ done
 echo ""
 echo "=== Workspace reconstitution complete ==="
 echo "All sibling checkouts are ready in $PARENT_DIR."
+echo "Assistant REPL & Reviewer tools:"
+echo "  - CLI bridge:  $ARENA_DIR/scripts/campaign-cli.py status|discover|schedule|verify"
+echo "  - MCP server:  $ARENA_DIR/scripts/campaign-mcp.py --mcp"
+echo "  - Antigravity: $ARENA_DIR/.agents/skills/shikumi-campaign/SKILL.md"
+echo ""
 echo "You can now run 'cabal build all' or 'cabal run campaign-demo' from $ARENA_DIR."
 
 if [[ "${1:-}" == "--build" ]]; then
