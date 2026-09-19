@@ -42,6 +42,7 @@ module Campaign.Hands
     parentRepoPath,
     parentDirtyCount,
     gitCapture,
+    git_,
   )
 where
 

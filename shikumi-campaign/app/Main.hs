@@ -64,6 +64,7 @@ import Data.ByteString.Lazy qualified as BL
 import Data.Foldable (for_, traverse_)
 import Data.IORef (atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Maybe (catMaybes, isJust, maybeToList)
+import Data.Either (isRight)
 import Data.Set qualified as SSet
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -111,7 +112,7 @@ import Kiroku.Store.Types
     StreamName (..),
     StreamVersion (..),
   )
-import System.Directory (createDirectoryIfMissing, doesFileExist, listDirectory, removeFile)
+import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesFileExist, listDirectory, removeFile)
 import System.Environment (lookupEnv)
 import Data.Function ((&))
 import Data.Maybe (fromMaybe, listToMaybe)
@@ -138,6 +139,7 @@ import Campaign.Bootstrap
   , storeWorkflowCount
   )
 import System.Exit (ExitCode (..), exitFailure, exitSuccess)
+import Control.Exception (try, SomeException)
 import System.FilePath ((</>))
 import System.IO (hClose, openTempFile)
 import Data.UUID.V4 (nextRandom)
@@ -180,6 +182,7 @@ import Campaign.Hands
     campaignWorktreePath,
     ensureCampaignWorktree,
     gitCapture,
+    git_,
     parentDirtyCount,
   )
 import Campaign.Landing
@@ -269,6 +272,7 @@ import Campaign.Mercury
     mercuryHelpCheckWorkflow,
     mercuryIntegrationTag,
     mercuryPromotionBranches,
+    mercuryWorktreeFor,
   )
 import Baikai (Context (..), Message (..), Response, TextContent (..), UserContent (..))
 import Baikai.Message (UserPayload (UserPayload))
@@ -349,6 +353,11 @@ main = do
   case classifyMode of
     Just spec -> classifyProbeMode spec >> exitSuccess
     Nothing -> pure ()
+  replayMode <- lookupEnv "REPLAY"
+  case replayMode of
+    Just "mercury" -> runMercuryReplay >> exitSuccess
+    Just other -> fail ("unknown REPLAY target: " <> other <> " (supported: mercury)")
+    Nothing -> pure ()
   putStrLn "[campaign] verification cells on keiro's durable runtime (shikumi decides, keiro journals, kioku remembers)"
   -- The demo runs all seventeen acts; a filter like ACTS=9 runs one act alone
   -- (against whatever journal state the database already has). The fix
@@ -384,6 +393,7 @@ main = do
             22 -> runAppPhaseAct >> pure mSid
             23 -> runRealAct >> pure mSid
             24 -> runEscalationDistillAct >> pure mSid
+            25 -> runMercuryReplayAct >> pure mSid
             n -> fail ("unknown act: " <> show n)
   foldM_ step Nothing [1 .. 24 :: Int]
 
@@ -3194,6 +3204,215 @@ runMercuryAct = do
         ("engine", "propose is the coder patch program (PatchPlan: one exact-match replacement); guard failures and no-decode replies are typed rejections that feed the informed retry"),
         ("guard", "the no-regression denominator is the options.m private-registration count (368 in the campaign clone); promoting one option must lower it by exactly one")
       ]
+-- ===========================================================================
+-- The Mercury replayable demo: the whole promotion drama on demand
+-- ===========================================================================
+
+-- | The campaign clone the Mercury track works against (the clean checkout
+-- with the dump family still private).
+mercuryCampaignClone :: FilePath
+mercuryCampaignClone = "/home/nyc/src/mercury-campaign"
+
+-- | REPLAY=mercury (or act 25): the promotion campaign as an on-demand,
+-- on-the-rails demo. Preflight proves every piece of ground truth BEFORE
+-- any cell starts — tree and facts, the compiler oracle, and the human
+-- seam wire (the awakeable id that the operator answers). Three engines:
+--   * MERCURY_ENGINE unset — the deterministic scripted responder (act 18's
+--     drama: one stale first attempt, informed retry, landing).
+--   * MERCURY_ENGINE=live — the real model via the live stack (act 19's
+--     engine; the same typed pipeline, honest model failures).
+--   * MERCURY_ENGINE=replay — no model at all: re-run the oracle and the
+--     fact probe over every existing per-run landing, then a replay tally
+--     over the journaled attempts — pure verification of what previous
+--     runs decided, zero cost.
+-- MERCURY_CLEAN=1 prunes this demo's own worktrees and branches first (a
+-- ref-by-ref loop through git worktree remove + branch -D, ignoring errors;
+-- the journals keep the history). Never touches the parent checkout.
+runMercuryReplay :: IO ()
+runMercuryReplay = do
+  putStrLn "\n=== mercury replay: the promotion campaign as a demo ==="
+  replayTag <- T.pack . show . floor . utcTimeToPOSIXSeconds <$> getCurrentTime
+
+  -- ---------------------------------------------------------------- (1)
+  -- Preflight 1: the tree and its facts. The demo cannot start without
+  -- ground truth to work from.
+  putStrLn "[preflight] tree + facts"
+  optsExists <- doesFileExist (mercuryOptionsPath mercuryCampaignClone)
+  unless optsExists $
+    fail ("mercury replay: the campaign clone is missing at " <> mercuryCampaignClone)
+  facts <- readMercuryFacts mercuryCampaignClone
+  if null facts
+    then
+      putStrLn
+        ( "  clone is fully promoted (no private dump-family lines in "
+            <> mercuryOptionsPath mercuryCampaignClone
+            <> ") — scripted/live runs have nothing to do; use MERCURY_ENGINE=replay"
+        )
+    else
+      for_ facts $ \f ->
+        putStrLn
+          ( "  fact: --" <> T.unpack (mfOption f) <> " at options.m:" <> show (mfLineNo f)
+              <> " (" <> T.unpack (mfConstructor f) <> " -> " <> T.unpack (mfPublicConstructor f) <> ")"
+          )
+  privNow <- mercuryPrivCount mercuryCampaignClone
+  putStrLn ("  private registrations in the tree: " <> show privNow)
+
+  -- ---------------------------------------------------------------- (2)
+  -- Optional cleanup of prior run state (worktrees first, then branches — a
+  -- ref-by-ref loop, ignoring per-ref errors so a half-removed state cannot
+  -- wedge the sweep). NOTE: this removes EVERY campaign/mercury-* worktree
+  -- and branch — scripted-run landings AND live-run landings alike; the
+  -- journals keep the history. Never touches the parent checkout. And the
+  -- journals are not inert: the driver's resume sweeps are store-wide, so
+  -- workflows parked on old cool-down timers will RE-LAND their branches on
+  -- the next scripted/live run — cleanup clears the git artifacts, not the
+  -- durable intentions.
+  doClean <- (== "1") <$> fromMaybe "" <$> lookupEnv "MERCURY_CLEAN"
+  when doClean $ do
+    putStrLn "[cleanup] pruning every campaign/mercury-* worktree and branch"
+    branches <- map snd <$> mercuryPromotionBranches mercuryCampaignClone
+    for_ branches $ \b -> do
+      let wt = mercuryWorktreeFor "mercury" b
+      wtExists <- doesDirectoryExist wt
+      if wtExists
+        then do
+          _ <- guardTry (git_ mercuryCampaignClone ["worktree", "remove", "--force", wt])
+          pure ()
+        else pure ()
+      _ <- guardTry (git_ mercuryCampaignClone ["branch", "-D", T.unpack b])
+      pure ()
+    git_ mercuryCampaignClone ["worktree", "prune"]
+    putStrLn ("  removed " <> show (length branches) <> " campaign branch(es) and their worktrees")
+
+  -- ---------------------------------------------------------------- (3)
+  -- Preflight 2: the compiler oracle — the dump probe must pass on the
+  -- INSTALLED mmc before any cell is allowed to run.
+  putStrLn "[preflight] compiler oracle (dump probe on the installed mmc)"
+  dumpV <- oracleDumpProbe ("replay-" <> replayTag)
+  putStrLn ("  dump probe: " <> (if ovOk dumpV then "ok — " else "FAILED — ") <> T.unpack (ovDetail dumpV))
+  unless (ovOk dumpV) $ fail "mercury replay: the dump oracle failed on the installed compiler"
+
+  -- ---------------------------------------------------------------- (4)
+  -- Engine choice and the run itself.
+  engineName <- fromMaybe "scripted" <$> lookupEnv "MERCURY_ENGINE"
+  case engineName of
+    "replay" -> do
+      -- Pure verification: no model, no writes. For every landing, re-run
+      -- the fact probe honestly: materialize a detached verify-worktree at
+      -- the landing's PARENT commit (the no-regression leg compares against
+      -- the pre-edit HEAD, so verifying in place would compare the landing
+      -- against itself and misreport), then apply the landing's options.m
+      -- diff as working-tree changes and probe that.
+      putStrLn "[replay] verifying existing landings (no model calls)"
+      landings0 <- mercuryPromotionBranches mercuryCampaignClone
+      -- mercuryPromotionBranches matches by known-target prefix, so a
+      -- dump-mlds-pred-name branch comes back twice (once as dump-mlds).
+      -- Derive each branch's owner from the branch NAME instead, longest
+      -- known target first, and dedupe by branch.
+      let branches = nub (map snd landings0)
+          landings = [(opt, b) | b <- branches, Just opt <- [mercuryBranchOwner b]]
+      if null landings
+        then putStrLn "  no campaign/mercury-* landings exist yet — nothing to replay"
+        else
+          for_ landings $ \(opt, branch) -> do
+            mf <- case [f | f <- facts, mfOption f == opt] of
+              (f : _) -> pure (Just f)
+              [] -> pure Nothing
+            case mf of
+              Nothing ->
+                putStrLn
+                  ( "  --" <> T.unpack opt <> " [" <> T.unpack branch <> "]: no fact for this option"
+                      <> " — fact probe not applicable"
+                  )
+              Just f -> do
+                v <- withVerifyWorktree branch $ \vt -> oracleFactProbe vt f
+                putStrLn
+                  ( "  --" <> T.unpack opt <> " [" <> T.unpack branch <> "]: "
+                      <> (if ovOk v then "still verifies" else "REGRESSED")
+                      <> " — " <> T.unpack (ovDetail v)
+                  )
+    "live" -> do
+      putStrLn "[campaign] the promotion cells under the live engine (REPLAY running act-19's shape)"
+      runLiveMercuryAct
+    "scripted" -> do
+      putStrLn "[campaign] the promotion cells under the scripted engine (REPLAY running act-18's shape)"
+      runMercuryAct
+    other -> fail ("mercury replay: unknown MERCURY_ENGINE " <> other <> " (scripted | live | replay)")
+
+  -- ---------------------------------------------------------------- (5)
+  -- The replay tally: every campaign/mercury-* landing, subject + age, so
+  -- the demo ends with the durable artifact, not a printout.
+  putStrLn "[tally] campaign landings in the clone"
+  landingsT <- nub . map snd <$> mercuryPromotionBranches mercuryCampaignClone
+  if null landingsT
+    then putStrLn "  (none)"
+    else
+      for_ landingsT $ \branch -> do
+        subject <- gitCapture mercuryCampaignClone ["log", "-1", "--format=%s", T.unpack branch]
+        age <- gitCapture mercuryCampaignClone ["log", "-1", "--format=%cr", T.unpack branch]
+        putStrLn ("  " <> T.unpack branch <> "  “" <> T.unpack subject <> "”  (" <> T.unpack age <> ")")
+  dirty <- parentDirtyCount "mercury"
+  putStrLn ("  parent checkout dirty entries: " <> show dirty)
+  putStrLn "[mercury replay] done"
+  where
+    -- | The option a @campaign/mercury-…@ branch lands: the leaf after
+    -- @mercury-@ STARTS with the option name (then @-<runtag>@ or the
+    -- help/integration shapes, which own no option). Longest target first
+    -- so @dump-mlds-pred-name-…@ is not misread as @dump-mlds@.
+    mercuryBranchOwner :: Text -> Maybe Text
+    mercuryBranchOwner b = do
+      leaf <- T.stripPrefix "campaign/mercury-" b
+      case [c | c <- ["dump-mlds-pred-name", "verbose-dump-mlds", "dump-mlds"], c `T.isPrefixOf` leaf] of
+        (c : _) -> Just c
+        [] -> Nothing
+
+    -- | Run an IO action that may throw (git_ uses runProcess_, which
+    -- throws on nonzero exit), swallowing ANY exception as Left — the
+    -- cleanup/verify paths must never die on a missing ref or worktree.
+    guardTry :: IO a -> IO (Either () a)
+    guardTry a = do
+      r <- try a
+      case r of
+        Right v -> pure (Right v)
+        Left (_ :: SomeException) -> pure (Left ())
+
+    -- | A detached verify-worktree for one landing: the branch's parent
+    -- commit checked out, the landing's options.m diff applied as
+    -- working-tree changes — exactly the state the fact probe expects
+    -- (edit present, pre-edit HEAD for the no-regression leg). Always
+    -- removed afterwards; a staging failure reports REGRESSED loudly
+    -- rather than silently skipping.
+    withVerifyWorktree :: Text -> (FilePath -> IO OracleVerdict) -> IO OracleVerdict
+    withVerifyWorktree branch probe = do
+      -- Worktree paths must not contain the branch's “campaign/” prefix.
+      let vt = "/tmp/mercury-verify-" <> T.unpack (last (T.splitOn "/" branch))
+          parentRev = T.unpack branch <> "~"
+      _ <- guardTry (git_ mercuryCampaignClone ["worktree", "remove", "--force", vt])
+      _ <- guardTry (git_ mercuryCampaignClone ["worktree", "prune"])
+      added <- isRight <$> guardTry (git_ mercuryCampaignClone ["worktree", "add", "--detach", vt, parentRev])
+      r <-
+        if not added
+          then pure (Left ())
+          else
+            guardTry $
+              do
+                -- Materialize the landing's options.m WITHOUT moving HEAD:
+                -- HEAD stays at the parent commit (the pre-edit baseline the
+                -- no-regression leg compares against), the working file is
+                -- the landing's version.
+                git_ vt ["checkout", T.unpack branch, "--", "compiler/options.m"]
+                probe vt
+      _ <- guardTry (git_ mercuryCampaignClone ["worktree", "remove", "--force", vt])
+      case r of
+        Right v -> pure v
+        Left _ -> pure (OracleVerdict False "verify worktree could not be staged")
+
+-- | The act wrapper: act 25 is the same demo inside the numbered sequence.
+runMercuryReplayAct :: IO ()
+runMercuryReplayAct = do
+  putStrLn "\n=== act 25: the Mercury promotion demo, replayable on demand ==="
+  runMercuryReplay
+
 -- ===========================================================================
 -- Act 19: the Mercury promotion, live — a real model proposes the edits
 -- ===========================================================================
