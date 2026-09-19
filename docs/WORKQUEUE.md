@@ -151,7 +151,7 @@ Organ Bank harvests intermediate representations from compiler corpses into a un
 Mowgli explores multimodal logic programming in Mercury. Peirce implements a Large Semiotic Model in Julia and Python.
 
 ### Current Status
-- **Mowgli Verification (`mowgli/host@film-fixture`)**: Integrated into [`Campaign.Real`](file:///home/nyc/src/typed-language-model-arena/shikumi-campaign/src/Campaign/Real.hs). Runs `film_episode_test` and `film_annotation_fixture_test` (verified live with `"all checks passed"`).
+- **Mowgli Verification (`mowgli/host@film-fixture`)**: Integrated into [`Campaign.Real`](file:///home/nyc/src/typed-language-model-arena/shikumi-campaign/src/Campaign/Real.hs). Runs `src/logic/film_episode_test` and `src/logic/film_annotation_fixture_test` (verified live with `"all checks passed"`). Adapter in `src/adapters/llada_interface.py`.
 - **Mowgli Core Modules**: 12 Mercury modules and 14 runnable demos combining semirings, PLP (Sato semantics), CTL model checking, DTMC value iteration, multimodal Kripke structures (S5/S4/KD), and Kowalski-Sergot event calculus.
 - **Citation Verification**: `tools/verify_citations.py` automatically checks identifiers against Crossref, arXiv, and DBLP APIs.
 - **Peirce Large Semiotic Model**: Full pipeline operating over Peircean sign structures; 0% trichotomy violations on Phase 1 checkpoint; 33,517 training text chunks across literature and scientific corpora.
