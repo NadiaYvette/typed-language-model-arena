@@ -8,7 +8,7 @@
 -- The toy matrix (@Campaign.Matrix@) proved the shape on synthetic stages;
 -- this module points the same shape at the processes that actually exist:
 --
---   * A pgcl cell is @matrix-driver.sh LINUX_DIR ARCH CONFIG OUTDIR@ — one
+--   * A pgcl cell is @matrix-driver-all.sh LINUX_DIR ARCH CONFIG OUTDIR@ — one
 --     kernel build plus one QEMU boot, one log per cell, verdict markers
 --     written by the initramfs init itself. The arch/config vocabulary is
 --     /discovered against reality/: arches are the driver's catalog
@@ -187,10 +187,21 @@ pgclArchRowsFromDriver path = do
 pgclConfigCatalog :: [Text]
 pgclConfigCatalog = ["mainline", "0", "2", "4", "6"]
 
+-- | Mirror of matrix-driver-all.sh's sh4 toolchain fallback: probe the
+-- x-tools cross-gcc dirs the driver's own PATH loop searches.
+sh4XToolsProbe :: Text -> Text
+sh4XToolsProbe cc =
+  "for d in \"$HOME\"/x-tools/*/sh4-linux/bin \"$HOME\"/x-tools/sh-sh4--*/bin; do\n\
+  \  [ -x \"$d/" <> cc <> "gcc\" ] && exit 0\ndone; exit 1"
+
 -- | @command -v@ probe; False on lookup failure.
 availableOnPath :: Text -> IO Bool
-availableOnPath bin = do
-  (ec, _, _) <- readProcess (proc "bash" ["-c", "command -v " <> T.unpack bin])
+availableOnPath bin = bashProbe ("command -v " <> bin)
+
+-- | @bash -c@ probe; False on any nonzero exit.
+bashProbe :: Text -> IO Bool
+bashProbe snippet = do
+  (ec, _, _) <- readProcess (proc "bash" ["-c", T.unpack snippet])
   pure (ec == ExitSuccess)
 
 -- | The working kernel tree a pgcl config builds from.
@@ -213,7 +224,15 @@ realUnitCells = do
       ( \row -> do
           ccOk <- case paToolchain row of
             "" -> availableOnPath "gcc"
-            cc -> availableOnPath (cc <> "gcc")
+            cc -> do
+              ok <- availableOnPath (cc <> "gcc")
+              -- matrix-driver-all.sh prepends @$HOME/x-tools@ cross-gcc dirs
+              -- to PATH for sh4 only; mirror that fallback verbatim so
+              -- discovery plans what the driver can actually run (the sh4
+              -- toolchain is not on the default PATH).
+              if ok || paArch row /= "sh4"
+                then pure ok
+                else bashProbe (sh4XToolsProbe cc)
           qemuOk <- availableOnPath (paQemuBin row)
           pure (paArch row, ccOk && qemuOk)
       )
@@ -237,9 +256,11 @@ realUnitCells = do
         ]
   pure (pgclUnits <> telixUnits)
 
--- Ground-truth path the discovery reads.
+-- Ground-truth path the discovery reads: the full-catalog driver. The
+-- reduced matrix-driver.sh speaks only 10 of the 20 arches the historical
+-- matrix ran; -all is the driver the 80-cell campaigns actually used.
 pgclDriverPath :: FilePath
-pgclDriverPath = "/home/nyc/src/pgcl/matrix-driver.sh"
+pgclDriverPath = "/home/nyc/src/pgcl/matrix-driver-all.sh"
 
 -- ---------------------------------------------------------------------------
 -- The verdict: read off the log the tool wrote
