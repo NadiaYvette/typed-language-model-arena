@@ -4,6 +4,8 @@ Living workqueue and architecture reference for the typed language model ecosyst
 Scheduler ground truth: `REAL_LIMIT=0 ACTS=23 cabal run campaign-demo` — currently schedules 99 real units (95 kernel matrix cells across 19 architectures + 4 portfolio host verification units) from memory evidence.
 Last updated: 2026-09-19 (portfolio verification infrastructure expansion across `telix`, `tessera`, `organ-bank`, `frankenstein`, `mowgli`, and `peirce`).
 
+See also [Campaign Generalization Architecture](CAMPAIGN_GENERALIZATION.md) for the strategic generalization roadmap (declarative target manifests, distributed worker federation via `pgmq`, autonomous bisection, and sovereign forge integration).
+
 ---
 
 ## 1. Portfolio Architecture & Ecosystem Map

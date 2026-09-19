@@ -19,7 +19,8 @@ The arena synthesizes Nadeem Bitar's four-layer typed LM stack:
 - **[`shikumi-coder`](shikumi-coder)** — Guarded, exact-match code editing engine with strict AST and symbol preservation.
 - **[`toy-fixer`](toy-fixer)** — Autonomous code-repair agent loop over guarded edits.
 - **[`shikumi-campaign`](shikumi-campaign)** — 25-act durable orchestration engine managing verification cells across Linux kernel matrix boots, formal proofs, workflow timers, and promotion campaigns.
-- **[`docs/WORKQUEUE.md`](docs/WORKQUEUE.md)** — Living scheduler queue, failure baseline records, and commit ledger.
+- **[`docs/WORKQUEUE.md`](docs/WORKQUEUE.md)** — Living scheduler queue, portfolio roadmap, failure baseline records, and commit ledger.
+- **[`docs/CAMPAIGN_GENERALIZATION.md`](docs/CAMPAIGN_GENERALIZATION.md)** — Architectural blueprint for campaign generalization, declarative manifests, distributed workers, and sovereign forge integration.
 
 ---
 
