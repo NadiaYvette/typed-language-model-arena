@@ -4579,7 +4579,7 @@ runRealAct = do
   -- treatment, and the rationale is journaled as data alongside the order.
   lessonsRef <- newIORef (Map.empty :: Map.Map Text [Text])
   withCampaignStore $ \store ->
-    for_ ["pgcl", "telix"] $ \proj -> do
+    for_ ["pgcl", "telix", "tessera", "organ-bank", "mowgli"] $ \proj -> do
       notes <- requireEither =<< runCampaignStore store (recallNotes (projectNamespace proj))
       modifyIORef' lessonsRef (Map.insert proj notes)
   lessonsByProject <- readIORef lessonsRef
@@ -4617,11 +4617,11 @@ runRealAct = do
         RealPlan -> "offline; set REAL_LIVE=1"
       seRankOf u = maybe 1 seRank (find ((== realCellKey u) . realCellKey . seUnit) rows)
       pgclUnits = [u | u <- units, ruProject u == "pgcl"]
-      telixUnits = [u | u <- units, ruProject u == "telix"]
+      hostUnits = [u | u <- units, ruKind u == "host-verify"]
   putStrLn
     ( "[real] discovered " <> show (length pgclUnits) <> " pgcl cell(s) across "
         <> show (length (nub (map ruArch pgclUnits))) <> " arch(es), "
-        <> show (length telixUnits) <> " telix unit(s)"
+        <> show (length hostUnits) <> " host unit(s)"
     )
   for_ (groupSortOn ruProject units) $ \group ->
     let keyOf u = ruArch u <> "@" <> ruConfig u

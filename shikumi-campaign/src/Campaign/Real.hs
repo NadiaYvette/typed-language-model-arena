@@ -39,10 +39,13 @@ module Campaign.Real
     PgclArchRow (..),
     pgclArchRowsFromDriver,
     realWorkflowIdTagged,
-    realCellFromWf,     classifyCellLog,
-     classifyCellLogArch,
-     verdictFrom,
-     knownFailuresFor,
+    realCellFromWf,
+    classifyCellLog,
+    classifyCellLogArch,
+    verdictFrom,
+    hostVerdictFrom,
+    hostVerdictFromProj,
+    knownFailuresFor,
     -- * Scheduling from memory
     RealScheduleEntry (..),
     RealSchedule (..),
@@ -254,7 +257,22 @@ realUnitCells = do
         [ RealUnit "telix" "host-verify" "host" "verify" []
         | hasTelix
         ]
-  pure (pgclUnits <> telixUnits)
+  hasTessera <- doesDirectoryExist "/home/nyc/src/tessera/proof"
+  let tesseraUnits =
+        [ RealUnit "tessera" "host-verify" "host" "proof" []
+        | hasTessera
+        ]
+  hasOrganBank <- doesDirectoryExist "/home/nyc/src/organ-bank"
+  let organBankUnits =
+        [ RealUnit "organ-bank" "host-verify" "host" "organ-ir" []
+        | hasOrganBank
+        ]
+  hasMowgli <- doesDirectoryExist "/home/nyc/src/mowgli"
+  let mowgliUnits =
+        [ RealUnit "mowgli" "host-verify" "host" "film-fixture" []
+        | hasMowgli
+        ]
+  pure (pgclUnits <> telixUnits <> tesseraUnits <> organBankUnits <> mowgliUnits)
 
 -- Ground-truth path the discovery reads: the full-catalog driver. The
 -- reduced matrix-driver.sh speaks only 10 of the 20 arches the historical
@@ -357,10 +375,12 @@ knownFailuresFor _ = []
 classifyCellLog :: Text -> Text
 classifyCellLog = classifyCellLogArch ""
 
--- | Where the driver writes this unit's log (under the run's output dir).
 realLogPath :: RealUnit -> FilePath -> Text
-realLogPath u outDir =
-  T.pack outDir <> "/" <> ruArch u <> "_" <> ruConfig u <> ".log"
+realLogPath u outDir
+  | ruKind u == "host-verify" =
+      T.pack outDir <> "/" <> ruProject u <> "-" <> ruConfig u <> ".log"
+  | otherwise =
+      T.pack outDir <> "/" <> ruArch u <> "_" <> ruConfig u <> ".log"
 
 -- ---------------------------------------------------------------------------
 -- Execution (the gated side effect)
@@ -416,14 +436,28 @@ budgetedMode RealLive mlim rank = case mlim of
 realWorkDir :: RealUnit -> Text
 realWorkDir u = case ruProject u of
   "telix" -> "/home/nyc/src/telix"
+  "tessera" -> "/home/nyc/src/tessera"
+  "organ-bank" -> "/home/nyc/src/organ-bank"
+  "mowgli" -> "/home/nyc/src/mowgli"
+  "frankenstein" -> "/home/nyc/src/frankenstein"
   _ -> pgclWorkDir (ruConfig u)
 
 -- | The exact command a cell runs, as journaled (and as the operator would
 -- type to run it by hand).
 commandText :: RealUnit -> FilePath -> Text
 commandText u outDir
-  | ruKind u == "host-verify" =
+  | ruProject u == "telix" =
       "make -C " <> realWorkDir u <> " verify"
+  | ruProject u == "tessera" =
+      "lake --dir " <> realWorkDir u <> "/proof build"
+  | ruProject u == "organ-bank" =
+      "cabal --project-dir=" <> realWorkDir u <> " test organ-ir"
+  | ruProject u == "mowgli" =
+      "make -C " <> realWorkDir u <> " film_episode_test film_annotation_fixture_test && "
+        <> realWorkDir u <> "/film_episode_test && "
+        <> realWorkDir u <> "/film_annotation_fixture_test"
+  | ruKind u == "host-verify" =
+      "make -C " <> realWorkDir u <> " " <> ruConfig u
   | otherwise =
       "bash " <> T.pack pgclDriverPath <> " " <> realWorkDir u <> " "
         <> T.intercalate " " (ruArch u : ruArgs u <> [T.pack outDir])
@@ -446,18 +480,19 @@ verdictFrom ec arch t = case classifyCellLogArch arch t of
   _ -> "failed"
 
 -- | Execute one unit for real. pgcl cells invoke the driver (which manages
--- its own PATH, build dir, QEMU and timeouts); telix runs make. Returns
--- (verdict, logPath) — the verdict read from the log the tool wrote, never
--- from the process exit code alone.
+-- its own PATH, build dir, QEMU and timeouts); host-verify units run their
+-- project test harness. Returns (verdict, logPath) — the verdict read from
+-- the log the tool wrote, never from the process exit code alone.
 runRealUnit :: RealUnit -> FilePath -> IO (Text, Text)
 runRealUnit u outDir
   | ruKind u == "host-verify" = do
-      let logPath = T.pack outDir <> "/telix-host-verify.log"
+      let logPath = realLogPath u outDir
+          cmd = commandText u outDir
       (ec, out, err) <-
-        readProcess (proc "make" ["-C", T.unpack (realWorkDir u), "verify"])
+        readProcess (proc "bash" ["-c", T.unpack cmd])
       let body = TL.toStrict (TLE.decodeUtf8 out) <> "\n" <> TL.toStrict (TLE.decodeUtf8 err)
       TIO.writeFile (T.unpack logPath) body
-      pure (hostVerdictFrom ec body, logPath)
+      pure (hostVerdictFromProj (ruProject u) ec body, logPath)
   | otherwise = do
       let logPath = realLogPath u outDir
           args = T.unpack (realWorkDir u) : map T.unpack (ruArch u : ruArgs u <> [T.pack outDir])
@@ -466,17 +501,27 @@ runRealUnit u outDir
       body <- if exists then T.pack <$> readFile (T.unpack logPath) else pure ""
       pure (verdictFrom ec (ruArch u) body, logPath)
 
--- | A make target has no subtotal banners: make's exit code /is/ the
--- verdict (it propagates cargo and fmt failures), and the @verify@ target's
--- own @Telix-side checks passed.@ marker — printed only after both
--- prerequisites succeeded — corroborates a /complete/ run. Success without
--- the marker is conservatively failed (a truncated or redefined target);
--- the journaled log tells the operator which.
-hostVerdictFrom :: ExitCode -> Text -> Text
-hostVerdictFrom ExitSuccess body
+-- | A host verification verdict read from the command's exit code and
+-- captured log, per project. Success requires the tool's complete-run
+-- marker, guarding against truncated or silently-passing runs.
+hostVerdictFromProj :: Text -> ExitCode -> Text -> Text
+hostVerdictFromProj "telix" ExitSuccess body
   | "Telix-side checks passed." `T.isInfixOf` body = "passed"
   | otherwise = "failed"
-hostVerdictFrom _ _ = "failed"
+hostVerdictFromProj "tessera" ExitSuccess body
+  | "Build completed successfully." `T.isInfixOf` body = "passed"
+  | otherwise = "failed"
+hostVerdictFromProj "organ-bank" ExitSuccess body
+  | "passed" `T.isInfixOf` body = "passed"
+  | otherwise = "failed"
+hostVerdictFromProj "mowgli" ExitSuccess body
+  | "all checks passed" `T.isInfixOf` body = "passed"
+  | otherwise = "failed"
+hostVerdictFromProj _ ExitSuccess _ = "passed"
+hostVerdictFromProj _ _ _ = "failed"
+
+hostVerdictFrom :: ExitCode -> Text -> Text
+hostVerdictFrom = hostVerdictFromProj "telix"
 
 -- ---------------------------------------------------------------------------
 -- The journaled attempt
@@ -563,6 +608,12 @@ realCellFromWf (WorkflowId t) = do
 unitFor :: Text -> Text -> Text -> RealUnit
 unitFor "telix" _ _ =
   RealUnit "telix" "host-verify" "host" "verify" []
+unitFor "tessera" _ cfg =
+  RealUnit "tessera" "host-verify" "host" (if T.null cfg then "proof" else cfg) []
+unitFor "organ-bank" _ cfg =
+  RealUnit "organ-bank" "host-verify" "host" (if T.null cfg then "organ-ir" else cfg) []
+unitFor "mowgli" _ cfg =
+  RealUnit "mowgli" "host-verify" "host" (if T.null cfg then "film-fixture" else cfg) []
 unitFor proj arch cfg =
   RealUnit
     { ruProject = proj,

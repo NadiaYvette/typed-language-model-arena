@@ -32,10 +32,15 @@ declare -A REPOS=(
   ["shibuya-pgmq-adapter"]="https://github.com/shinzui/shibuya-pgmq-adapter.git fee9b3a8670e41baaa41388cfe9235aa03a5caf2"
 )
 
-# Optional runtime verification dependencies
+# Portfolio runtime verification and domain dependencies
 declare -A OPTIONAL_REPOS=(
   ["pgcl"]="https://github.com/NadiaYvette/pgcl-testscripts.git 542bf6e176ae69e32bd0f318cd3484324e7571cf"
   ["telix"]="https://github.com/NadiaYvette/telix.git b0879d7fc2c9ff0aba6693c36db8b23a1aaf0b9c"
+  ["tessera"]="https://github.com/NadiaYvette/tessera.git 97c6312d3dcabb2f04a24ee205f60d441b01e109"
+  ["organ-bank"]="https://github.com/NadiaYvette/organ-bank.git 759ecf0ab3dbfb0b345f79b8fa0fd14deee7648a"
+  ["frankenstein"]="https://github.com/NadiaYvette/frankenstein.git 82ac89364c9127bf15f0a8e257cb72b693b8e83a"
+  ["mowgli"]="https://github.com/NadiaYvette/mowgli.git 04a5ccf59e933997cb90e0b0e0e0aced08022e3b"
+  ["peirce"]="https://github.com/NadiaYvette/peirce.git d9d1b78245461352e919e4682c17b186dc051a9f"
 )
 
 clone_and_pin() {
