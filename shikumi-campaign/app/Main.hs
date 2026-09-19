@@ -1772,7 +1772,7 @@ runFleetAct = do
 -- ---------------------------------------------------------------------------
 
 -- | Act 7 runs the /same/ campaign body over real files: unused-import cells
--- scanned out of the actual checkouts (mowgli: @llada_interface.py@; peirce:
+-- scanned out of the actual checkouts (mowgli: @src/adapters/llada_interface.py@; peirce:
 -- @python/base_model.py@, @python/pdf_extract.py@), the real unused-import
 -- oracle owning ground truth, and one memory namespace per project so each
 -- project's lessons and distillations partition cleanly. Nothing writes back
@@ -3998,7 +3998,7 @@ runDispatchAct = do
   -- dispatch-instance id (act 9's live-prefix trick) so a re-run replays
   -- nothing and the resume worker drives the campaign through the merged
   -- registry.
-  pcsM <- catMaybes <$> mapM readProjectCell [("mowgli", "llada_interface.py")]
+  pcsM <- catMaybes <$> mapM readProjectCell [("mowgli", "src/adapters/llada_interface.py")]
   let dispatchCell c = c {cellId = CellId ("dispatch:" <> unCellId (cellId c))}
       mowgliCell = case pcsM of
         (pc : _) ->
@@ -4142,7 +4142,7 @@ runDispatchAct = do
             -- The real unused-import oracle over the real checkout file:
             -- the claim "mowgli's file carries unused imports" is checked
             -- against ground truth before any fixer runs on it.
-            mpc <- liftIO (readProjectCell ("mowgli", "llada_interface.py"))
+            mpc <- liftIO (readProjectCell ("mowgli", "src/adapters/llada_interface.py"))
             pure $ case mpc of
               Nothing -> "verify(mowgli): file missing — claim uncheckable"
               Just pc ->
@@ -4156,7 +4156,7 @@ runDispatchAct = do
         | otherwise -> do
             -- The toy corpus's marker oracle over one known cell.
             v <- liftIO (oracleDumpProbe ("dispatch-campaign-" <> tag))
-            mpc <- liftIO (readProjectCell ("mowgli", "llada_interface.py"))
+            mpc <- liftIO (readProjectCell ("mowgli", "src/adapters/llada_interface.py"))
             pure $ case mpc of
               Just pc ->
                 let diags = oracleCheck unusedImportOracle (pcPath pc) (pcSource pc)

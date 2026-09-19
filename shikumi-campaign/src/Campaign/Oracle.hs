@@ -550,7 +550,7 @@ data ProjectCell = ProjectCell
 -- bytes on disk, not embedded copies.
 projectCellSpecs :: [(Text, SourcePath)]
 projectCellSpecs =
-  [ ("mowgli", "llada_interface.py"),
+  [ ("mowgli", "src/adapters/llada_interface.py"),
     ("peirce", "python/base_model.py"),
     ("peirce", "python/pdf_extract.py")
   ]

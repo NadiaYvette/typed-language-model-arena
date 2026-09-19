@@ -455,8 +455,8 @@ commandText u outDir
       "cabal --project-dir=" <> realWorkDir u <> " test organ-ir"
   | ruProject u == "mowgli" =
       "make -C " <> realWorkDir u <> " film_episode_test film_annotation_fixture_test && "
-        <> realWorkDir u <> "/film_episode_test && "
-        <> realWorkDir u <> "/film_annotation_fixture_test"
+        <> realWorkDir u <> "/src/logic/film_episode_test && "
+        <> realWorkDir u <> "/src/logic/film_annotation_fixture_test"
   | ruKind u == "host-verify" =
       "make -C " <> realWorkDir u <> " " <> ruConfig u
   | otherwise =
