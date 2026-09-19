@@ -162,14 +162,41 @@ Mowgli explores multimodal logic programming in Mercury. Peirce implements a Lar
 
 ---
 
-## 7. Track 6: `mercury` (Compiler Promotion Campaign) — CLOSED
+## 7. Track 6: Reviewer Accessibility & AI Coding Assistant REPL Integration (MCP, Skills, & Plugins)
+
+External interlocutors and reviewers evaluating the portfolio should be able to query, verify, and inspect the state of any project directly from their interactive AI coding assistant REPL (Antigravity, Claude Code, Cursor, Windsurf, Aider) without needing to memorize raw shell commands (`REAL_LIMIT=0 ACTS=23 cabal run campaign-demo`) or manually probe PostgreSQL sockets.
+
+### Objectives & Surface Area
+- **Model Context Protocol (MCP) Server (`shikumi-campaign-mcp`)**:
+  - Implement an MCP server exposing typed JSON-RPC tools:
+    - `campaign_discover`: List discovered portfolio verification units and host toolchain requirements.
+    - `campaign_schedule`: Inspect the memory-ranked schedule, priorities, and evidence rationale.
+    - `campaign_run`: Dispatch real verification units (single cell, budget-capped, or full matrix) with live log capture.
+    - `campaign_evidence`: Query Kioku memory lessons, documented known-fails baselines, and execution durations.
+    - `campaign_review_branches`: List candidate repair branches from autonomous fixers, display unified diffs, and record human approve/reject verdicts.
+- **Packaged Assistant Skill (`/campaign`)**:
+  - Provide an assistant skill specification (`skills/shikumi-campaign/SKILL.md`) enabling natural conversational workflows:
+    - Reviewer: *"What is our regression baseline for LoongArch?"* -> Assistant queries Kioku memory via `campaign_evidence`.
+    - Reviewer: *"Run the Lean 4 proof verification in Tessera"* -> Assistant dispatches `tessera/host@proof` via `campaign_run` and reports the real log verdict.
+    - Reviewer: *"Show me candidate repairs on Mowgli"* -> Assistant inspects review branches and displays diffs.
+- **Editor & IDE Integration**:
+  - Status lenses in Cursor / VS Code / Neovim for managed portfolio projects.
+
+### Next Milestones
+1. **MCP Tool Bindings**: Implement `shikumi-campaign-mcp` exposing stdio JSON-RPC tool calls for discovery, scheduling, execution, and memory queries.
+2. **Packaged Reviewer Skill**: Author `skills/shikumi-campaign/SKILL.md` with prompt guides, tool mappings, and slash commands.
+3. **One-Command Reviewer Launch**: Wire `cabal run campaign-mcp` and test interactive queries from an assistant REPL.
+
+---
+
+## 8. Track 7: `mercury` (Compiler Promotion Campaign) — CLOSED
 
 - Proven in arena commit `2216b59`: `REPLAY=mercury cabal run campaign-demo`.
 - Verified live engine, replay engine, scripted drama, and parent-commit verification geometry end to end.
 
 ---
 
-## 8. Living Commit & Mirror Ledger
+## 9. Living Commit & Mirror Ledger
 
 ### Remotes & Key IDs
 - **User Remotes**: Nadia Yvette Chambers (`NadiaYvette` on GitHub, Disroot, Framagit, GitCode).

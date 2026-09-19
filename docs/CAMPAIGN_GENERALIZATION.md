@@ -136,6 +136,23 @@ Upgrade the scheduling heuristic (`failed > unknown > passed`) to Bayesian activ
 - **Rigorous Benchmarking Harness**: Existing coding agent benchmarks (SWE-bench, WebArena) frequently suffer from brittle Python scripts, non-resumable container crashes, and hallucinated evaluations.
 - Shikumi-campaign provides an enterprise-grade execution harness for benchmarking coding agents: typed durability, append-only PostgreSQL telemetry, verifiable non-opinionated oracles, and zero evaluation leakage.
 
+### 6. Reviewer Accessibility & AI Coding Assistant REPL Integration (MCP, Skills, & Plugins)
+External interlocutors and reviewers evaluating the portfolio often work directly inside AI coding assistant REPLs (such as Antigravity / AGY, Claude Code, Cursor, Windsurf, or Aider). Forcing reviewers to memorize raw shell incantations (e.g., `REAL_LIMIT=0 ACTS=23 cabal run campaign-demo`), debug local PostgreSQL sockets, or parse raw JSON journals creates unnecessary friction. Exposing `shikumi-campaign` as a native assistant interface bridges this seam:
+
+- **Model Context Protocol (MCP) Server**:
+  - Expose a lightweight MCP server (`shikumi-campaign-mcp`) communicating over stdio/JSON-RPC.
+  - Expose first-class MCP tools:
+    - `campaign_discover`: Enumerate discovered verification targets across the portfolio along with required toolchains and emulators.
+    - `campaign_schedule`: Query the memory-informed execution schedule, rank order, and evidence rationale.
+    - `campaign_run`: Dispatch real verification units (single cell, budget-capped, or full matrix) with real-time log capturing.
+    - `campaign_evidence`: Inspect Kioku memory lessons, known-failure baselines, and historical cell runtimes.
+    - `campaign_review_branches`: List candidate repair branches produced by the autonomous fixer, inspect unified diffs, and submit operator approve/reject verdicts.
+- **Packaged Assistant Skill & Slash Commands**:
+  - Provide a standardized skill (`skills/shikumi-campaign/SKILL.md`) enabling slash commands (e.g., `/campaign status`, `/campaign verify <target>`, `/campaign review`).
+  - Allows an external reviewer to ask conversational questions—e.g., *"What is our current baseline for LoongArch?"*, *"Run the Lean 4 proof track in Tessera"*, or *"Review the repair branch on Mowgli"*—which the assistant fulfills by invoking the exact underlying typed campaign state machines deterministically.
+- **Editor & IDE Plugins (Cursor / VS Code / Neovim)**:
+  - Expose inline status visualizers and one-click verification lenses for code files that belong to managed portfolio projects.
+
 ---
 
 ## 4. Implementation Roadmap
@@ -144,6 +161,7 @@ Upgrade the scheduling heuristic (`failed > unknown > passed`) to Bayesian activ
 | :--- | :--- | :--- |
 | **Phase 1** | In-Tree Target Manifests | Support `.campaign-target.yaml` discovery alongside hardcoded definitions |
 | **Phase 2** | Standardized Oracle DSL | Implement structured log assertion rules (exit code, markers, JSON schema) |
-| **Phase 3** | Autonomous Git Bisection | Add automated bisection workflows triggered on pass-to-fail regressions |
-| **Phase 4** | Remote Worker Leasing | Connect `pgmq` queue consumers for distributed multi-machine execution |
-| **Phase 5** | Radicle Attestation Seam | Emit signed cryptographic verification receipts to Radicle seed nodes |
+| **Phase 3** | Reviewer MCP Server & Skill | Package MCP tools and assistant skill (`/campaign`) for frictionless reviewer evaluation |
+| **Phase 4** | Autonomous Git Bisection | Add automated bisection workflows triggered on pass-to-fail regressions |
+| **Phase 5** | Remote Worker Leasing | Connect `pgmq` queue consumers for distributed multi-machine execution |
+| **Phase 6** | Radicle Attestation Seam | Emit signed cryptographic verification receipts to Radicle seed nodes |
