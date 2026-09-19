@@ -182,10 +182,14 @@ External interlocutors and reviewers evaluating the portfolio should be able to 
 - **Editor & IDE Integration**:
   - Status lenses in Cursor / VS Code / Neovim for managed portfolio projects.
 
-### Next Milestones
-1. **MCP Tool Bindings**: Implement `shikumi-campaign-mcp` exposing stdio JSON-RPC tool calls for discovery, scheduling, execution, and memory queries.
-2. **Packaged Reviewer Skill**: Author `skills/shikumi-campaign/SKILL.md` with prompt guides, tool mappings, and slash commands.
-3. **One-Command Reviewer Launch**: Wire `cabal run campaign-mcp` and test interactive queries from an assistant REPL.
+## 7. Track 6: Reviewer Accessibility & AI Coding Assistant REPL Integration (MCP, Skills, & Plugins) — CLOSED
+
+- **Proven in arena commit `eb168d7`**:
+  - MCP stdio server [`scripts/campaign-mcp.py`](file:///home/nyc/src/typed-language-model-arena/scripts/campaign-mcp.py) exposing 7 typed tools (`campaign_status`, `campaign_discover`, `campaign_schedule`, `campaign_verify`, `campaign_evidence`, `campaign_review`, `campaign_classify`).
+  - Human/reviewer CLI bridge [`scripts/campaign-cli.py`](file:///home/nyc/src/typed-language-model-arena/scripts/campaign-cli.py) supporting formatted text tables and `--json`.
+  - Packaged Antigravity workspace skill ([`.agents/skills/shikumi-campaign/SKILL.md`](file:///home/nyc/src/typed-language-model-arena/.agents/skills/shikumi-campaign/SKILL.md)) and plugin bundle ([`.agents/plugins/shikumi-campaign/`](file:///home/nyc/src/typed-language-model-arena/.agents/plugins/shikumi-campaign/)).
+  - Preconfigured cross-assistant endpoints ([`.mcp.json`](file:///home/nyc/src/typed-language-model-arena/.mcp.json) for Claude Code / open standard, [`.cursor/mcp.json`](file:///home/nyc/src/typed-language-model-arena/.cursor/mcp.json) for Cursor, [`.agents/mcp_config.json`](file:///home/nyc/src/typed-language-model-arena/.agents/mcp_config.json) for Antigravity).
+  - All 4 domain host verification units (`telix`, `tessera`, `organ-bank`, `mowgli`) verified live through the CLI and MCP stdio pipes with verified exit codes and logs.
 
 ---
 
