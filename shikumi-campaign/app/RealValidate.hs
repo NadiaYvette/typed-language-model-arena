@@ -11,7 +11,7 @@
 -- Usage: real-validate [LOG_DIR]
 module Main (main) where
 
-import Campaign.Real (classifyCellLog)
+import Campaign.Real (classifyCellLogArch)
 import Data.List (sort)
 import Data.Text qualified as T
 import System.Directory (listDirectory)
@@ -30,12 +30,13 @@ main = do
     mapM
       ( \f -> do
           b <- readFile (dir </> f)
-          pure (f, classifyCellLog (T.pack b))
+          let arch = T.pack (takeWhile (/= '_') (takeFileName f))
+          pure (f, classifyCellLogArch arch (T.pack b))
       )
       logs
   mapM_ (\(f, v) -> putStrLn (takeFileName f <> ": " <> T.unpack v)) results
   let tally k = show (length [() | (_, v) <- results, T.unpack v == k]) <> " " <> k
-  putStrLn ("=== " <> show (length results) <> " log(s): " <> intercalate ", " [tally "passed", tally "failed", tally "skipped"])
+  putStrLn ("=== " <> show (length results) <> " log(s): " <> intercalate ", " [tally "passed", tally "passed-waived", tally "failed", tally "skipped"])
   where
     intercalate sep (x : xs) = x ++ concatMap (sep ++) xs
     intercalate _ [] = []

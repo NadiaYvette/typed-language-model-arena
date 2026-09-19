@@ -1,8 +1,8 @@
 # Workqueue — typed-language-model-arena
 
 Living queue for the campaign stack (shikumi decides, keiro journals, kioku remembers).
-Scheduler ground truth: `REAL_LIMIT=0 ACTS=23 campaign-demo` — currently 12 evidenced
-cells, alpha tier at the head of the plan. Last updated: 2026-09-19 (catalog audit closed).
+Scheduler ground truth: `REAL_LIMIT=0 ACTS=23 campaign-demo` — currently 17 evidenced
+cells, alpha tier (retest) at the head of the plan. Last updated: 2026-09-19 (alpha baseline & initramfs sync).
 
 ## In flight
 
@@ -22,12 +22,12 @@ Per-row verification of the 20-arch catalog against what this host actually has,
 
 ## Queue — campaign / matrix track
 
-1. **Live alpha tier batch** — the scheduler's #1–#5 (`pgcl/alpha@0,2,4,6,mainline`, "no evidence yet"). Light cells (2G guest, 600s boot budget); first live run under `matrix-driver-all.sh`.
+1. **Alpha tier baseline & re-test** — first live run proved all 5 cells compile and boot into QEMU Clipper cleanly (rc=0, 73 LTP passed). Root-caused missing LTP failure names to an outdated April `init` script in `initramfs-alpha.cpio.gz` (lacked immediate fail dump and `LTP FAIL LIST`); rebuilt `initramfs-alpha.cpio.gz` and `initramfs-arm.cpio.gz` with current `init`. Verified single failing LTP test is `mmap3: FAIL (exit=2)` (identical across configs and May baseline). Added `knownFailuresFor "alpha" = ["mmap3"]` to `Campaign.Real.hs`. Re-test live batch will promote tier from `failed` to `passed-waived`.
 2. **Live batches across the remaining tiers** — arm-lpae is #6–#10; behind it arm, hppa, hppa64, microblaze, mips64, or1k, xtensa, sh4, riscv32, sparc64, s390x, ppc64. The road to 19-arch × 5-config coverage (96 units, minus csky).
 3. **hppa/hppa64 baseline evidence** — June logs show single LTP failures; two repeat runs each before they earn `knownFailuresFor` entries (the loongarch rule: no baseline on one log).
 4. **csky** — install its cross-gcc + `qemu-system-csky`, or accept permanent absence from the plan.
-5. **Stale workflow wart** — an unregistered `project-cell-campaign` workflow (old Sail lexing unit) nags the resume sweep; needs a tombstone rule or store cleanup.
-6. **alpha batch pre-flight** — the catalog audit is green, so the alpha tier (#1–#5) is cleared to run live.
+5. **Stale workflow wart** — CLOSED (`CLEANUP=stale` retired orphaned Sail units with typed cancellations; resume sweep now 0 discovered / 0 unregistered).
+6. **alpha batch pre-flight** — CLOSED (catalog audit green, QEMU Clipper stable).
 
 ## Queue — verification-beyond-boot track
 
@@ -47,6 +47,9 @@ and the parent-commit verify geometry all proven end to end.
 
 ## Ledger (recent)
 
+- arena — added `knownFailuresFor "alpha" = ["mmap3"]`; updated `real-validate` to support arch-scoped baseline classification
+- pgcl — rebuilt `initramfs-alpha.cpio.gz` and `initramfs-arm.cpio.gz` with current `init` (restores immediate fail dump, `LTP FAIL LIST`, autotest console flush)
+- arena — `CLEANUP=stale` operator mode added; retired stale Sail workflow instances (`project-cell-campaign`) with typed cancellations; resume sweep now 0 unregistered
 - pgcl `542bf6e` — riscv32 row fix (`defconfig 32-bit.config`) + `matrix-catalog-audit.sh`
 - arena `2216b59` — Mercury replay demo: the promotion campaign as a one-command demo
 - arena `29c444d` — discovery/dispatch pointed at the full-catalog `matrix-driver-all.sh`; sh4 `~/x-tools` fallback mirrored in discovery

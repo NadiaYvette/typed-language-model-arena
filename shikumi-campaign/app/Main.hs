@@ -358,6 +358,13 @@ main = do
     Just "mercury" -> runMercuryReplay >> exitSuccess
     Just other -> fail ("unknown REPLAY target: " <> other <> " (supported: mercury)")
     Nothing -> pure ()
+  -- Operator mode: retire stale or superseded workflows from historical runs
+  -- that nag the resume sweep (e.g. old Sail units).
+  cleanupMode <- lookupEnv "CLEANUP"
+  case fmap (T.unpack . T.toLower . T.strip . T.pack) cleanupMode of
+    Just "stale" -> cleanupStaleWorkflows >> exitSuccess
+    Just other -> fail ("unknown CLEANUP target: " <> other <> " (supported: stale)")
+    Nothing -> pure ()
   putStrLn "[campaign] verification cells on keiro's durable runtime (shikumi decides, keiro journals, kioku remembers)"
   -- The demo runs all seventeen acts; a filter like ACTS=9 runs one act alone
   -- (against whatever journal state the database already has). The fix
@@ -828,6 +835,30 @@ resumeOnceQuiet store registry = do
     requireEither
       =<< runCampaignStore store (resumeWorkflowsOnce resumeOptions registry)
   when (discovered summary > 0) $ putStrLn ("  resume: " <> show summary)
+
+-- | Operator cleanup: retire stale or orphaned workflows with a typed
+-- cancellation — journal event recorded, never a silent delete.
+-- Resolves the old Sail lexing/analysis units that nag the resume sweep.
+cleanupStaleWorkflows :: IO ()
+cleanupStaleWorkflows = withCampaignStore $ \store -> do
+  putStrLn "[cleanup] scanning for stale/orphaned workflows..."
+  now <- getCurrentTime
+  pairs <- requireEither =<< runCampaignStore store (findUnfinishedWorkflowIds now)
+  let isSailUnit (name, wid) =
+        name == unWorkflowName' projectCampaignWorkflowName
+          && ("sail" `T.isInfixOf` wid || "tessera" `T.isInfixOf` wid)
+      discoveredStale = filter isSailUnit pairs
+      knownOrphaned =
+        [ (unWorkflowName' projectCampaignWorkflowName, "pcell-app-app1789643209-sail-x86-from-acl2:translator/validation/automation/analyseOutput.py")
+        , (unWorkflowName' projectCampaignWorkflowName, "pcell-app-app1789652435-tessera/third_party/sail:test/lexing/run_tests.py")
+        ]
+      allTargets = nub (discoveredStale ++ knownOrphaned)
+  if null allTargets
+    then putStrLn "  no stale workflows found"
+    else for_ allTargets $ \(nameText, idText) -> do
+      outcome <- requireEither =<< runCampaignStore store (cancelWorkflow (WorkflowName nameText) (WorkflowId idText))
+      putStrLn ("  retired: " <> T.unpack nameText <> " [" <> T.unpack idText <> "] -> " <> show outcome)
+  putStrLn "[cleanup] done"
 
 -- | Fire workflow-sleep timers (clock well past the delay) until @step@ shows
 -- up in the journal, bounded. Jitsurei's helper, pointed at our act.

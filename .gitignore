@@ -5,3 +5,6 @@ dist-newstyle/
 .shikumi/
 classify.json
 db/
+.freebuff/
+cabal.project.local
+cabal.project.local*

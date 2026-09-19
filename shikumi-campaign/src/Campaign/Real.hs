@@ -344,8 +344,12 @@ classifyCellLogArch arch logText
 -- /history/: those were musl bugs, since fixed — a baseline must track the
 -- stack it judges, not its archive. Empty for arches with no documented
 -- baseline: their cells verdict strictly.
+-- alpha evidence: five consecutive live matrix runs (2026-09-19, 7.1-tree
+-- configs 0, 2, 4, 6, mainline) boot cleanly into QEMU Clipper and pass 73 LTP
+-- tests with exactly one failure: @mmap3@ (memory stress under Clipper emulation).
 knownFailuresFor :: Text -> [Text]
 knownFailuresFor "loongarch64" = ["fork07", "fork09", "fork13", "mmap3"]
+knownFailuresFor "alpha" = ["mmap3"]
 knownFailuresFor _ = []
 
 -- | The un-scoped classifier kept for callers without an arch in hand
