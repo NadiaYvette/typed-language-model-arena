@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# scripts/reconstitute.sh
+#
+# Reconstitutes the typed-language-model-arena workspace by cloning and pinning
+# Nadeem Bitar's typed language model ecosystem repositories (shikumi, baikai,
+# keiro, kioku, etc.) alongside this repository in the parent directory.
+#
+# Usage:
+#   ./scripts/reconstitute.sh [--build]
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ARENA_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+PARENT_DIR="$(cd "$ARENA_DIR/.." && pwd)"
+
+echo "=== Reconstituting typed-language-model-arena workspace ==="
+echo "Arena directory:  $ARENA_DIR"
+echo "Target directory: $PARENT_DIR"
+echo ""
+
+# Declarative manifest of sibling repositories, URLs, and tested commit hashes.
+declare -A REPOS=(
+  ["shikumi"]="https://github.com/shinzui/shikumi.git ca207c9384816d996bf207c066baae2bfd134e3b"
+  ["baikai"]="https://github.com/shinzui/baikai.git 4a9547b00de18b095259e3720e1ede82670787c9"
+  ["keiki"]="https://github.com/shinzui/keiki.git 97d8b07e87ceb2d9b6e6b2b8a60a7de84e15e2bb"
+  ["kiroku"]="https://github.com/shinzui/kiroku.git 09b7005382750e851f841079ba72b4d666006537"
+  ["shibuya"]="https://github.com/shinzui/shibuya.git daa1e0c8726bd407288bbeb065146e01a63a4046"
+  ["keiro"]="https://github.com/shinzui/keiro.git 0ab397f710a4ef73ead14d17a519545209d92ca3"
+  ["kioku"]="https://github.com/shinzui/kioku.git 1fb4fa39747f03ff5be6c5f07ae3a1d385cdfbee"
+  ["pgmq-hs"]="https://github.com/shinzui/pgmq-hs.git 8a704c336dea742a426eb737848367681dc9ebf7"
+  ["shibuya-pgmq-adapter"]="https://github.com/shinzui/shibuya-pgmq-adapter.git fee9b3a8670e41baaa41388cfe9235aa03a5caf2"
+)
+
+# Optional runtime verification dependencies
+declare -A OPTIONAL_REPOS=(
+  ["pgcl"]="https://github.com/NadiaYvette/pgcl-testscripts.git 542bf6e176ae69e32bd0f318cd3484324e7571cf"
+  ["telix"]="https://github.com/NadiaYvette/telix.git b0879d7fc2c9ff0aba6693c36db8b23a1aaf0b9c"
+)
+
+clone_and_pin() {
+  local name="$1"
+  local url="$2"
+  local commit="$3"
+  local dest="$PARENT_DIR/$name"
+
+  if [ -d "$dest/.git" ]; then
+    echo "  [$name] already present at $dest"
+  else
+    echo "  [$name] cloning from $url..."
+    git clone "$url" "$dest"
+    echo "  [$name] pinning to commit $commit..."
+    git -C "$dest" checkout "$commit"
+  fi
+}
+
+echo "--- 1. Cloning / verifying Haskell workspace dependencies ---"
+for name in "${!REPOS[@]}"; do
+  read -r url commit <<< "${REPOS[$name]}"
+  clone_and_pin "$name" "$url" "$commit"
+done
+
+echo ""
+echo "--- 2. Cloning / verifying runtime verification targets (optional for unit acts) ---"
+for name in "${!OPTIONAL_REPOS[@]}"; do
+  read -r url commit <<< "${OPTIONAL_REPOS[$name]}"
+  clone_and_pin "$name" "$url" "$commit"
+done
+
+echo ""
+echo "=== Workspace reconstitution complete ==="
+echo "All sibling checkouts are ready in $PARENT_DIR."
+echo "You can now run 'cabal build all' or 'cabal run campaign-demo' from $ARENA_DIR."
+
+if [[ "${1:-}" == "--build" ]]; then
+  echo ""
+  echo "--- 3. Running cabal build all ---"
+  cd "$ARENA_DIR"
+  cabal build all
+fi
