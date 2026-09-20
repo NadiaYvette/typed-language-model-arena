@@ -2,7 +2,7 @@
 
 Living workqueue and architecture reference for the typed language model ecosystem (shikumi decides, keiro journals, kioku remembers).
 Scheduler ground truth: `REAL_LIMIT=0 ACTS=23 cabal run campaign-demo` — currently schedules 99 real units (95 kernel matrix cells across 19 architectures + 4 portfolio host verification units) from memory evidence.
-Last updated: 2026-09-19 (portfolio verification infrastructure expansion across `telix`, `tessera`, `organ-bank`, `frankenstein`, `mowgli`, and `peirce`).
+Last updated: 2026-09-20 (added Tracks 8/9 — `kuroko` & `smirk` — as AWAITING REVIEW open-ended tracks; kuroko policy matcher moved to smirk; kuroko Dhall config fixed + env-var variant added; smirk split into core + effectful + polysemy packages).
 
 See also [Campaign Generalization Architecture](CAMPAIGN_GENERALIZATION.md) for the strategic generalization roadmap (declarative target manifests, distributed worker federation via `pgmq`, autonomous bisection, and sovereign forge integration).
 
@@ -200,6 +200,61 @@ External interlocutors and reviewers evaluating the portfolio should be able to 
 
 ---
 
+## 8b. Track 8: `kuroko` (Autonomous Agent Sidecar) — AWAITING REVIEW
+
+Kuroko is an unobtrusive, effectful autonomous coding agent runtime (< 1,500 LOC) built on `effectful`, extensible records (vinyl/docrecords), `persistent-effectful` + SQLite, and Dhall-typed configuration.
+
+### Current Status
+- **Status**: **Awaiting review** — open-ended track; goals not yet firmed up beyond the landed scaffolding.
+- **Policy & config hardening (landed)**:
+  - Tool policy pattern rules now use **smirk** (pure Haskell glob + ReDoS-safe fuel-bounded PCRE) instead of `Glob` + `regex-with-pcre`, dropping the C FFI dependency from the arg-scanning path.
+  - `config/agent.dhall` is now a valid, self-contained default (includes the required `policy` block: budget cap, rate cap, glob/PCRE `patternRules`). Previously it was missing `policy` and failed typechecking.
+  - `config/agent-env.dhall` demonstrates Dhall-native env-var imports (`env:KUROKO_MODEL as Text`) for deployment overrides.
+- **Dhall config grammar reference** (verified against dhall 1.42.3, kept as a workqueue note since it bit hard):
+  - Empty list literals require an annotation: `[] : List Text`.
+  - `None` is a polymorphic builtin — write it applied: `None { maxCallsPerWindow : Natural, windowSeconds : Double }`.
+  - Union *values* are projections of the union type: with `let verdict = < AllowAuto | Denied : Text | … >`, write `verdict.Denied "…"`, not `<Denied> "…"`.
+  - `env:VAR` splices the value **as Dhall code** by default; `env:VAR as Text` treats it as a raw string literal. Missing var → hard "Missing environment variable" error (all-or-nothing, no `${VAR:-default}`).
+
+### Next Milestones (open-ended, pick as reviewed)
+1. **Reviewer pass on the policy/config changes** (see "Awaiting review" note below).
+2. Decide whether `kuroko` should become a first-class campaign verification unit (`kuroko/host@verify`: `cabal build && cabal test` wired into `Campaign.Real`), or remain a portfolio library tracked only here.
+3. Optional: expose MCP `campaign_*` tools over kuroko's own agent loop (kuroko currently *serves* MCP; the arena orchestrates it).
+4. Optional: ReDoS-fuel tuning for `matchArgPCRE` (currently `Unlimited`; smirk's `StepBudget` is available if arg payloads ever grow adversarial).
+
+---
+
+## 8c. Track 9: `smirk` (Pure PCRE + Glob Engine) — AWAITING REVIEW
+
+Smirk is a 100% native Haskell, step-bounded (ReDoS-safe), pausable/resumable PCRE engine with glob compilation and optional algebraic-effect interpreters.
+
+### Package Layout (landed)
+Split into three packages so effect interfaces don't drag each other in (module paths unchanged; each effect package lives in its own subdirectory because cabal rejects multiple `.cabal` files in one directory):
+| Package | Cabal file | Contents |
+| :--- | :--- | :--- |
+| **`smirk`** (core) | `smirk.cabal` (root) | PCRE parser/AST/bytecode/VM, glob engine, sequence polymorphism, quasiquoters — no effect-system deps |
+| **`smirk-effectful`** | `effectful/smirk-effectful.cabal` | `Smirk.Effect.Effectful` (`RegexEngine` as an `effectful` effect) + `smirk-effectful-test` |
+| **`smirk-polysemy`** | `polysemy/smirk-polysemy.cabal` | `Smirk.Effect.Polysemy` (`RegexEngine` as a `polysemy` effect) + `smirk-polysemy-test` |
+Effect tests moved out of the core `smirk-test` into the per-interface suites. Dev compiler pinned to `ghc-9.12.4` (`cabal.project`); older-GHC compat deferred to productisation. Note: `cabal test all` also runs the local `../polysemy` dep's own suite, which currently fails to build ("Could not find test program") — pre-existing, unrelated to smirk; test the three `smirk*` suites individually.
+
+### Current Status
+- **Status**: **Awaiting review** — open-ended track; goals not yet firmed up.
+- **New consumer (landed)**: `kuroko`'s tool-policy matcher (`Kuroko.Effect.Policy.matchToolGlob` / `matchArgPCRE`) now uses smirk **core** only (no polysemy/effectful drag-in for kuroko).
+- **Engine surface**: PCRE parse (lookarounds, named groups, backrefs, `(?i)/(?s)/(?m)`), glob → AST (path-aware `**`, brace expansion, char classes), fuel-bounded VM, mono-traversable sequence polymorphism (Text, ByteString, Seq, Vector, NonEmpty).
+
+### Next Milestones (open-ended, pick as reviewed)
+1. **Reviewer pass on the kuroko integration** (shared with Track 8).
+2. Decide smirk's verification story: does it get a `smirk/host@test` campaign unit, or is its `smirk-test` suite (`ParserSpec`, `VMSpec`, `GlobSpec`, …) sufficient and tracked here?
+3. Optional: differential testing smirk's VM against a reference PCRE backend (e.g. `regex-with-pcre`) over a shared pattern corpus, to catch semantic drift in lookarounds/backrefs.
+4. Optional: `Smirk.Effect.Polysemy`/`Smirk.Effect.Effectful` are now separate packages — decide which (if either) kuroko should adopt as its default effect interface (kuroko currently uses its own `effectful` policy layer + smirk core only).
+
+---
+
+### Review Status Convention (Tracks 8 & 9)
+Both new tracks are marked **AWAITING REVIEW** deliberately: they are seeded with concrete, verified landed work but **without definite goals** — the "Next Milestones" lists are proposals to be chosen/edited during review, not committed targets. A track leaves AWAITING REVIEW when a reviewer (human or assistant) has confirmed the landed changes and picked (or deferred) its next milestones.
+
+---
+
 ## 9. Living Commit & Mirror Ledger
 
 ### Remotes & Key IDs
@@ -212,6 +267,11 @@ External interlocutors and reviewers evaluating the portfolio should be able to 
   - `mowgli`: `rad:z2jiunVzMrWnfcefCFN52VRo5mudp`
 
 ### Recent Ledger
+- **arena** — Added Tracks 8 (`kuroko`) & 9 (`smirk`) to the workqueue as **AWAITING REVIEW** open-ended tracks (seeded with landed work, goals to be picked at review), plus a review-status convention and a verified Dhall config-grammar reference.
+- **kuroko** — Tool policy pattern matching now uses **smirk** (pure glob + ReDoS-safe fuel-bounded PCRE); dropped `Glob` + `regex-with-pcre` deps. Fixed `config/agent.dhall` (was missing required `policy` block → typecheck failure); added `config/agent-env.dhall` demonstrating `env:VAR as Text` Dhall env imports.
+- **smirk** — Split into 3 packages: core `smirk` (no effect-system deps, root `smirk.cabal`), `effectful/smirk-effectful.cabal`, `polysemy/smirk-polysemy.cabal`; effect tests moved to per-interface suites (commit `f17d488`). First in-ecosystem production consumer: `Kuroko.Effect.Policy.matchToolGlob` / `matchArgPCRE` (core only; kuroko's closure verified free of polysemy & regex-with-pcre).
+- **kuroko** — Policy matcher via smirk core + fixed/extended Dhall configs, commit `2ed7a20`.
+- **smirk / kuroko** — Dev compiler pinned to recent 9.12 series (smirk `cabal.project`: `ghc-9.12.4`; kuroko stays `9.12.2`); older-GHC compatibility deferred to productisation. Maintainer line standardized to `Nadia Chambers <nadia.yvette.chambers@ik.me>`.
 - **arena** — Built and verified complete AI Assistant REPL & Reviewer integration:
   - Landed [`scripts/campaign-mcp.py`](file:///home/nyc/src/typed-language-model-arena/scripts/campaign-mcp.py) and [`scripts/campaign-cli.py`](file:///home/nyc/src/typed-language-model-arena/scripts/campaign-cli.py) exposing 7 typed tools (`status`, `discover`, `schedule`, `verify`, `evidence`, `review`, `classify`).
   - Added native JSON query modes to `shikumi-campaign` (`DISCOVER=json`, `SCHEDULE=json`, `EVIDENCE_FORMAT=json`, `REVIEW_FORMAT=json`, `SERVER_FORMAT=json`) with clean stderr log separation.
