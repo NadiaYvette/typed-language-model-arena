@@ -2,7 +2,7 @@
 
 Living workqueue and architecture reference for the typed language model ecosystem (shikumi decides, keiro journals, kioku remembers).
 Scheduler ground truth: `REAL_LIMIT=0 ACTS=23 cabal run campaign-demo` — currently schedules 99 real units (95 kernel matrix cells across 19 architectures + 4 portfolio host verification units) from memory evidence.
-Last updated: 2026-09-20 (added Tracks 8/9 — `kuroko` & `smirk` — as AWAITING REVIEW open-ended tracks; kuroko policy matcher moved to smirk; kuroko Dhall config fixed + env-var variant added; smirk split into core + effectful + polysemy packages).
+Last updated: 2026-09-20 (added Tracks 8/9 — `kuroko` & `smirk` — as AWAITING REVIEW open-ended tracks; kuroko policy matcher moved to smirk; kuroko Dhall config fixed + env-var variant added; smirk split into core + effectful + polysemy packages; added Track 10 — `seihou` as candidate campaign substrate for Vectors A/D, Integrations #5/#6, and attestation).
 
 See also [Campaign Generalization Architecture](CAMPAIGN_GENERALIZATION.md) for the strategic generalization roadmap (declarative target manifests, distributed worker federation via `pgmq`, autonomous bisection, and sovereign forge integration).
 
@@ -250,8 +250,43 @@ Effect tests moved out of the core `smirk-test` into the per-interface suites. D
 
 ---
 
-### Review Status Convention (Tracks 8 & 9)
-Both new tracks are marked **AWAITING REVIEW** deliberately: they are seeded with concrete, verified landed work but **without definite goals** — the "Next Milestones" lists are proposals to be chosen/edited during review, not committed targets. A track leaves AWAITING REVIEW when a reviewer (human or assistant) has confirmed the landed changes and picked (or deferred) its next milestones.
+## 8d. Track 10: `seihou` (Upstream Scaffolding & Agent Infrastructure as Campaign Substrate) — AWAITING REVIEW
+
+`seihou` (製法) is a **Nadeem Bitar upstream** (BSD-3-Clause, `shinzui` org — the same org as the campaign's Layer-1 repos, but Nadeem's, not the portfolio's) Dhall-driven, composable project-scaffolding and agent-workflow-authoring system. It is **not** a member of the typed-language-model portfolio; it is a candidate substrate the campaign can adopt.
+
+### Why it's in the workqueue (incorporation scope)
+- **Vector A — declarative target manifests**: replace the hardcoded `RealUnit` records in `Campaign.Real` with self-describing, discoverable, typed targets.
+- **Vector D — autonomous bisection & closed-loop repair**: resumable, receipted, review-gated artifact flows.
+- **Integration #5 — agent-evaluation arenas**: type-safe, incremental, deterministic-baseline-first authoring as the antidote to brittle scripts / non-resumable crashes / hallucinated evaluations.
+- **Integration #6 — reviewer skills & prompts**: seihou's `prompt` kind as the authoring substrate for the `/campaign` assistant surface.
+- **Attestation / Provenance**: seihou's ADR 0011-style receipts and origin-locked manifests as the design template for signed verification receipts (Phase 6, Radicle).
+- **Ecosystem dovetailing**: Nadeem's baikai / seihou / mori-OKF family is expected to integrate with the campaign stack further than it does today; track release coupling in the ledger.
+
+### Verified facts (this session, 2026-09-20)
+- seihou v0.8.0.0; three packages (`seihou-core`, `seihou-cli`, `seihou-okf-extension`); four Dhall-typed artifact kinds — `module`, `recipe`, `blueprint`, `prompt` — validated before any file is written.
+- `.seihou/manifest.json` is incremental state with a three-state diff (manifest / plan / disk); re-runs never clobber hand-edited files; modules ship `removal` steps and versioned `migrations` with per-edge receipts and resume.
+- ADRs that matter to the campaign: 0001 (manifest = checked-in, machine-independent artifact), 0003 (stale or substituted artifact is a hard error), 0007 (deliberate no-op is a third outcome, not success), 0011 (a migration receipt asserts a claim about the project).
+- AI providers enter through the **baikai family** (`baikai`, `baikai-claude`, `baikai-openai`, `baikai-kit` ≥ 0.7.0.0) — the **same baikai version the arena pins** (`scripts/reconstitute.sh`: `shinzui/baikai @ 4a9547b` = release 0.7.0.0, Layer 1 "Protocol mediation & session lifecycles").
+- No other coupling: seihou depends on none of `kioku` / `shikumi` / `keiro` / `kiroku` / `shibuya` / `pgmq` (keiro/kiroku appear only as example migration names in seihou's tests), and the arena references seihou nowhere.
+- Build: nix-haskell-flake 0.19.0, GHC 9.12+ required; `seihou-core/test/fixtures/haskell-base` is a ready-made starting fixture.
+
+### Open design questions (resolve at review)
+1. **Manifest language**: Vector A's sketch is `.campaign-target.yaml`; seihou is Dhall. Do campaign targets become seihou `module`/`recipe` values (Dhall, in-language with the Haskell orchestrator), or does seihou grow a YAML-compatible artifact form?
+2. **Oracle metadata**: how a target carries oracle rules (exit code + marker + JSON schema + known-fails baseline) inside the seihou artifact while keeping verdicts strictly non-opinionated (the Vector B boundary must stay intact).
+3. **Upstream commitment**: adopting seihou makes the campaign manifest layer transitively depend on Nadeem's baikai family — a third-party infrastructure commitment; pin policy needed (no skew today, both on 0.7.0.0).
+
+### Next Milestones (open-ended, pick as reviewed)
+1. **Spike**: author one real campaign target (e.g. `tessera/host@proof`) as a seihou module/recipe and discover it from `Campaign.Real` without recompiling the orchestrator (Vector A feasibility).
+2. Carry oracle metadata + known-fails baselines in the target artifact (Vector B bridge, non-opinionated).
+3. Model one pass-to-fail repair as blueprint + migration receipts feeding `Campaign.Review` (Vector D).
+4. Re-express the `/campaign` skill prompts as seihou `prompt` artifacts (Integration #6).
+5. Draft the seihou-receipt → signed-attestation mapping for Phase 6 (Attestation/Provenance, Radicle).
+6. Ecosystem watch: record baikai/seihou/mori-OKF releases and new dovetailing surfaces in the ledger.
+
+---
+
+### Review Status Convention (Tracks 8, 9 & 10)
+These tracks are marked **AWAITING REVIEW** deliberately: each is seeded with concrete, verified work (Tracks 8–9: landed changes; Track 10: verified reconnaissance) but **without definite goals** — the "Next Milestones" lists are proposals to be chosen/edited during review, not committed targets. A track leaves AWAITING REVIEW when a reviewer (human or assistant) has confirmed the seeded work and picked (or deferred) its next milestones.
 
 ---
 
@@ -267,6 +302,7 @@ Both new tracks are marked **AWAITING REVIEW** deliberately: they are seeded wit
   - `mowgli`: `rad:z2jiunVzMrWnfcefCFN52VRo5mudp`
 
 ### Recent Ledger
+- **arena** — Added Track 10 (`seihou`, Nadeem Bitar upstream, BSD-3-Clause) as an AWAITING REVIEW open-ended track: candidate substrate for campaign Vector A (declarative target manifests), Vector D (bisection/repair with receipts), Integration #5 (agent-eval anti-brittleness), Integration #6 (prompt authoring), and attestation/provenance (Phase 6 design template). Verified in the wild: seihou 0.8.0.0, baikai-family dependency at the same 0.7.0.0 the arena pins, no other coupling to portfolio repos; open design questions recorded (Dhall vs YAML manifests, oracle metadata in artifacts, upstream pin policy).
 - **arena** — Added Tracks 8 (`kuroko`) & 9 (`smirk`) to the workqueue as **AWAITING REVIEW** open-ended tracks (seeded with landed work, goals to be picked at review), plus a review-status convention and a verified Dhall config-grammar reference.
 - **kuroko** — Tool policy pattern matching now uses **smirk** (pure glob + ReDoS-safe fuel-bounded PCRE); dropped `Glob` + `regex-with-pcre` deps. Fixed `config/agent.dhall` (was missing required `policy` block → typecheck failure); added `config/agent-env.dhall` demonstrating `env:VAR as Text` Dhall env imports.
 - **smirk** — Split into 3 packages: core `smirk` (no effect-system deps, root `smirk.cabal`), `effectful/smirk-effectful.cabal`, `polysemy/smirk-polysemy.cabal`; effect tests moved to per-interface suites (commit `f17d488`). First in-ecosystem production consumer: `Kuroko.Effect.Policy.matchToolGlob` / `matchArgPCRE` (core only; kuroko's closure verified free of polysemy & regex-with-pcre).
