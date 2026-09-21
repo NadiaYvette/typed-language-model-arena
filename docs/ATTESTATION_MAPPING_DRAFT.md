@@ -1,6 +1,6 @@
 # Phase 6 Draft — Mapping seihou migration receipts onto Radicle signed verification attestations
 
-- Status: **DRAFT (Track 10, milestone 5)** — design mapping, no code
+- Status: **DRAFT (Track 10, milestone 5) — mapping agreed, all 3 open questions RESOLVED (2026-09-21)**; remaining work is Phase 6 code (trailer emission in `approveBranch`, DID signing, Keiro storage, verifier CLI)
 - Date: 2026-09-21
 - Upstream substrate: `seihou` v0.8.0.0 (Nadeem Bitar, BSD-3-Clause), ADRs 0001/0002/0003/0007/0011
 - Phase 6 target (CAMPAIGN_GENERALIZATION.md): "Emit signed cryptographic verification receipts to Radicle seed nodes."
@@ -74,8 +74,13 @@ CampaignAttestation {
 
 Phase 6 publishes `CampaignAttestation` to Radicle seed nodes bound to the merge commit that `approveBranch` produced; a Radicle patchset's verification evidence is then the *re-derivation claim + signer*, replayable by any verifier holding the checked-in blueprint + receipt and the oracle.
 
-## 7. Open questions for review
+## 7. Open questions — RESOLVED (2026-09-21, decided at review; Q1 from source inspection)
 
-1. Does Radicle's patchset-attestation surface accept an arbitrary DID-signed JSON payload, or must the attestation ride in a patch annotation (e.g. a `verification: <sha256>` trailer)? This determines whether `attIdentity` is a trailer or a linked note.
-2. Should `journal-origin` attestations embed the Keiro stream name + act range directly, or a hash of that range (smaller, but requires journal access to replay)?
-3. Supersede-by-timestamp within identity (§5) vs. explicit revocation: seihou has no revocation (receipts are additive); the campaign should decide whether a tamper-remedy attestation needs to *void* a prior one for downstream Radicle consumers.
+**Q1 (Radicle surface) — the attestation rides in a commit trailer; the full record is replayed from the journal.**
+Source: heartwood (the seed, `/home/nyc/src/heartwood`, commit `ac607c8c`) normalizes every commit to "object description form" (`radicle-git-metadata`'s `CommitData`), and its `Display` impl re-emits **every** trailer in the message's last paragraph — not only the `Rad-*` ones. Parsing rules (`commit/parse.rs`): the trailer paragraph is the last blank-line-separated block; each line splits on the first `": "`; tokens are restricted to alphanumerics + `-`; values may span folded continuation lines. The canonical push rules do not filter trailers (`git/canonical/rules*` has no trailer handling), so an external trailer survives seed ingestion and round-trips.
+Concretely: `approveBranch`'s merge commit gains a trailer of the form
+`Verification: sha256:<attHash> ref:keiro://<stream>#acts<a>-<b>` (plus the signer DID as a second value-line), where `<attHash>` is the SHA-256 of the canonical `CampaignAttestation` JSON. The full signed record lives in the Keiro journal (journal-origin trust level, §3) and in the checked-in receipt + blueprint (repo-origin); the trailer is the patchset-visible pointer. No arbitrary-payload surface is needed — the trailer carries identity + provenance, and a verifier re-derives (invariant #4) rather than trusting embedded claims.
+
+**Q2 — self-describing journal references** (decided by Nadia). `journalRef` embeds the stream name + act range directly (§6 shape confirmed), so an attestation is replayable by anyone with journal access without a side lookup table.
+
+**Q3 — supersede-by-timestamp within identity; no revocation records** (decided by Nadia). The journal is append-only and receipts are additive (seihou's model, §5): a tamper-remedy attestation re-derived under the corrected oracle simply lands later under the same §2 identity, and consumers pick the latest. If a downstream seed-node consumer caches per-patchset status, it re-resolves by re-reading the trailer paragraph on patchset update — the trailer itself names the journal range, so supersession is visible without extra machinery.
