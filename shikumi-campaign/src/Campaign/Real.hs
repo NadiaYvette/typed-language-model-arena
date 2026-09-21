@@ -42,7 +42,9 @@ module Campaign.Real
     realCellFromWf,
     classifyCellLog,
     classifyCellLogArch,
+    classifyCellLogBaseline,
     verdictFrom,
+    verdictFromBaseline,
     hostVerdictFrom,
     hostVerdictFromProj,
     knownFailuresFor,
@@ -322,15 +324,31 @@ pgclDriverPath = "/home/nyc/src/pgcl/matrix-driver-all.sh"
 -- /replaces/ it (same identity, manifest command + oracle); a manifest unit
 -- with a new key is /added@. Discovery therefore reads the directory at
 -- runtime — authoring a new target requires no recompile of the orchestrator.
+--
+-- Oracle fact kinds (decision #2: added only as declarative facts, never as
+-- executable payloads):
+--   * successMarkers  — every one must appear in the log (AND)
+--   * waiveBaseline   — documented known-fail names a pgcl cell may waive
+--                        (unioned with the arch's built-in baseline)
+--   * logSchema       — optional: a JSON-schema id the log must validate
+--                        against (richer fact kind; awaiting a proof/log
+--                        target that interprets it)
+--   * proofHygiene    — optional: a proof-hygiene fact id (richer fact kind;
+--                        awaiting a tessera Lean target that interprets it)
+--   * exitMustSucceed — the exit-code fact (false = markers decide alone)
+--   * timeoutSeconds  — wall-clock bound (documented; the driver/harness owns
+--                        its own timeouts for now)
 data TargetManifest = TargetManifest
   { project        :: !Text
-  , kind           :: !Text  -- ^ @host-verify@ (the only kind the spike executes)
+  , kind           :: !Text  -- ^ @host-verify@ or @qemu-boot-matrix@
   , arch           :: !Text
   , config         :: !Text
   , workDir        :: !Text
   , command        :: !Text  -- ^ the exact command to run (journaled verbatim)
   , successMarkers :: ![Text] -- ^ every one must appear in the log for @passed@
-  , waiveBaseline  :: ![Text] -- ^ documented known-fail names (pgcl cells; reserved for host)
+  , waiveBaseline  :: ![Text] -- ^ documented known-fail names (pgcl; empty = no extra waivers)
+  , logSchema      :: !(Maybe Text) -- ^ richer fact kind, not yet interpreted
+  , proofHygiene   :: !(Maybe Text) -- ^ richer fact kind, not yet interpreted
   , exitMustSucceed :: !Bool
   , timeoutSeconds :: !Natural
   }
@@ -376,13 +394,13 @@ realUnitCellManifests = do
         Left err -> do
           hPutStrLn stderr $ "[targets] " <> f <> ": " <> T.unpack err <> " — skipped"
           pure Nothing
-        Right t | t.kind == "host-verify" -> pure (Just t)
+        Right t | t.kind `elem` ["host-verify", "qemu-boot-matrix"] -> pure (Just t)
         Right t -> do
           hPutStrLn
             stderr
             $ "[targets] " <> f <> ": unsupported kind \""
               <> T.unpack t.kind
-              <> "\" (spike executes host-verify) — skipped"
+              <> "\" (spike executes host-verify + qemu-boot-matrix) — skipped"
           pure Nothing
 
 -- | Merge manifest units over the built-in discovery: a manifest whose
@@ -439,7 +457,15 @@ manifestFor manifests u =
 -- (see 'knownFailuresFor') — any unnamed or novel failure still fails the
 -- cell. Not arch-scoped for @host-verify@ units, whose logs carry no LTP.
 classifyCellLogArch :: Text -> Text -> Text
-classifyCellLogArch arch logText
+classifyCellLogArch arch logText = classifyCellLogBaseline arch (knownFailuresFor arch) logText
+
+-- | The arch-scoped classifier with an explicit waiver baseline: a cell
+-- with failures passes as @passed-waived@ only when /every/ failure the log
+-- names is on @baseline@. A manifest's @waiveBaseline@ is unioned with the
+-- arch's built-in baseline at the call site — the baseline is a /target
+-- fact/, and the manifest is where target facts live (decision #2).
+classifyCellLogBaseline :: Text -> [Text] -> Text -> Text
+classifyCellLogBaseline arch baseline logText
   | any (\l -> "SKIP: no " `T.isPrefixOf` T.strip l) (T.lines logText) = "skipped"
   | Just fails <- lastSubtotalFails logText =
       if fails == 0 && not (kernelWarned logText) then "passed"
@@ -451,7 +477,7 @@ classifyCellLogArch arch logText
         not (null names)
           && names == List.nub names
           && length names == n
-          && all (`elem` knownFailuresFor arch) names
+          && all (`elem` baseline) names
       Nothing -> False
     -- The failed count of the last "… N passed, M failed[ …]" line.
     lastSubtotalFails t = go Nothing (T.lines t)
@@ -617,7 +643,13 @@ commandText u outDir mfs = case mfs of
 -- when this gate learned about @passed-waived@, its last consumer learned
 -- at the same time.
 verdictFrom :: ExitCode -> Text -> Text -> Text
-verdictFrom ec arch t = case classifyCellLogArch arch t of
+verdictFrom ec arch t = verdictFromBaseline ec arch (knownFailuresFor arch) t
+
+-- | The pgcl verdict gate with an explicit waiver baseline (a manifest's
+-- @waiveBaseline@ unioned with the arch's built-in). Kept exported so the
+-- CLASSIFY probe and the manifest path exercise the same gate.
+verdictFromBaseline :: ExitCode -> Text -> [Text] -> Text -> Text
+verdictFromBaseline ec arch baseline t = case classifyCellLogBaseline arch baseline t of
   "skipped" -> "skipped"
   "passed" | ec == ExitSuccess -> "passed"
   -- A baseline-waived cell is priced and journaled like a pass — but
@@ -644,10 +676,13 @@ runRealUnit u outDir mfs
   | otherwise = do
       let logPath = realLogPath u outDir
           args = T.unpack (realWorkDir u) : map T.unpack (ruArch u : ruArgs u <> [T.pack outDir])
+          -- The waiver baseline is a target fact: the arch's built-in known
+          -- failures unioned with any the manifest declares for this cell.
+          baseline = knownFailuresFor (ruArch u) <> maybe [] waiveBaseline mfs
       (ec, _, _) <- readProcess (proc "bash" (pgclDriverPath : args))
       exists <- doesFileExist (T.unpack logPath)
       body <- if exists then T.pack <$> readFile (T.unpack logPath) else pure ""
-      pure (verdictFrom ec (ruArch u) body, logPath)
+      pure (verdictFromBaseline ec (ruArch u) baseline body, logPath)
 
 -- | A host verification verdict read from the command's exit code and
 -- captured log, per project. Success requires the tool's complete-run

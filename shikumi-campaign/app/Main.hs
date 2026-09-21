@@ -4904,8 +4904,19 @@ classifyProbeMode :: String -> IO ()
 classifyProbeMode spec =
   for_ (T.splitOn "," (T.strip (T.pack spec))) $ \item ->
     if T.null item then pure () else do
-      let (archT, rest) = T.breakOn ":" item
-          (arch, path) = if T.null rest then ("", item) else (T.unpack archT, T.drop 1 rest)
+      let (archPart, path) = case T.breakOn ":" item of
+            (_, rest) | T.null rest -> ("", item)
+            (a, r) -> (a, T.drop 1 r)
+          (arch, baseline) = case T.breakOn "@" archPart of
+            (a, r) | T.null r -> (a, ([] :: [Text]))
+            (a, r) -> (a, T.splitOn ";" (T.drop 1 r))
       body <- T.pack <$> readFile (T.unpack path)
-      putStrLn ("  " <> arch <> ":" <> T.unpack path <> " -> "
-                <> T.unpack (verdictFrom ExitSuccess (T.pack arch) body))
+      -- No `@baseline` in the spec: exercise the arch built-in only (the
+      -- pre-existing behaviour). With it: union the built-in with the named
+      -- baselines, exactly as the manifest path does.
+      let v =
+            if null baseline
+              then verdictFrom ExitSuccess arch body
+              else verdictFromBaseline ExitSuccess arch (knownFailuresFor arch <> baseline) body
+      putStrLn $ "  " <> T.unpack arch <> (if null baseline then "" else "@" <> T.unpack (T.intercalate ";" baseline)) <> ":" <> T.unpack path
+        <> " -> " <> T.unpack v

@@ -11,6 +11,8 @@
 , command = "make -C /home/nyc/src/mowgli film_episode_test film_annotation_fixture_test && /home/nyc/src/mowgli/src/logic/film_episode_test && /home/nyc/src/mowgli/src/logic/film_annotation_fixture_test"
 , successMarkers = [ "all checks passed" ]
 , waiveBaseline = [] : List Text
+, logSchema = None Text
+, proofHygiene = None Text
 , exitMustSucceed = True
 , timeoutSeconds = 600
 }

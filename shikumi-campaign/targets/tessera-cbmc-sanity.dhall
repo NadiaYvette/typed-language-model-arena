@@ -11,6 +11,8 @@
 , command = "bash /home/nyc/src/tessera/property2/cbmc/run.sh /home/nyc/src/tessera /home/nyc/src/tessera/property2/cbmc/cbmc-sanity.log"
 , successMarkers = [ "SUITE OK" ]
 , waiveBaseline = [] : List Text
+, logSchema = None Text
+, proofHygiene = None Text
 , exitMustSucceed = True
 , timeoutSeconds = 1800
 }
