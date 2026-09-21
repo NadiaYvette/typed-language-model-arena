@@ -46,6 +46,7 @@ library
     Campaign.Mercury
     Campaign.Oracle
     Campaign.ReactFixer
+    Campaign.RepairReceipt
     Campaign.Review
     Campaign.Real
     Campaign.Workflow
@@ -88,6 +89,21 @@ library
 executable real-validate
   import: warnings, shared
   main-is: RealValidate.hs
+  hs-source-dirs: app
+  ghc-options:
+    -threaded
+    -rtsopts
+    -with-rtsopts=-N
+  build-depends:
+    base,
+    directory,
+    filepath,
+    shikumi-campaign,
+    text,
+
+executable repair-receipt
+  import: warnings, shared
+  main-is: RepairReceipt.hs
   hs-source-dirs: app
   ghc-options:
     -threaded

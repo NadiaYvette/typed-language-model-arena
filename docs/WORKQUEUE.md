@@ -1,8 +1,8 @@
 # Workqueue & Portfolio Infrastructure — typed-language-model-arena
 
 Living workqueue and architecture reference for the typed language model ecosystem (shikumi decides, keiro journals, kioku remembers).
-Scheduler ground truth: `REAL_LIMIT=0 ACTS=23 cabal run campaign-demo` — currently schedules 99 real units (95 kernel matrix cells across 19 architectures + 4 portfolio host verification units) from memory evidence.
-Last updated: 2026-09-20 (added Tracks 8/9 — `kuroko` & `smirk` — as AWAITING REVIEW open-ended tracks; kuroko policy matcher moved to smirk; kuroko Dhall config fixed + env-var variant added; smirk split into core + effectful + polysemy packages; added Track 10 — `seihou` as candidate campaign substrate for Vectors A/D, Integrations #5/#6, and attestation).
+Scheduler ground truth: `REAL_LIMIT=0 ACTS=23 cabal run campaign-demo` — currently schedules 100 real units (95 kernel matrix cells across 19 architectures + 5 host verification units, the last two of which — `tessera/host@cbmc-sanity` (new) and `mowgli/host@film-fixture` (replacement) — are discovered at runtime from Dhall target manifests in `shikumi-campaign/targets/`; 99 with no manifest directory).
+Last updated: 2026-09-21 (Track 10 milestones 1–3 landed & verified: runtime Dhall target manifests in Campaign.Real; facts-only oracle proven live; pass-to-fail repair modeled as blueprint+receipt with re-derivation admission feeding the review gate).
 
 See also [Campaign Generalization Architecture](CAMPAIGN_GENERALIZATION.md) for the strategic generalization roadmap (declarative target manifests, distributed worker federation via `pgmq`, autonomous bisection, and sovereign forge integration).
 
@@ -295,10 +295,27 @@ Effect tests moved out of the core `smirk-test` into the per-interface suites. D
 - `kind` is restricted to `host-verify` (other kinds reported + skipped); `workDir`/`timeoutSeconds`/`waiveBaseline` are loaded but the executor ignores them for now (host path uses the built-in workDir; pgcl waive flow not manifest-wired).
 - The `dhall` library is now an arena dep (Hackage-resolved; seihou itself is not yet a build dependency — milestone 3's receipts/blueprints are where that lands).
 
+### Milestone 3 results — pass-to-fail repair as blueprint + receipt, feeding the review gate (2026-09-21, verified by execution)
+A seihou `blueprint` is an agent task; a seihou *migration* + per-edge *receipt* is the receipted, replayable record of what changed. Milestone 3 models one pass→fail→pass repair in those shapes and wires it to the campaign's existing review boundary.
+
+**Landed** (`shikumi-campaign/repairs/`, `Campaign.RepairReceipt`, `repair-receipt` exe):
+- Dhall schemas, validated in-process by the `dhall` package before any claim is read (ADR 0003 spirit): `RepairOp` (deletion op: `opLine` + `opText` — the MigrationOp analogue; a plain record today because a single-constructor Dhall union derives to its payload record, graduating to a true union when a second op kind appears), `SourceState` (bytes + rendered diagnostics), `RepairBlueprint` (the task: cell, oracle id, path, rules, failing state, prompt), `RepairReceipt` (the trajectory: before-state, operations, after-state, checker provenance).
+- `Campaign.RepairReceipt`: the schema records (field names mirror the Dhall keys), in-process loaders, `replayOps` (re-derive the after-state from the ops: intercalate, no trailing newline — byte-exact), and `admitReceipt`, which **re-derives every claim under the named `CellOracle`**: replay reproduces the after-state, re-run diagnostics match the recorded ones on both states, before actually fails, after actually passes, and every op is a faithful deletion of a real original line.
+- **The seam to `Campaign.Review` is the facts-only decision in action:** `admitReceipt` returns re-derivation results, not a verdict. An admissible receipt is evidence that feeds `approveBranch` — which still owns the final oracle re-verification of the branch's actual files (invariant #4: the receipt is content, the merge is not).
+- Worked example grounded in the real toy corpus: `alpha.py`'s two `W-todo` lines; the recorded diagnostics are the checker's actual `showDiagnostic` output; the receipt's ops delete original lines 3 then 2.
+
+**Verified by execution** (`repair-receipt`):
+- Real receipt **ADMISSIBLE**: replay reproduces the after-state byte-for-byte, oracle re-derivation matches both states' diagnostics, pass→fail→pass holds; the built-in negative control (tampered after-diagnostics) is rejected.
+- Three tampered fixtures, each rejected for the *correct distinct* reason: fake before-diagnostics → "recorded before-diagnostics do not match the oracle"; forged after-state → "replayed operations do not reproduce the recorded after-state"; invalid op (nonexistent line) → replay mismatch + after-diagnostics mismatch + "operation 1 is not a faithful deletion of an original line".
+
+**Known limitations (feed milestones 4–5):**
+- `RepairOp` is deletions-only (the corpus contract); `rrMaxOperations`/`rrSubsetOnly` are recorded but admission enforces the replay/faithfulness facts, not the numeric bound.
+- The receipt is validated against the *in-process* `markerOracle`; wiring admitted receipts into `approveBranch` as an input (e.g. a `--receipt` flag) and the signed-attestation mapping (milestone 5) are the remaining integration work.
+
 ### Next Milestones (open-ended, pick as reviewed)
 1. ~~**Spike**: author one real campaign target as a seihou module/recipe and discover it from `Campaign.Real` without recompiling the orchestrator (Vector A feasibility).~~ **DONE (2026-09-20)** — see Spike results above (as a dedicated Dhall `TargetManifest` schema, seihou pattern).
 2. ~~Carry oracle metadata + known-fails baselines in the target artifact (Vector B bridge, non-opinionated).~~ **DONE (2026-09-20)** — facts-only oracle in the manifest; positive+negative live proof. Remainder: wire `waiveBaseline` into the pgcl path and add the richer oracle fact kinds (JSON-schema, proof-hygiene) as new schema fields.
-3. Model one pass-to-fail repair as blueprint + migration receipts feeding `Campaign.Review` (Vector D).
+3. **DONE (2026-09-21)** — Model one pass-to-fail repair as blueprint + migration receipts feeding `Campaign.Review` (Vector D). See "Milestone 3 results" below.
 4. Re-express the `/campaign` skill prompts as seihou `prompt` artifacts (Integration #6).
 5. Draft the seihou-receipt → signed-attestation mapping for Phase 6 (Attestation/Provenance, Radicle).
 6. Ecosystem watch: record baikai/seihou/mori-OKF releases and new dovetailing surfaces in the ledger.
@@ -322,6 +339,8 @@ These tracks are marked **AWAITING REVIEW** deliberately: each is seeded with co
   - `mowgli`: `rad:z2jiunVzMrWnfcefCFN52VRo5mudp`
 
 ### Recent Ledger
+- **arena `c126286`** — Track 10 milestones 1–2: runtime Dhall `TargetManifest` discovery in `Campaign.Real` (built-ins ∪ `shikumi-campaign/targets/`, `CAMPAIGN_TARGETS_DIR` override; replace-or-add merge; facts-only oracle threaded through command/execution/verdict, journaled verbatim). Verified live, same binary: 99→100 discovery flip, manifest-authority marker in the journal, positive+negative facts-only verdict, ground-truth run includes both manifest cells.
+- **arena** — Track 10 milestone 3: pass→fail→pass repair modeled as `RepairBlueprint` + `RepairReceipt` (seihou blueprint/migration-receipt analogues) with `admitReceipt` re-deriving every claim under the named `CellOracle` (replay byte-exactness, diagnostics re-run on both states, faithful-deletion checks); `repair-receipt` validator exe. Verified: real `alpha.py` receipt ADMISSIBLE; three tampered fixtures rejected, each for the correct distinct reason. The receipt is evidence feeding `approveBranch`, never a verdict (invariant #4).
 - **arena** — Added Track 10 (`seihou`, Nadeem Bitar upstream, BSD-3-Clause) as an AWAITING REVIEW open-ended track: candidate substrate for campaign Vector A (declarative target manifests), Vector D (bisection/repair with receipts), Integration #5 (agent-eval anti-brittleness), Integration #6 (prompt authoring), and attestation/provenance (Phase 6 design template). Verified in the wild: seihou 0.8.0.0, baikai-family dependency at the same 0.7.0.0 the arena pins, no other coupling to portfolio repos. **All three design questions DECIDED:** Dhall manifests (upgrade over the YAML sketch), facts-only oracle metadata (no executable verdict payloads; invariant #4 preserved), exact-revision upstream pins with BSD-vendoring fallback.
 - **arena** — Added Tracks 8 (`kuroko`) & 9 (`smirk`) to the workqueue as **AWAITING REVIEW** open-ended tracks (seeded with landed work, goals to be picked at review), plus a review-status convention and a verified Dhall config-grammar reference.
 - **kuroko** — Tool policy pattern matching now uses **smirk** (pure glob + ReDoS-safe fuel-bounded PCRE); dropped `Glob` + `regex-with-pcre` deps. Fixed `config/agent.dhall` (was missing required `policy` block → typecheck failure); added `config/agent-env.dhall` demonstrating `env:VAR as Text` Dhall env imports.
