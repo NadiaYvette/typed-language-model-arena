@@ -37,6 +37,7 @@ library
     Campaign.Aggregate
     Campaign.Bootstrap
     Campaign.Cell
+    Campaign.Attestation
     Campaign.Dispatch
     Campaign.Fanout
     Campaign.Hands
@@ -55,8 +56,10 @@ library
     aeson >=2.2,
     base >=4.21 && <5,
     baikai,
+    base16-bytestring,
     bytestring,
     containers,
+    cryptohash-sha256,
     directory,
     dhall,
     effectful >=2.6,

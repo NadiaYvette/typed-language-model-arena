@@ -35,10 +35,12 @@ module Campaign.Review
     approveBranch,
     rejectBranch,
     ApprovalOutcome (..),
+    journalRefFor,
   )
 where
 
 import Control.Exception (try)
+import Data.List (sort)
 import Data.Text (Text)
 import Data.Text qualified as T
 import System.Directory (doesDirectoryExist, doesFileExist)
@@ -51,6 +53,15 @@ import GHC.Generics (Generic)
 
 import Campaign.Hands (campaignWorktreePath, gitCapture, parentRepoPath)
 import Campaign.Oracle (CellOracle (..))
+import Campaign.RepairReceipt (RepairReceipt, admitReceiptsForFiles)
+import Campaign.Attestation
+  ( Attestation (..),
+    JournalRef (..),
+    VerificationTrailer (..),
+    appendVerificationTrailer,
+    attestationHash,
+    journalRefText,
+  )
 import Toy.Fixer.Domain (Source (..), showDiagnostic)
 
 -- | One reviewable branch of one project, as 'listReviewBranches' reports it.
@@ -110,38 +121,70 @@ listReviewBranches proj = do
       pure (ReviewBranch proj b ahead merged)
 
 -- | The result of an approval: the merge commit (short hash; empty when the
--- gate refused), the files the branch touched, and the pre-merge
--- verification's diagnostics (empty = clean).
+-- gate refused), the files the branch touched, the pre-merge
+-- verification's diagnostics (empty = clean), and the attestation hash
+-- written into the merge commit's message trailer (Nothing when no new
+-- merge commit was made — already-merged and content-idempotent outcomes
+-- carry the original attestation, if any).
 data ApprovalOutcome = ApprovalOutcome
   { aoMergeCommit :: !Text,
     aoFiles :: ![Text],
-    aoDiagnostics :: ![Text]
+    aoDiagnostics :: ![Text],
+    aoAttestation :: !(Maybe Text)
   }
   deriving stock (Eq, Show, Generic)
   deriving anyclass (Aeson.ToJSON, Aeson.FromJSON)
 
--- | Approve one review branch: re-verify every touched file with the real
--- oracle against the /branch's own bytes/ (read from its worktree — the
--- parent checkout may carry the very defects this branch fixes), then merge
--- @--no-ff@ into the project's default branch in the parent checkout, then
--- delete the review branch and its worktree. Diagnostics at the gate mean
--- /no merge/ — the outcome reports them instead.
-approveBranch :: CellOracle -> Text -> Text -> IO ApprovalOutcome
-approveBranch oracle proj branch = do
+-- | The attestation's journal reference, self-describing (Q2): the verdict
+-- session 'journalVerdict' creates for this verdict is deterministic —
+-- memory space "shikumi-campaign", the project's review namespace (the
+-- slash/%/: sanitization 'reviewNamespace' applies in the driver), and the
+-- session name "review <branch>". Naming it here means the trailer is
+-- correct /before/ the verdict is journaled: the journal write that
+-- follows reproduces exactly the session the ref points at.
+journalRefFor :: Text -> Text -> JournalRef
+journalRefFor proj branch =
+  JournalRef
+    { jrMemorySpace = "shikumi-campaign",
+      jrNamespace = T.replace "/" "." (T.replace "%" "" (T.replace ":" "" proj)),
+      jrSession = "review " <> branch,
+      jrFromAct = 1,
+      jrToAct = 2
+    }
+
+-- | Approve one review branch. Two evidentiary layers, both oracle-derived:
+--
+--   * the /receipts/ (an input; 'Nothing' or '[]' for a plain operator
+--     approval with no repair evidence to present) must be admitted for the
+--     branch's changed files — every receipt re-derives under the oracle AND
+--     together they cover exactly the files the branch touched
+--     ('admitReceiptsForFiles');
+--   * the /re-verification/ — every touched file is checked with the oracle
+--     against the /branch's own bytes/ (read from its worktree — the parent
+--     checkout may carry the very defects this branch fixes).
+--
+-- Either layer failing means /no merge/ — the outcome reports the reasons.
+-- On a clean gate the merge is @--no-ff@ into the project's default branch
+-- in the parent checkout, the merge commit carries the attestation trailer
+-- (Phase 6, 'Campaign.Attestation'), and the review branch + worktree are
+-- retired. Diagnostics at the gate mean /no merge/ — the outcome reports
+-- them instead.
+approveBranch :: CellOracle -> Maybe [RepairReceipt] -> Text -> Text -> IO ApprovalOutcome
+approveBranch oracle receipts proj branch = do
   def <- defaultBranchOf proj
   let parent = parentRepoPath proj
   -- The branch's worktree must exist (it is where the branch's bytes live).
   gitIn parent ["worktree", "prune"]
   hasWt <- doesDirectoryExist (campaignWorktreePath proj branch)
   if not hasWt
-    then pure (ApprovalOutcome "" [] ["branch worktree missing: " <> T.pack wt <> " — nothing to verify, nothing merged"])
+    then pure (ApprovalOutcome "" [] ["branch worktree missing: " <> T.pack wt <> " — nothing to verify, nothing merged"] Nothing)
     else do
       -- The parent must be on the default branch with a clean tree: the
       -- merge is a ref transaction on top of it, and the dirty-count
       -- invariant must hold before and after.
       dirty <- gitIn parent ["status", "--porcelain"]
       if not (T.null (T.strip dirty))
-        then pure (ApprovalOutcome "" [] ["parent checkout dirty — refusing to merge; clean it first"])
+        then pure (ApprovalOutcome "" [] ["parent checkout dirty — refusing to merge; clean it first"] Nothing)
         else do
           -- A detached parent (a vendored repo pinned to a release tag, say)
           -- has no branch to merge into; merging there would strand commits
@@ -156,16 +199,51 @@ approveBranch oracle proj branch = do
                     aoDiagnostics =
                       [ "parent checkout is detached (no branch checked out) — "
                           <> "nothing to merge into; check out the default branch first"
-                      ]
+                      ],
+                    aoAttestation = Nothing
                   }
             else do
               files <-
                 filter (not . T.null) . map T.strip . T.lines
                   <$> gitIn parent ["diff", "--name-only", T.unpack def <> "..." <> T.unpack branch]
+              -- The receipts gate (an input to the approval): the evidence
+              -- the operator presents must be admissible AND cover exactly
+              -- this change. No receipts (Nothing/[]) = a plain approval:
+              -- the re-verification below is the whole gate.
+              receiptDiags <- case receipts of
+                Nothing -> pure []
+                Just rcs ->
+                  case admitReceiptsForFiles oracle rcs files of
+                    Left fails -> pure fails
+                    Right _ -> pure []
               diags <- fmap concat . mapM (verifyOne wt) $ files
-              if not (null diags)
-                then pure (ApprovalOutcome "" files diags)
+              let allDiags = receiptDiags <> diags
+              if not (null allDiags)
+                then pure (ApprovalOutcome "" files allDiags Nothing)
                 else do
+                  -- The attestation is computed BEFORE the merge: every
+                  -- input (project, branch, the oracle the gate used, the
+                  -- sorted touched-file set, the deterministic journal ref)
+                  -- is public now, and the merge commit's hash + exact
+                  -- committer timestamp only exist afterwards — they cannot
+                  -- be in what is signed (invariant #4: the hash is a
+                  -- pointer to re-derivable facts, not a claim about
+                  -- itself).
+                  let att =
+                        Attestation
+                          { attProject = proj,
+                            attBranch = branch,
+                            attOracleId = oracleId oracle,
+                            attFiles = sort files,
+                            attJournal = journalRefFor proj branch
+                          }
+                      attHash = attestationHash att
+                      attTrailer =
+                        VerificationTrailer
+                          { vtHash = attHash,
+                            vtJournal = journalRefFor proj branch,
+                            vtSigner = Nothing -- step 3: DID-key signer
+                          }
                   -- HEAD is the merge target (the parent is on a branch and
                   -- clean — checked above). origin/<def> is a remote-tracking
                   -- ref and does NOT move on merge, so the advance check
@@ -179,8 +257,16 @@ approveBranch oracle proj branch = do
                     then do
                       gitIn parent ["worktree", "remove", "--force", wt]
                       gitIn parent ["branch", "-d", T.unpack branch]
-                      pure (ApprovalOutcome before files [])
+                      pure (ApprovalOutcome before files [] Nothing)
                     else do
+                      -- The merge commit carries the attestation trailer
+                      -- (Q1): the message is the human-approval text plus
+                      -- the Verification: block. The trailer paragraph is
+                      -- the last paragraph of the commit message, so
+                      -- heartwood's parse_body + Display round-trip it
+                      -- verbatim.
+                      let mergeMessage =
+                            appendVerificationTrailer (mergeMsg branch) attTrailer
                       mergedOr <-
                         try
                           ( gitIn
@@ -189,7 +275,7 @@ approveBranch oracle proj branch = do
                                 "--no-ff",
                                 "--no-edit",
                                 "-m",
-                                T.unpack (mergeMsg branch),
+                                T.unpack mergeMessage,
                                 T.unpack branch
                               ]
                           ) :: IO (Either IOError Text)
@@ -209,7 +295,8 @@ approveBranch oracle proj branch = do
                                       <> " and "
                                       <> def
                                       <> "; the parent checkout is restored, the branch stays reviewable"
-                                  ]
+                                  ],
+                                aoAttestation = Nothing
                               }
                         Right out -> do
                           mc <- gitIn parent ["rev-parse", "--short", "HEAD"]
@@ -223,14 +310,14 @@ approveBranch oracle proj branch = do
                                 then do
                                   gitIn parent ["worktree", "remove", "--force", wt]
                                   gitIn parent ["branch", "-d", T.unpack branch]
-                                  pure (ApprovalOutcome before files [])
-                                else pure (ApprovalOutcome "" files ["merge produced no new commit on the checked-out branch — unexpected; investigate"])
+                                  pure (ApprovalOutcome before files [] Nothing)
+                                else pure (ApprovalOutcome "" files ["merge produced no new commit on the checked-out branch — unexpected; investigate"] Nothing)
                             else do
                               -- Merged: retire the branch and its worktree. -d
                               -- (not -D) refuses if git disagrees that it merged.
                               gitIn parent ["worktree", "remove", "--force", wt]
                               gitIn parent ["branch", "-d", T.unpack branch]
-                              pure (ApprovalOutcome mc files [])
+                              pure (ApprovalOutcome mc files [] (Just attHash))
   where
     wt = campaignWorktreePath proj branch
     verifyOne wtPath f = do

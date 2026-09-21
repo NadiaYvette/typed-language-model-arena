@@ -34,6 +34,7 @@ module Campaign.RepairReceipt
     -- * Admission (re-derivation under the oracle)
     admitReceipt,
     replayOps,
+    admitReceiptsForFiles,
   )
 where
 
@@ -144,6 +145,46 @@ loadRepairReceipt path = do
   pure $ case m of
     Left e -> Left (T.pack (show e))
     Right t -> Right t
+
+-- ---------------------------------------------------------------------------
+-- Gate input: a set of receipts as evidence FOR A BRANCH'S CHANGED FILES
+-- ---------------------------------------------------------------------------
+
+-- | Admit a set of receipts against the /file set a branch actually changed/.
+-- This is the 'approveBranch' input (Phase 6 wiring): the receipts are the
+-- evidence the operator presents, and the question is whether that evidence
+-- is (a) admissible — every receipt re-derives under the oracle, and (b)
+-- /complete for this change/ — it covers exactly the files the branch
+-- touched, no more (orphan receipts describe a different change) and no
+-- less (an uncovered changed file has no evidence).
+--
+-- Returns 'Right' with the admitted per-file evidence when both hold, or
+-- 'Left' with the reasons the gate should refuse to merge.
+admitReceiptsForFiles
+  :: CellOracle -> [RepairReceipt] -> [Text] -> Either [Text] [(Text, RepairReceipt)]
+admitReceiptsForFiles oracle rcs files =
+  let receiptFiles = [rcPath rc | rc <- rcs]
+      admissionFailures =
+        [ "receipt for " <> rcPath rc <> " not admissible: "
+          <> T.intercalate "; " fails
+        | rc <- rcs,
+          Left fails <- [admitReceipt oracle rc]
+        ]
+      -- every changed file has at least one receipt (evidence is complete)
+      uncovered = [f | f <- files, not (any (== f) receiptFiles)]
+      coverageFailures =
+        [ "changed file " <> f <> " has no repair receipt — evidence is incomplete"
+        | f <- uncovered
+        ]
+          -- every receipt names a file the branch changed (no orphans)
+          <> [ "receipt for " <> f <> " does not name a file this branch changed — orphan evidence"
+              | f <- receiptFiles,
+                not (any (== f) files)
+              ]
+      failures = admissionFailures <> coverageFailures
+   in if null failures
+        then Right [(rcPath rc, rc) | rc <- rcs]
+        else Left failures
 
 -- ---------------------------------------------------------------------------
 -- Admission: re-derive every claim under the named oracle

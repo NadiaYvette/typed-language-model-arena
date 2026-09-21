@@ -292,9 +292,12 @@ import Campaign.Review
   ( ApprovalOutcome (..),
     ReviewBranch (..),
     approveBranch,
+    journalRefFor,
     listReviewBranches,
     rejectBranch,
   )
+import Campaign.RepairReceipt (RepairReceipt, loadRepairReceipt)
+import Campaign.Attestation (journalRefText)
 import Campaign.Real
 import Campaign.ReactFixer (renderSteps, reactEngineFor, scriptedReactEngine)
 import Campaign.Workflow
@@ -535,12 +538,29 @@ reviewOperatorMode mode = do
         "answer" -> reviewAnswer proj branch
         other -> fail ("REVIEW=" <> other <> " — supported: list, approve, reject, answer")
 
--- | Approve: oracle re-verification of the branch's bytes, then the
--- --no-ff merge in the parent checkout (the human sanction lifts the
--- landing phase's never-touch-the-parent rule), then the verdict journaled.
+-- | Approve: the receipts the operator presents (CAMPAIGN_REVIEW_RECEIPTS,
+-- comma-separated paths — the repair evidence, admitted against the branch's
+-- changed files before anything else), oracle re-verification of the
+-- branch's bytes, then the --no-ff merge in the parent checkout (the human
+-- sanction lifts the landing phase's never-touch-the-parent rule), the merge
+-- commit attested with a Verification: trailer, and the verdict journaled.
 reviewApprove :: T.Text -> T.Text -> IO ()
 reviewApprove proj branch = do
-  outcome <- approveBranch unusedImportOracle proj branch
+  mrcpts <- lookupEnv "CAMPAIGN_REVIEW_RECEIPTS"
+  rcs <- case mrcpts of
+    Nothing -> pure Nothing
+    Just spec -> do
+      let paths = filter (not . null) . map T.unpack . map T.strip . T.splitOn "," $ T.pack spec
+      loaded <- forM paths $ \p -> do
+        e <- loadRepairReceipt p
+        case e of
+          Left err -> pure (Left (p <> ": " <> T.unpack err))
+          Right rc -> pure (Right rc)
+      let errs = [e | Left e <- loaded]
+      case errs of
+        [] -> pure (Just [rc | Right rc <- loaded])
+        es -> fail $ "[review] receipt(s) failed to load:\n  " <> unlines es
+  outcome <- approveBranch unusedImportOracle rcs proj branch
   mapM_
     ( \d -> TIO.putStrLn ("  [gate] " <> d) )
     (aoDiagnostics outcome)
@@ -555,10 +575,18 @@ reviewApprove proj branch = do
             <> " (" <> show (length (aoFiles outcome)) <> " file(s), re-verified clean before merge)"
         )
       mapM_ (TIO.putStrLn . ("    " <>)) (aoFiles outcome)
+      let attLine =
+            case aoAttestation outcome of
+              Just h ->
+                [ "attested " <> h <> " (Verification: trailer on the merge commit; journal " <> journalRefText (journalRefFor proj branch) <> ")"
+                ]
+              Nothing -> []
       journalVerdict proj branch "approve" . T.unlines $
         [ "merged as " <> aoMergeCommit outcome,
           T.intercalate ", " (aoFiles outcome)
         ]
+          <> attLine
+      mapM_ (TIO.putStrLn . ("    " <>)) attLine
 
 -- | Answer: respond to a parked workflow's human-query awakeable — the
 -- answering half of the escalation seam (act 2 proved the asking half).
