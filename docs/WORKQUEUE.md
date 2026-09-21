@@ -275,9 +275,29 @@ Effect tests moved out of the core `smirk-test` into the per-interface suites. D
 2. **Where "how to judge success" lives — DECIDED: facts-only manifest.** The target artifact carries declarative judgment data — "command must exit 0", "log must contain marker `Build completed successfully.`", "expected known failures for this arch: [fork07, …]" — and the orchestrator keeps owning the code that *interprets* those facts. The manifest can describe what a pass looks like; it cannot embed executable verdict steps (scripts / Dhall programs), because then the verdict becomes *content* a malformed or malicious manifest could forge — the exact thing invariant #4 exists to prevent. Richer oracle types (JSON-schema, proof-hygiene) are added later only as *new declarative fact kinds* in the schema, never as executable payloads.
 3. **How hard to pin the upstream — DECIDED: exact-revision pins.** Adopting seihou means the campaign manifest layer transitively depends on Nadeem's baikai/seihou family — software we do not maintain — so we lock what we adopt, not floating versions. Precedent already exists: `scripts/reconstitute.sh` pins baikai to an exact git hash (`4a9547b` = release 0.7.0.0). seihou (and the baikai family it needs) get the same treatment; no skew today (both on baikai 0.7.0.0). BSD-3-Clause permits vendoring a local copy as a fallback if the upstream ever moves, breaks, or disappears — a survivable contingency for a small manifest layer, not the first choice.
 
+### Spike results — Milestones 1 & 2 LANDED (2026-09-20, verified with live journal evidence)
+**Design call made during the spike:** the milestone's "seihou module/recipe" wording was not taken literally. A seihou `module`/`recipe` is a *file-generation* artifact (template steps, vars) — a verification target is the opposite shape (a command to run + a facts-only oracle), and forcing it into the module DSL would distort both. Instead the spike adopts seihou's *pattern*: a dedicated Dhall `TargetManifest` schema, validated in-process by the `dhall` package (typecheck before execution, ADR 0003 spirit), loaded at runtime from a directory. Seihou's own artifact kinds remain the model for milestones 3–5.
+
+**Landed** (`shikumi-campaign/targets/`, `Campaign.Real`):
+- `TargetManifest` Dhall record — identity (`project/kind/arch/config`), `command`, facts-only oracle (`successMarkers`, `waiveBaseline`, `exitMustSucceed`, `timeoutSeconds`), `workDir`. No executable payloads (decision #2).
+- `realUnitCells` is now the single discovery point: built-ins ∪ manifests. A manifest key matching a built-in **replaces** it (manifest command + oracle govern); a new key is **added**. Directory `shikumi-campaign/targets/`, override `CAMPAIGN_TARGETS_DIR`.
+- A malformed/mistyped manifest fails its own typecheck, is reported on stderr, and skipped — one bad target cannot blind the campaign.
+- Manifest facts are threaded lazily into `commandText` / `runRealUnit` / `hostVerdictFromProj`, so fresh dispatch *and* journal resume read the same facts; the journaled `verify-plan`/`run-cell` records carry the manifest command verbatim.
+- Two real manifests: `mowgli-film-fixture.dhall` (replacement) and `tessera-cbmc-sanity.dhall` (new target, CBMC sanity suite).
+
+**Proven with the same binary, no orchestrator recompile:**
+- Discovery count flips with filesystem state only: 99 (no dir) → 100 (both manifests); `tessera/host@cbmc-sanity` appears; the mowgli replacement keeps count stable but is manifest-governed.
+- **Manifest authority (live):** journaled `verify-plan` for `mowgli/host@film-fixture` carried a marker only the manifest contained (`echo "[manifest-authority:2381]" && …`) — the built-in command was not what ran.
+- **Facts-only oracle (live, positive + negative):** the manifest's `successMarkers` passed a real mowgli run (`"passed"`, 0.3s), and a changed marker failed the same run (`"failed"`) — the manifest's facts, not code, decide; the interpreting code stayed in `Campaign.Real` (invariant #4).
+- Ground-truth `REAL_LIMIT=0 ACTS=23` run includes both manifest cells in the schedule; resume pass unaffected.
+
+**Known spike limitations (feed milestones 3+):**
+- `kind` is restricted to `host-verify` (other kinds reported + skipped); `workDir`/`timeoutSeconds`/`waiveBaseline` are loaded but the executor ignores them for now (host path uses the built-in workDir; pgcl waive flow not manifest-wired).
+- The `dhall` library is now an arena dep (Hackage-resolved; seihou itself is not yet a build dependency — milestone 3's receipts/blueprints are where that lands).
+
 ### Next Milestones (open-ended, pick as reviewed)
-1. **Spike**: author one real campaign target (e.g. `tessera/host@proof`) as a seihou module/recipe and discover it from `Campaign.Real` without recompiling the orchestrator (Vector A feasibility).
-2. Carry oracle metadata + known-fails baselines in the target artifact (Vector B bridge, non-opinionated).
+1. ~~**Spike**: author one real campaign target as a seihou module/recipe and discover it from `Campaign.Real` without recompiling the orchestrator (Vector A feasibility).~~ **DONE (2026-09-20)** — see Spike results above (as a dedicated Dhall `TargetManifest` schema, seihou pattern).
+2. ~~Carry oracle metadata + known-fails baselines in the target artifact (Vector B bridge, non-opinionated).~~ **DONE (2026-09-20)** — facts-only oracle in the manifest; positive+negative live proof. Remainder: wire `waiveBaseline` into the pgcl path and add the richer oracle fact kinds (JSON-schema, proof-hygiene) as new schema fields.
 3. Model one pass-to-fail repair as blueprint + migration receipts feeding `Campaign.Review` (Vector D).
 4. Re-express the `/campaign` skill prompts as seihou `prompt` artifacts (Integration #6).
 5. Draft the seihou-receipt → signed-attestation mapping for Phase 6 (Attestation/Provenance, Radicle).

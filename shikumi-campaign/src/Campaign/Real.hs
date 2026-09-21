@@ -62,6 +62,15 @@ module Campaign.Real
     realLogPath,
     realAttemptRecord,
     runRealUnit,
+    -- * Target manifests (Vector A, Track 10)
+    TargetManifest (..),
+    targetManifestsDir,
+    loadTargetManifest,
+    realUnitCellManifests,
+    realUnitsWithManifests,
+    targetUnitOfManifest,
+    manifestFor,
+    governingManifest,
     -- * Workflow
     realCellWorkflow,
     realWorkflowName,
@@ -72,16 +81,22 @@ module Campaign.Real
 where
 
 import Data.Aeson qualified as Aeson
+import Data.Function (on)
+import Data.List (find, sort, sortOn)
 import Data.List qualified as List
-import Data.Maybe (mapMaybe)
 import Data.Map.Strict qualified as Map
+import Data.Maybe (catMaybes, mapMaybe)
+import GHC.Natural (Natural)
+import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
 import Data.Text.Lazy qualified as TL
 import Data.Text.Lazy.Encoding qualified as TLE
 import Control.Exception qualified as E
+import Control.Exception (SomeException)
 import Data.Time (NominalDiffTime, diffUTCTime, getCurrentTime)
+import Dhall qualified as Dhall
 import Effectful (Eff, IOE, liftIO, (:>))
 import GHC.Generics (Generic)
 import Keiro.Workflow (StepName (..), WorkflowId (..), step)
@@ -90,9 +105,11 @@ import Keiro.Workflow.Resume (WorkflowDef (..), WorkflowRegistry)
 import Keiro.Workflow.Types (WorkflowJournalEvent (..), WorkflowName (..))
 import Kiroku.Store.Effect (Store)
 import Kiroku.Store.Effect.Resource (KirokuStoreResource)
-import System.Directory (doesDirectoryExist, doesFileExist)
+import System.Directory (doesDirectoryExist, doesFileExist, getCurrentDirectory, listDirectory)
 import System.Environment (lookupEnv)
 import System.Exit (ExitCode (..))
+import System.FilePath ((</>), takeExtension)
+import System.IO (hPutStrLn, stderr)
 import System.Process.Typed (proc, readProcess)
 import Text.Read (readMaybe)
 
@@ -273,13 +290,137 @@ realUnitCells = do
         [ RealUnit "mowgli" "host-verify" "host" "film-fixture" []
         | hasMowgli
         ]
-  pure (pgclUnits <> telixUnits <> tesseraUnits <> organBankUnits <> mowgliUnits)
+      builtIns = pgclUnits <> telixUnits <> tesseraUnits <> organBankUnits <> mowgliUnits
+  -- Vector A / Track 10 spike: merge discovered target manifests over the
+  -- built-ins. A manifest with a new key adds a unit; one with a built-in
+  -- key replaces it (the manifest's command + oracle facts then govern).
+  -- This is what makes authoring a new target a filesystem write, not a
+  -- rebuild of the orchestrator.
+  manifests <- realUnitCellManifests
+  pure (realUnitsWithManifests builtIns manifests)
 
 -- Ground-truth path the discovery reads: the full-catalog driver. The
 -- reduced matrix-driver.sh speaks only 10 of the 20 arches the historical
 -- matrix ran; -all is the driver the 80-cell campaigns actually used.
 pgclDriverPath :: FilePath
 pgclDriverPath = "/home/nyc/src/pgcl/matrix-driver-all.sh"
+
+-- ---------------------------------------------------------------------------
+-- Target manifests (Vector A, seihou Track 10 spike)
+-- ---------------------------------------------------------------------------
+--
+-- A target manifest is a Dhall value in @shikumi-campaign/targets/*.dhall@
+-- (override the directory with @CAMPAIGN_TARGETS_DIR@). Following the Track
+-- 10 design decisions: Dhall as the manifest language, and a /facts-only/
+-- oracle — the manifest declares identity, the command to run, and declarative
+-- success facts (exit-code requirement + required log markers + waive
+-- baseline). It cannot embed executable verdict logic: interpreting the facts
+-- is always the orchestrator's job (invariant #4: a manifest is content, a
+-- verdict is not).
+--
+-- A manifest unit with the key @project/arch@config@ of a built-in unit
+-- /replaces/ it (same identity, manifest command + oracle); a manifest unit
+-- with a new key is /added@. Discovery therefore reads the directory at
+-- runtime — authoring a new target requires no recompile of the orchestrator.
+data TargetManifest = TargetManifest
+  { project        :: !Text
+  , kind           :: !Text  -- ^ @host-verify@ (the only kind the spike executes)
+  , arch           :: !Text
+  , config         :: !Text
+  , workDir        :: !Text
+  , command        :: !Text  -- ^ the exact command to run (journaled verbatim)
+  , successMarkers :: ![Text] -- ^ every one must appear in the log for @passed@
+  , waiveBaseline  :: ![Text] -- ^ documented known-fail names (pgcl cells; reserved for host)
+  , exitMustSucceed :: !Bool
+  , timeoutSeconds :: !Natural
+  }
+  deriving stock (Eq, Show, Generic)
+  deriving anyclass (Aeson.ToJSON, Aeson.FromJSON, Dhall.FromDhall, Dhall.ToDhall)
+
+targetManifestsDir :: IO FilePath
+targetManifestsDir = do
+  cwd <- getCurrentDirectory
+  mOverride <- lookupEnv "CAMPAIGN_TARGETS_DIR"
+  pure $ case mOverride of
+    Just d -> d
+    Nothing -> cwd </> "shikumi-campaign" </> "targets"
+
+-- | Load one manifest, typechecking it as Dhall first: a malformed or
+-- mistyped target is an operator error, not a silent no-op.
+loadTargetManifest :: FilePath -> IO (Either Text TargetManifest)
+loadTargetManifest path = do
+  m <- E.try (Dhall.inputFileWithSettings Dhall.defaultEvaluateSettings Dhall.auto path)
+    :: IO (Either SomeException TargetManifest)
+  pure $ case m of
+    Left  e -> Left (T.pack (show e))
+    Right t -> Right t
+
+-- | Discover all manifests in the target directory. Bad files are reported on
+-- stderr and skipped (one broken target must not blind the whole campaign);
+-- kinds the spike cannot execute are reported and skipped too.
+realUnitCellManifests :: IO [TargetManifest]
+realUnitCellManifests = do
+  dir <- targetManifestsDir
+  exists <- doesDirectoryExist dir
+  if not exists
+    then pure []
+    else do
+      fs <- sort <$> listDirectory dir
+      ms <- mapM (loadOne (dir </>)) [f | f <- fs, takeExtension f == ".dhall"]
+      pure (catMaybes ms)
+  where
+    loadOne :: (FilePath -> FilePath) -> FilePath -> IO (Maybe TargetManifest)
+    loadOne joinFile f = do
+      m <- loadTargetManifest (joinFile f)
+      case m of
+        Left err -> do
+          hPutStrLn stderr $ "[targets] " <> f <> ": " <> T.unpack err <> " — skipped"
+          pure Nothing
+        Right t | t.kind == "host-verify" -> pure (Just t)
+        Right t -> do
+          hPutStrLn
+            stderr
+            $ "[targets] " <> f <> ": unsupported kind \""
+              <> T.unpack t.kind
+              <> "\" (spike executes host-verify) — skipped"
+          pure Nothing
+
+-- | Merge manifest units over the built-in discovery: a manifest whose
+-- @project/arch@config@ key matches a built-in unit replaces that unit; a
+-- manifest with a new key is appended. Ordering is stable (built-ins first,
+-- in their original order; new manifest keys appended in directory order).
+realUnitsWithManifests :: [RealUnit] -> [TargetManifest] -> [RealUnit]
+realUnitsWithManifests builtIns manifests =
+  let manifestUnits = map targetUnitOfManifest manifests
+      manifestKeys = Set.fromList (map realCellKey manifestUnits)
+      -- Drop built-ins whose key a manifest governs (that manifest unit
+      -- replaces them); keep every other built-in.
+      kept = [u | u <- builtIns, realCellKey u `Set.notMember` manifestKeys]
+      -- Append every manifest unit: a replacement for a dropped built-in,
+      -- or a genuinely new target. Manifests never duplicate — discovery
+      -- loads each file once, and two files claiming one key is a manifest
+      -- authoring error the operator should see, not silently merge away.
+   in kept <> manifestUnits
+
+-- | The @RealUnit@ a manifest declares. @ruArgs@ stays empty: host-verify
+-- execution (and resume reconstruction) is fully determined by the key.
+targetUnitOfManifest :: TargetManifest -> RealUnit
+targetUnitOfManifest m =
+  RealUnit
+    { ruProject = m.project
+    , ruKind = m.kind
+    , ruArch = m.arch
+    , ruConfig = m.config
+    , ruArgs = []
+    }
+
+-- | The manifest (if any) that governs a unit: looked up by key.
+manifestFor :: [TargetManifest] -> RealUnit -> Maybe TargetManifest
+manifestFor manifests u =
+  find ((== realCellKey u) . manifestKey) manifests
+  where
+    manifestKey m = m.project <> "/" <> m.arch <> "@" <> m.config
+
 
 -- ---------------------------------------------------------------------------
 -- The verdict: read off the log the tool wrote
@@ -444,24 +585,29 @@ realWorkDir u = case ruProject u of
   _ -> pgclWorkDir (ruConfig u)
 
 -- | The exact command a cell runs, as journaled (and as the operator would
--- type to run it by hand).
-commandText :: RealUnit -> FilePath -> Text
-commandText u outDir
-  | ruProject u == "telix" =
-      "make -C " <> realWorkDir u <> " verify"
-  | ruProject u == "tessera" =
-      "lake --dir " <> realWorkDir u <> "/proof build"
-  | ruProject u == "organ-bank" =
-      "cabal --project-dir=" <> realWorkDir u <> " test organ-ir"
-  | ruProject u == "mowgli" =
-      "make -C " <> realWorkDir u <> " film_episode_test film_annotation_fixture_test && "
-        <> realWorkDir u <> "/src/logic/film_episode_test && "
-        <> realWorkDir u <> "/src/logic/film_annotation_fixture_test"
-  | ruKind u == "host-verify" =
-      "make -C " <> realWorkDir u <> " " <> ruConfig u
-  | otherwise =
-      "bash " <> T.pack pgclDriverPath <> " " <> realWorkDir u <> " "
-        <> T.intercalate " " (ruArch u : ruArgs u <> [T.pack outDir])
+-- type to run it by hand). A governing manifest is authoritative: its
+-- command replaces the built-in text for that key.
+commandText :: RealUnit -> FilePath -> Maybe TargetManifest -> Text
+commandText u outDir mfs = case mfs of
+  Just tm -> command tm
+  Nothing -> builtInCommandText u outDir
+  where
+    builtInCommandText u' outDir'
+      | ruProject u' == "telix" =
+          "make -C " <> realWorkDir u' <> " verify"
+      | ruProject u' == "tessera" =
+          "lake --dir " <> realWorkDir u' <> "/proof build"
+      | ruProject u' == "organ-bank" =
+          "cabal --project-dir=" <> realWorkDir u' <> " test organ-ir"
+      | ruProject u' == "mowgli" =
+          "make -C " <> realWorkDir u' <> " film_episode_test film_annotation_fixture_test && "
+            <> realWorkDir u' <> "/src/logic/film_episode_test && "
+            <> realWorkDir u' <> "/src/logic/film_annotation_fixture_test"
+      | ruKind u' == "host-verify" =
+          "make -C " <> realWorkDir u' <> " " <> ruConfig u'
+      | otherwise =
+          "bash " <> T.pack pgclDriverPath <> " " <> realWorkDir u' <> " "
+            <> T.intercalate " " (ruArch u' : ruArgs u' <> [T.pack outDir'])
 
 -- | The verdict gate for a driver-run pgcl cell: the log classifier (which
 -- owns ground truth about the /guest/) crossed with the driver's own exit
@@ -482,18 +628,19 @@ verdictFrom ec arch t = case classifyCellLogArch arch t of
 
 -- | Execute one unit for real. pgcl cells invoke the driver (which manages
 -- its own PATH, build dir, QEMU and timeouts); host-verify units run their
--- project test harness. Returns (verdict, logPath) — the verdict read from
--- the log the tool wrote, never from the process exit code alone.
-runRealUnit :: RealUnit -> FilePath -> IO (Text, Text)
-runRealUnit u outDir
+-- project test harness. A governing manifest is authoritative over the
+-- command and the oracle facts. Returns (verdict, logPath) — the verdict
+-- read from the log the tool wrote, never from the process exit code alone.
+runRealUnit :: RealUnit -> FilePath -> Maybe TargetManifest -> IO (Text, Text)
+runRealUnit u outDir mfs
   | ruKind u == "host-verify" = do
       let logPath = realLogPath u outDir
-          cmd = commandText u outDir
+          cmd = commandText u outDir mfs
       (ec, out, err) <-
         readProcess (proc "bash" ["-c", T.unpack cmd])
       let body = TL.toStrict (TLE.decodeUtf8 out) <> "\n" <> TL.toStrict (TLE.decodeUtf8 err)
       TIO.writeFile (T.unpack logPath) body
-      pure (hostVerdictFromProj (ruProject u) ec body, logPath)
+      pure (hostVerdictFromProj (ruProject u) ec body mfs, logPath)
   | otherwise = do
       let logPath = realLogPath u outDir
           args = T.unpack (realWorkDir u) : map T.unpack (ruArch u : ruArgs u <> [T.pack outDir])
@@ -504,25 +651,34 @@ runRealUnit u outDir
 
 -- | A host verification verdict read from the command's exit code and
 -- captured log, per project. Success requires the tool's complete-run
--- marker, guarding against truncated or silently-passing runs.
-hostVerdictFromProj :: Text -> ExitCode -> Text -> Text
-hostVerdictFromProj "telix" ExitSuccess body
-  | "Telix-side checks passed." `T.isInfixOf` body = "passed"
-  | otherwise = "failed"
-hostVerdictFromProj "tessera" ExitSuccess body
-  | "Build completed successfully." `T.isInfixOf` body = "passed"
-  | otherwise = "failed"
-hostVerdictFromProj "organ-bank" ExitSuccess body
-  | "passed" `T.isInfixOf` body = "passed"
-  | otherwise = "failed"
-hostVerdictFromProj "mowgli" ExitSuccess body
-  | "all checks passed" `T.isInfixOf` body = "passed"
-  | otherwise = "failed"
-hostVerdictFromProj _ ExitSuccess _ = "passed"
-hostVerdictFromProj _ _ _ = "failed"
+-- marker, guarding against truncated or silently-passing runs. A manifest
+-- supplies the oracle as /facts/ (the Track 10 decision): it declares what
+-- a complete run looks like, but the interpreting code stays here — the
+-- manifest can never decide a verdict itself (invariant #4). When a manifest
+-- is present its marker list is authoritative and EVERY marker must appear;
+-- @exitMustSucceed@ false means markers alone decide (a command that exits
+-- non-zero still passes on the markers). Otherwise the built-in per-project
+-- marker applies.
+hostVerdictFromProj :: Text -> ExitCode -> Text -> Maybe TargetManifest -> Text
+hostVerdictFromProj proj ec body mfs =
+  if exitOk && all (`T.isInfixOf` body) markers then "passed" else "failed"
+  where
+    exitOk :: Bool
+    exitOk = case mfs of
+      Just tm | not (exitMustSucceed tm) -> True
+      _ -> ec == ExitSuccess
+    markers :: [Text]
+    markers = case mfs of
+      Just tm | not (null (successMarkers tm)) -> successMarkers tm
+      _ -> builtInMarker proj
+    builtInMarker "telix" = ["Telix-side checks passed."]
+    builtInMarker "tessera" = ["Build completed successfully."]
+    builtInMarker "organ-bank" = ["passed"]
+    builtInMarker "mowgli" = ["all checks passed"]
+    builtInMarker _ = [] -- no marker requirement beyond exit success
 
 hostVerdictFrom :: ExitCode -> Text -> Text
-hostVerdictFrom = hostVerdictFromProj "telix"
+hostVerdictFrom ec body = hostVerdictFromProj "telix" ec body Nothing
 
 -- ---------------------------------------------------------------------------
 -- The journaled attempt
@@ -554,15 +710,16 @@ realAttemptRecord ::
   RealMode ->
   Text ->
   Int ->
+  Maybe TargetManifest ->
   Eff es RealAttempt
-realAttemptRecord u outDir mode planWhy n = do
-  let cmd = commandText u outDir
+realAttemptRecord u outDir mode planWhy n mfs = do
+  let cmd = commandText u outDir mfs
   case mode of
     RealPlan ->
       pure (RealAttempt n cmd "plan" ("planned (" <> planWhy <> ")") "" Nothing)
     RealLive -> do
       t0 <- liftIO getCurrentTime
-      er <- liftIO (E.try (runRealUnit u outDir))
+      er <- liftIO (E.try (runRealUnit u outDir mfs))
       t1 <- liftIO getCurrentTime
       let dt = Just (diffUTCTime t1 t0)
       pure $ case er of
@@ -576,6 +733,10 @@ realAttemptRecord u outDir mode planWhy n = do
 -- | The cell workflow: journal the exact command, run (or refuse), done.
 -- No retries at this rung: a cell is minutes-to-hours, and re-running a
 -- failed cell is an operator decision informed by the journaled log path.
+-- The governing manifest is loaded lazily at def time — the target directory
+-- is re-read, so a fresh dispatch and a journal resume see the same facts
+-- (a manifest edited between runs changes what resume replays; that is the
+-- intended authority of the manifest).
 realCellWorkflow ::
   (KeiroWorkflow.Workflow :> es, IOE :> es, KirokuStoreResource :> es, Store :> es) =>
   RealUnit ->
@@ -584,9 +745,17 @@ realCellWorkflow ::
   FilePath ->
   Eff es Text
 realCellWorkflow u mode planWhy outDir = do
-  _plan <- step (StepName "verify-plan") (pure (commandText u outDir))
-  attempt <- step (StepName "run-cell") (realAttemptRecord u outDir mode planWhy 1)
+  mfs <- liftIO (governingManifest u)
+  _plan <- step (StepName "verify-plan") (pure (commandText u outDir mfs))
+  attempt <- step (StepName "run-cell") (realAttemptRecord u outDir mode planWhy 1 mfs)
   pure (raVerdict attempt)
+
+-- | Load the manifest (if any) governing a unit — the runtime discovery
+-- path both dispatch and resume go through.
+governingManifest :: RealUnit -> IO (Maybe TargetManifest)
+governingManifest u = do
+  ms <- realUnitCellManifests
+  pure (manifestFor ms u)
 
 -- | The workflow id embeds the cell key and the run tag, separated by @__@
 -- (which cell keys cannot contain — keys use @/@ and @@@): the id carries

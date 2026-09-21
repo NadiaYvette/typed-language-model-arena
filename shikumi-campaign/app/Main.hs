@@ -446,7 +446,7 @@ scheduleJsonMode = do
   units <- realUnitCells
   lessonsRef <- newIORef (Map.empty :: Map.Map Text [Text])
   withCampaignStore $ \store ->
-    for_ ["pgcl", "telix", "tessera", "organ-bank", "mowgli"] $ \proj -> do
+    for_ (nub (map ruProject units)) $ \proj -> do
       notes <- requireEither =<< runCampaignStore store (recallNotes (projectNamespace proj))
       modifyIORef' lessonsRef (Map.insert proj notes)
   lessonsByProject <- readIORef lessonsRef
@@ -459,7 +459,7 @@ scheduleTextMode = do
   units <- realUnitCells
   lessonsRef <- newIORef (Map.empty :: Map.Map Text [Text])
   withCampaignStore $ \store ->
-    for_ ["pgcl", "telix", "tessera", "organ-bank", "mowgli"] $ \proj -> do
+    for_ (nub (map ruProject units)) $ \proj -> do
       notes <- requireEither =<< runCampaignStore store (recallNotes (projectNamespace proj))
       modifyIORef' lessonsRef (Map.insert proj notes)
   lessonsByProject <- readIORef lessonsRef
@@ -4671,7 +4671,7 @@ runRealAct = do
   -- treatment, and the rationale is journaled as data alongside the order.
   lessonsRef <- newIORef (Map.empty :: Map.Map Text [Text])
   withCampaignStore $ \store ->
-    for_ ["pgcl", "telix", "tessera", "organ-bank", "mowgli"] $ \proj -> do
+    for_ (nub (map ruProject units0)) $ \proj -> do
       notes <- requireEither =<< runCampaignStore store (recallNotes (projectNamespace proj))
       modifyIORef' lessonsRef (Map.insert proj notes)
   lessonsByProject <- readIORef lessonsRef
