@@ -1,7 +1,7 @@
+{-# LANGUAGE GHC2024 #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveAnyClass #-}
 {-# LANGUAGE DerivingStrategies #-}
-{-# LANGUAGE GHC2024 #-}
 {-# LANGUAGE OverloadedStrings #-}
 
 -- | The Mercury promotion campaign: the analyze → propose → guard → test →
@@ -52,14 +52,17 @@ module Campaign.Mercury
     mercuryBranchFor,
     mercuryWorktreeFor,
     mercuryPrivCount,
+
     -- * The staged oracle
     OracleVerdict (..),
     oracleFactProbe,
     oracleDumpProbe,
+
     -- * The promotion engine
     MercuryEngine,
     mercuryPromotionSignature,
     mercuryScriptedEngine,
+
     -- * The workflow
     mercuryWorkflowName,
     mercuryWorkflowIdTagged,
@@ -69,6 +72,7 @@ module Campaign.Mercury
     MercuryAttempt (..),
     mercuryAttemptsOf,
     mercuryCoolDown,
+
     -- * The help-check cell (the paced compiler build)
     HelpCheckCell (..),
     mercuryPromotionBranches,
@@ -89,13 +93,18 @@ module Campaign.Mercury
   )
 where
 
-import Control.Exception (catch, SomeException, try)
-import Control.Monad (forM, forM_, unless, void, when)
+import Baikai (Response)
+import Campaign.Hands (campaignWorktreePath, ensureCampaignWorktree, gitCapture)
+import Campaign.Memory (projectNamespace, recallNotesForKeyword)
+import Campaign.Workflow (HumanVerdict (..), humanQueryStepName)
+import Control.Exception (SomeException, catch, try)
+import Control.Monad (forM, unless, void, when)
 import Data.Aeson (FromJSON, ToJSON)
 import Data.Aeson qualified as Aeson
+import Data.Char (isDigit)
 import Data.Function ((&))
 import Data.Map.Strict qualified as Map
-import Data.Maybe (listToMaybe, mapMaybe)
+import Data.Maybe (catMaybes, fromMaybe, listToMaybe, mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
@@ -104,15 +113,6 @@ import Data.Text.Lazy.Encoding qualified as TLE
 import Data.Time.Clock (NominalDiffTime)
 import Effectful (Eff, IOE, liftIO, raise, (:>))
 import GHC.Generics (Generic)
-import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesFileExist, findExecutable, listDirectory)
-import System.Exit (ExitCode (..))
-import System.FilePath ((</>))
-import System.Process.Typed (proc, readProcess, setWorkingDir)
-
-import Baikai (Response)
-import Campaign.Hands (campaignWorktreePath, ensureCampaignWorktree, gitCapture)
-import Campaign.Memory (projectNamespace, recallNotesForKeyword)
-import Campaign.Workflow (HumanVerdict (..), humanQueryStepName)
 import Keiro.Workflow (StepName (..), Workflow, WorkflowId (..), step)
 import Keiro.Workflow.Awakeable (AwakeableId, awakeableNamed)
 import Keiro.Workflow.Resume (WorkflowDef (..), WorkflowRegistry)
@@ -121,14 +121,18 @@ import Keiro.Workflow.Types (WorkflowJournalEvent (..), WorkflowName (..))
 import Kioku.Api.Scope (Namespace)
 import Kiroku.Store.Effect (Store)
 import Kiroku.Store.Effect.Resource (KirokuStoreResource)
+import Shikumi.Coder.Pipeline (ProposeIn (..), failureReport)
+import Shikumi.Coder.Task (PatchPlan (..), applyPlan, renderEditFailure)
 import Shikumi.Error (ShikumiError)
 import Shikumi.Module (predict)
 import Shikumi.Program (Program, runProgram)
 import Shikumi.Schema.Types (Field (Field, unField))
 import Shikumi.Signature (Signature, mkSignature)
 import Shikumi.Testing (runStubEval)
-import Shikumi.Coder.Pipeline (ProposeIn (..), failureReport)
-import Shikumi.Coder.Task (PatchPlan (..), applyPlan, renderEditFailure)
+import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesFileExist, findExecutable, listDirectory)
+import System.Exit (ExitCode (..))
+import System.FilePath ((</>))
+import System.Process.Typed (proc, readProcess, setWorkingDir)
 
 -- ---------------------------------------------------------------------------
 -- Facts and cells
@@ -180,13 +184,13 @@ readMercuryFacts tree = do
       let ls = T.lines body
           facts =
             [ MercuryFact
-              { mfOption = opt,
-                mfConstructor = privC,
-                mfPublicConstructor = pubC,
-                mfLineNo = i,
-                mfLine = l,
-                mfPublicLine = T.replace privC pubC l
-              }
+                { mfOption = opt,
+                  mfConstructor = privC,
+                  mfPublicConstructor = pubC,
+                  mfLineNo = i,
+                  mfLine = l,
+                  mfPublicLine = T.replace privC pubC l
+                }
             | (opt, privC, pubC) <- mercuryPromotionTargets,
               (i, l) <- take 1 [(i, l) | (i, l) <- zip [1 :: Int ..] ls, targetNeedle privC opt `T.isInfixOf` l]
             ]
@@ -232,11 +236,11 @@ mercuryCellSpecs tree tag = do
   facts <- readMercuryFacts tree
   pure
     [ MercuryCell
-      { mcOption = mfOption f,
-        mcWorktree = mercuryWorktreeFor (mfOption f) tag,
-        mcBranch = mercuryBranchFor (mfOption f) tag,
-        mcFact = f
-      }
+        { mcOption = mfOption f,
+          mcWorktree = mercuryWorktreeFor (mfOption f) tag,
+          mcBranch = mercuryBranchFor (mfOption f) tag,
+          mcFact = f
+        }
     | f <- facts
     ]
 
@@ -276,7 +280,7 @@ oracleFactProbe wt fact = do
   body <- TIO.readFile fp
   let ls = T.lines body
       privGone = not (any (targetNeedle (mfConstructor fact) (mfOption fact) `T.isInfixOf`) ls)
-      publicIn = any (== mfPublicLine fact) ls
+      publicIn = mfPublicLine fact `elem` ls
   baseline <- gitShowFile wt
   countNow <- mercuryPrivCount wt
   let countBase = length [() | l <- T.lines baseline, "    priv_" `T.isPrefixOf` l]
@@ -294,7 +298,7 @@ oracleFactProbe wt fact = do
           if null problems
             then
               "private line gone, public line in, priv-count "
-                <> T.pack (show (maybe 0 id countNow))
+                <> T.pack (show (fromMaybe 0 countNow))
                 <> " (baseline "
                 <> T.pack (show countBase)
                 <> ")"
@@ -558,11 +562,11 @@ attemptIO n notes cell engine = do
                         <> "The whole change is that one line: swap the constructor, verbatim otherwise."
                     ),
                 piFact =
-                  Field $
-                    T.unlines $
-                      [T.pack (show (mfLineNo fact)) <> ": " <> mfLine fact]
-                        ++ (if null notes then [] else ["", "Feedback on your previous attempt:"])
-                        ++ map ("  " <>) notes
+                  Field
+                    $ T.unlines
+                    $ [T.pack (show (mfLineNo fact)) <> ": " <> mfLine fact]
+                      ++ (if null notes then [] else ["", "Feedback on your previous attempt:"])
+                      ++ map ("  " <>) notes
               }
           prog = predict mercuryPromotionSignature
       mPlan <- engine n prog proposeIn notes
@@ -704,6 +708,7 @@ placeholderFact opt =
       mfLine = "",
       mfPublicLine = ""
     }
+
 -- ---------------------------------------------------------------------------
 -- The help-check cell: the paced compiler build
 -- ---------------------------------------------------------------------------
@@ -791,8 +796,6 @@ helpCheckBranchFor tag =
     (prefix, rev)
       | T.all isDigit rev && not (T.null rev) -> T.dropEnd 2 prefix
     _ -> tag
-  where
-    isDigit c = c >= '0' && c <= '9'
 
 helpCheckCellFor :: [Text] -> Text -> HelpCheckCell
 helpCheckCellFor opts tag =
@@ -874,7 +877,7 @@ ensureIntegrationWorktree parent = do
           Left (_ :: SomeException) -> do
             _ <- try (gitCapture wt ["merge", "--abort"]) :: IO (Either SomeException Text)
             pure Nothing -- cannot auto-merge; skipped, reported honestly
-  pure (integrationBranchName, [opt | Just opt <- integrated])
+  pure (integrationBranchName, catMaybes integrated)
 
 -- | Is @b@ already an ancestor of HEAD in the repo at @dir@? (git exits 0
 -- silently when it is, 1 when it is not.)
@@ -924,8 +927,7 @@ ensureHelpCheckWorktree parent integrationBranch helpBranch = do
         Left (_ :: SomeException) ->
           void (gitCapture parent ["branch", T.unpack helpBranch, T.unpack integrationBranch])
       _ <- gitCapture parent ["worktree", "add", wt, T.unpack helpBranch]
-      pure wt
-        <* ensureBoehmGc parent wt
+      wt <$ ensureBoehmGc parent wt
   -- Also on the resume path: a worktree created by recipe r2 has no GC.
   where
     -- The world-fact: @boehm_gc@ is a git submodule that fresh worktrees
@@ -939,10 +941,12 @@ ensureHelpCheckWorktree parent integrationBranch helpBranch = do
       haveParent <- doesDirectoryExist gcInParent
       haveInWt <- doesDirectoryExist gcInWt
       emptyInWt <- if haveInWt then null <$> listDirectory gcInWt else pure True
-      when (emptyInWt && haveParent) $
+      when (emptyInWt && haveParent)
+        $
         -- The destination exists (git creates the empty submodule dir), so
         -- copy the CONTENTS (SRC/.), not the directory itself.
-        void $ readProcess (proc "cp" ["-a", gcInParent <> "/.", gcInWt])
+        void
+        $ readProcess (proc "cp" ["-a", gcInParent <> "/.", gcInWt])
 
 -- | Any exception, swallowed (the git merges and probes run on real trees
 -- and can fail in real ways; the verdicts carry the failure).
@@ -986,8 +990,9 @@ bootstrapConfigureProbe tree = do
       -- and an existing file skips the copy path entirely — journal-verified
       -- when recipe r6 failed on exactly that stale copy).
       hasConfigure <- doesFileExist (tree </> "configure")
-      when hasConfigure $
-        void $ readProcess (proc "chmod" ["+x", tree </> "configure"])
+      when hasConfigure
+        $ void
+        $ readProcess (proc "chmod" ["+x", tree </> "configure"])
       (ec, out) <- runPaced 240 tree (bootstrappingCompiler <> " ./configure --prefix=/tmp/mhelp-install 2>&1")
       pure $ case ec of
         ExitSuccess -> HelpStageVerdict "configure" "completed" "configured"
@@ -1062,8 +1067,11 @@ helpCheckProbe tree opt = do
       -- The FRESH library (the build tree's own), never the installed one:
       -- the whole point is that the built compiler is the one under test.
       let invocation =
-            "MERCURY_STDLIB_DIR=" <> T.pack (tree </> "library") <> " "
-              <> T.pack bin <> " --help 2>&1"
+            "MERCURY_STDLIB_DIR="
+              <> T.pack (tree </> "library")
+              <> " "
+              <> T.pack bin
+              <> " --help 2>&1"
       (ec, out) <- runPaced 60 (tree </> "compiler") invocation
       let hits = length [() | l <- T.lines out, ("--" <> opt) `T.isInfixOf` l]
       pure $ case ec of
@@ -1094,7 +1102,7 @@ mercuryHelpCheckWorkflow ::
   HelpCheckCell ->
   Eff es Text
 mercuryHelpCheckWorkflow publishHumanQuery cell = do
-  (_branch, integrated) <-
+  (_branch, _integrated) <-
     step (StepName "integrate") . liftIO $
       ensureIntegrationWorktree "/home/nyc/src/mercury"
   wt <-
@@ -1109,7 +1117,7 @@ mercuryHelpCheckWorkflow publishHumanQuery cell = do
 
     -- The configure stage: one bounded probe per round until it completes.
     configureLoop wt k = do
-      v <- step (StepName ("configure-r" <> T.pack (show k))) (liftIO (bootstrapConfigureProbe wt))
+      v <- step (StepName ("configure-r" <> T.pack (show (k :: Int)))) (liftIO (bootstrapConfigureProbe wt))
       case hsOutcome v of
         "completed" -> paceStages wt 1 1
         "still-running" -> do
@@ -1127,7 +1135,7 @@ mercuryHelpCheckWorkflow publishHumanQuery cell = do
               stageName = fst3 stage
           v <-
             step
-              (StepName ("bootstrap-" <> T.pack (show n) <> "-" <> stageName <> "-r" <> T.pack (show k)))
+              (StepName ("bootstrap-" <> T.pack (show (n :: Int)) <> "-" <> stageName <> "-r" <> T.pack (show (k :: Int))))
               (liftIO (bootstrapStageProbe wt stage))
           case hsOutcome v of
             "completed" -> paceStages wt (n + 1) 1
@@ -1144,7 +1152,10 @@ mercuryHelpCheckWorkflow publishHumanQuery cell = do
           shown_ = [o | (o, v) <- zipped, hvShows v]
           missing = [o | (o, v) <- zipped, not (hvShows v)]
       pure $
-        "help-check: " <> T.pack (show (length shown_)) <> "/" <> T.pack (show (length (hcOptions cell)))
+        "help-check: "
+          <> T.pack (show (length shown_))
+          <> "/"
+          <> T.pack (show (length (hcOptions cell)))
           <> " promoted option(s) visible in the built compiler's --help"
           <> (if null missing then "" else "; absent: " <> T.intercalate ", " missing)
 

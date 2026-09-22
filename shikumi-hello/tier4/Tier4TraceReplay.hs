@@ -27,7 +27,6 @@ import Effectful.Dispatch.Dynamic (interpret)
 import Effectful.Error.Static (runErrorNoCallStack)
 import Effectful.Prim (runPrim)
 import GHC.Generics (Generic)
-
 import Shikumi.Adapter (ToPrompt)
 import Shikumi.Cache (cachedLLM)
 import Shikumi.Cache.Backend.Memory (newMemoryCache, runCacheMemory)
@@ -83,8 +82,14 @@ main = withSystemTempDirectory "shikumi-hello" $ \dir -> do
         Stream {} -> pure []
 
   cached <-
-    runEff . runConcurrent . runTime . runCacheMemory cache . counting
-      . runErrorNoCallStack @ShikumiError . cachedLLM $ do
+    runEff
+      . runConcurrent
+      . runTime
+      . runCacheMemory cache
+      . counting
+      . runErrorNoCallStack @ShikumiError
+      . cachedLLM
+      $ do
         a <- runProgram qa input
         b <- runProgram qa input
         c <- runProgram qa otherInput

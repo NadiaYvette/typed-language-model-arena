@@ -19,7 +19,6 @@ module Main (main) where
 import Baikai (Context, Response)
 import Data.Text (Text)
 import GHC.Generics (Generic)
-
 import Shikumi.Adapter (ToPrompt)
 import Shikumi.Combinator ((>>>))
 import Shikumi.Module (predict)
@@ -34,15 +33,15 @@ import Shikumi.Testing (markerResponse, runStub, systemContains)
 -- ---------------------------------------------------------------------------
 
 data Article = Article
-  { title :: !(Field "The article's headline" Text)
-  , body :: !(Field "The full article text" Text)
+  { title :: !(Field "The article's headline" Text),
+    body :: !(Field "The full article text" Text)
   }
   deriving stock (Generic, Show, Eq)
   deriving anyclass (ToSchema, FromModel, ToPrompt)
 
 data Summary = Summary
-  { headline :: !(Field "A one-line summary" Text)
-  , bullets :: !(Field "Three to five key points" [Text])
+  { headline :: !(Field "A one-line summary" Text),
+    bullets :: !(Field "Three to five key points" [Text])
   }
   deriving stock (Generic, Show, Eq)
   deriving anyclass (ToSchema, FromModel, ToPrompt)
@@ -57,8 +56,8 @@ instance Validatable Summary where
       n = length (unField (bullets s))
 
 data Moderation = Moderation
-  { publish :: !Bool
-  , reason :: !Text
+  { publish :: !Bool,
+    reason :: !Text
   }
   deriving stock (Generic, Show, Eq)
   deriving anyclass (ToSchema, FromModel, ToPrompt)
@@ -83,8 +82,8 @@ pipeline = summarize >>> moderate
 sampleArticle :: Article
 sampleArticle =
   Article
-    { title = field "Typed LM programs"
-    , body = field "Shikumi makes LM calls behave like ordinary typed software."
+    { title = field "Typed LM programs",
+      body = field "Shikumi makes LM calls behave like ordinary typed software."
     }
 
 -- One responder for both stages: branch on the stage's instruction (it is
@@ -94,13 +93,13 @@ responder :: Context -> Response
 responder ctx
   | systemContains "Summarize" ctx =
       markerResponse
-        [ ("headline", "Shikumi types LM programs")
-        , ("bullets", "[\"records in\", \"records out\", \"errors are typed\"]")
+        [ ("headline", "Shikumi types LM programs"),
+          ("bullets", "[\"records in\", \"records out\", \"errors are typed\"]")
         ]
   | otherwise =
       markerResponse
-        [ ("publish", "true")
-        , ("reason", "on-topic, harmless, and complete")
+        [ ("publish", "true"),
+          ("reason", "on-topic, harmless, and complete")
         ]
 
 main :: IO ()

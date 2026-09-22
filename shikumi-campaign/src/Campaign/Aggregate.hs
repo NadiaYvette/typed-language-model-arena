@@ -10,6 +10,7 @@
 {-# LANGUAGE QualifiedDo #-}
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TypeApplications #-}
+{-# OPTIONS_GHC -Wno-unused-top-binds #-}
 
 -- | The campaign's cell aggregate, authored as a keiki transducer.
 --
@@ -79,7 +80,7 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Time (UTCTime)
 import GHC.Generics (Generic)
-import Keiki.Builder ((.=), reg)
+import Keiki.Builder (reg, (.=))
 import Keiki.Builder qualified as B
 import Keiki.Core
 import Keiki.Generics.TH (deriveAggregateCtors, deriveWireCtors)
@@ -146,8 +147,12 @@ data CellVertex
 -- before any read that could force them.
 initialCellRegs :: RegFile CellRegs
 initialCellRegs =
-  RCons (Proxy @"cellAttemptCount") 0
-    ( RCons (Proxy @"cellClearedAt") (error "uninit: cellClearedAt")
+  RCons
+    (Proxy @"cellAttemptCount")
+    0
+    ( RCons
+        (Proxy @"cellClearedAt")
+        (error "uninit: cellClearedAt")
         (RCons (Proxy @"cellEscalatedReason") (error "uninit: cellEscalatedReason") RNil)
     )
 

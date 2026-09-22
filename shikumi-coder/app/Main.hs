@@ -1,5 +1,4 @@
 {-# LANGUAGE GHC2024 #-}
-{-# LANGUAGE DeriveAnyClass #-}
 {-# LANGUAGE DerivingStrategies #-}
 {-# LANGUAGE OverloadedStrings #-}
 
@@ -29,16 +28,9 @@
 --      (OmniRoute), dry-run — the diff is printed, nothing is written.
 module Main (main) where
 
-import Control.Monad (unless)
-import Data.Maybe (fromMaybe)
-import Data.Text (Text)
-import Data.Text qualified as T
-import Data.Text.IO qualified as TIO
-import System.Environment (lookupEnv)
-
 import Baikai
-  ( ApiKeySource (ApiKeyEnv),
-    Api (OpenAIChatCompletions),
+  ( Api (OpenAIChatCompletions),
+    ApiKeySource (ApiKeyEnv),
     Model (..),
     Options (..),
     Response,
@@ -47,11 +39,15 @@ import Baikai
     mkModel,
   )
 import Baikai.Provider.OpenAI.Api qualified as OpenAI
+import Control.Monad (unless)
+import Data.Maybe (fromMaybe)
+import Data.Text (Text)
+import Data.Text qualified as T
+import Data.Text.IO qualified as TIO
 import Effectful (Eff, IOE, runEff)
 import Effectful.Concurrent (Concurrent, runConcurrent)
 import Effectful.Error.Static (Error, runErrorNoCallStack)
 import Effectful.Prim (Prim, runPrim)
-
 import Shikumi.Coder.Pipeline (PatchResult (..), ProposeIn (..), coder, coderOnce)
 import Shikumi.Coder.Task
   ( CodeFact (..),
@@ -63,12 +59,6 @@ import Shikumi.Coder.Task
   )
 import Shikumi.Effect.Time (Time, runTime)
 import Shikumi.Error (ShikumiError)
-import Shikumi.LLM (LLM)
-import Shikumi.Program (Program, embed, runProgram)
-import Shikumi.Schema.Types (Field (..), unField)
-import Shikumi.Testing (markerResponse, runStubEval)
-import Shikumi.Testing.StubLLM (runScriptLLM)
-
 import Shikumi.Eval
   ( Dataset,
     EvalConfig (concurrency),
@@ -83,11 +73,15 @@ import Shikumi.Eval
     predictionPrimary,
     renderReportText,
   )
-
-import Shikumi.LLM (defaultLLMConfig, runLLMResilient)
+import Shikumi.LLM (LLM, defaultLLMConfig, runLLMResilient)
 import Shikumi.LLM.Defaults (RequestDefaults (defaultMaxTokens), emptyRequestDefaults, withRequestDefaults)
+import Shikumi.Program (Program, embed, runProgram)
 import Shikumi.Routing (routeLLM, runRouting)
+import Shikumi.Schema.Types (Field (..), unField)
+import Shikumi.Testing (markerResponse, runStubEval)
 import Shikumi.Testing.Responses (withTransportOptions)
+import Shikumi.Testing.StubLLM (runScriptLLM)
+import System.Environment (lookupEnv)
 
 -- ---------------------------------------------------------------------------
 -- The fixture: the relevant region of compiler/options.m (from the real
@@ -159,7 +153,7 @@ dumpMldsTask =
     )
     fixtureOptionsM
   where
-    mkTask p t w f body = CodeTask p t w f body
+    mkTask = CodeTask
 
 -- | The propose stage's input, rendered from the task.
 proposeIn :: CodeTask -> ProposeIn
@@ -299,7 +293,7 @@ main = do
 
 -- | The hand-written expected result for the evaluation seam.
 expectedResult :: CodeTask -> PatchResult
-expectedResult t =
+expectedResult =
   PatchResult
     (Field expectedFile)
     ( PatchPlan
@@ -308,7 +302,6 @@ expectedResult t =
         (Field "the private constructor hides the option; the public one is established")
         (Field "Promotes --dump-mlds to a public, documented option.")
     )
-    t
 
 indented :: Text -> Text
 indented = T.unlines . map ("    " <>) . T.lines
@@ -341,8 +334,8 @@ runLive = do
               }
           creds =
             emptyOptions
-              { apiKey = Just (ApiKeyEnv "OMNIROUTE_API_KEY")
-              , timeoutMs = Just 120000
+              { apiKey = Just (ApiKeyEnv "OMNIROUTE_API_KEY"),
+                timeoutMs = Just 120000
               }
           cfg = defaultLLMConfig globalProviderRegistry
           defaults = emptyRequestDefaults {defaultMaxTokens = Just 2048}

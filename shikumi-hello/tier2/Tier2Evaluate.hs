@@ -16,7 +16,6 @@ module Main (main) where
 import Data.Text (Text)
 import Data.Text.IO qualified as TIO
 import GHC.Generics (Generic)
-
 import Shikumi.Adapter (ToPrompt)
 import Shikumi.Eval (Dataset, dataset, evaluatePure, exactMatch, example, renderReportText)
 import Shikumi.Module (predict)
@@ -41,10 +40,10 @@ classify = predict (mkSignature "Classify the review sentiment as positive or ne
 reviews :: Dataset Review Label
 reviews =
   dataset
-    [ example (Review "Loved it, would buy again") (Label "positive")
-    , example (Review "Total waste of money") (Label "negative")
-    , example (Review "Exceeded my expectations") (Label "positive")
-    , example (Review "Broke on day one") (Label "negative")
+    [ example (Review "Loved it, would buy again") (Label "positive"),
+      example (Review "Total waste of money") (Label "negative"),
+      example (Review "Exceeded my expectations") (Label "positive"),
+      example (Review "Broke on day one") (Label "negative")
     ]
 
 main :: IO ()

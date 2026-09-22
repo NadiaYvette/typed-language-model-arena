@@ -29,7 +29,6 @@ import Data.Aeson (ToJSON)
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import GHC.Generics (Generic)
-
 import Shikumi.Adapter (ToPrompt)
 import Shikumi.Cli (cliMain)
 import Shikumi.Cli.Registry (Registry, Task (..), emptyRegistry, register)
@@ -61,10 +60,10 @@ classify = predict (mkSignature "Classify the review sentiment as positive or ne
 trainset :: Dataset Review Label
 trainset =
   dataset
-    [ example (Review "Loved it, would buy again") (Label "positive")
-    , example (Review "Total waste of money") (Label "negative")
-    , example (Review "Exceeded my expectations") (Label "positive")
-    , example (Review "Broke on day one") (Label "negative")
+    [ example (Review "Loved it, would buy again") (Label "positive"),
+      example (Review "Total waste of money") (Label "negative"),
+      example (Review "Exceeded my expectations") (Label "positive"),
+      example (Review "Broke on day one") (Label "negative")
     ]
 
 sentimentMetric :: Metric Label
@@ -82,8 +81,8 @@ responder = const (markerResponse [("label", "positive")])
 optimizers :: Map.Map Text (Optimizer Review Label)
 optimizers =
   Map.fromList
-    [ ("bootstrap-fewshot", bootstrapFewShot classify defaultBudget)
-    , ("labeled-fewshot", labeledFewShot 2)
+    [ ("bootstrap-fewshot", bootstrapFewShot classify defaultBudget),
+      ("labeled-fewshot", labeledFewShot 2)
     ]
 
 myRegistry :: Registry

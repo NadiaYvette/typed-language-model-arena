@@ -60,18 +60,17 @@ module Campaign.Oracle
   )
 where
 
-import Data.Char (isAlphaNum)
-import Data.List (foldl', sort)
 import Control.Monad (filterM)
+import Data.Char (isAlphaNum)
+import Data.List (sort)
 import Data.Text (Text)
 import Data.Text qualified as T
-import System.Directory (doesDirectoryExist, doesFileExist, listDirectory)
-import System.FilePath (makeRelative, takeExtension, (</>))
-import System.Exit (ExitCode (..))
-import System.Process.Typed (byteStringInput, proc, readProcess, setStdin)
 import Data.Text.Lazy qualified as TL
 import Data.Text.Lazy.Encoding qualified as TLE
-
+import System.Directory (doesDirectoryExist, doesFileExist, listDirectory)
+import System.Exit (ExitCode (..))
+import System.FilePath (makeRelative, takeExtension, (</>))
+import System.Process.Typed (byteStringInput, proc, readProcess, setStdin)
 import Toy.Fixer.Domain (Diagnostic (..), Source (..), SourcePath, checkSource)
 
 -- ---------------------------------------------------------------------------
@@ -140,11 +139,14 @@ importSpecFrom ls = do
     then Nothing
     else do
       clauses <- parseClauses raw
-      let isFrom = "from " `T.isPrefixOf` T.strip (head ls)
-          fromMod
-            | isFrom = Just (T.strip (T.takeWhile (/= ' ') (T.strip (T.drop 5 (head (T.lines raw))))))
-            | otherwise = Nothing
-      pure (ImportSpec 1 (max 1 nLines) fromMod clauses)
+      case (ls, T.lines raw) of
+        (firstLs : _, firstRaw : _) -> do
+          let isFrom = "from " `T.isPrefixOf` T.strip firstLs
+              fromMod
+                | isFrom = Just (T.strip (T.takeWhile (/= ' ') (T.strip (T.drop 5 firstRaw))))
+                | otherwise = Nothing
+          pure (ImportSpec 1 (max 1 nLines) fromMod clauses)
+        _ -> Nothing
   where
     chunk :: Maybe (Text, Int)
     chunk = go [] 0 0 ls
@@ -180,8 +182,8 @@ importSpecFrom ls = do
                              in Just (names, st)
                in Just
                     [ ImportClause 0 names st
-                    | spec <- specs
-                    , Just (names, st) <- [clauseOf spec]
+                    | spec <- specs,
+                      Just (names, st) <- [clauseOf spec]
                     ]
     rootName n = case T.splitOn "." (T.strip n) of
       (h : _) -> h
@@ -206,7 +208,7 @@ importSpecsOf :: Source -> [ImportSpec]
 importSpecsOf src = go (executableLines src)
   where
     go [] = []
-    go ws@((n, l) : rest)
+    go ((n, l) : rest)
       | startsImport (T.strip l) =
           let -- The statement's continuation lines: consumed only while the
               -- first line's parens are still open. A closed statement owns
@@ -253,11 +255,11 @@ unusedImportDiags path (Source body) =
           | length unusedClauses == length (isClauses spec) =
               "unused import " <> T.intercalate ", " unusedNames
           | otherwise =
-              "unused import names " <> T.intercalate ", " unusedNames
+              "unused import names "
+                <> T.intercalate ", " unusedNames
                 <> " (statement partially used — rewrite keeping the used names)"
   ]
   where
-    numbered = zip [1 :: Int ..] (T.lines body)
     specs = importSpecsOf (Source body)
     bodyLines = T.lines body
     rawLine n = bodyLines !! (n - 1)
@@ -285,7 +287,6 @@ unusedImportDiags path (Source body) =
       | otherwise =
           any (\spec -> isStart spec > firstCodeLine || isIndented (isStart spec)) specs
     isIndented n = let l = rawLine n in " " `T.isPrefixOf` l || "\t" `T.isPrefixOf` l
-    maxImportLine = foldl' (\acc s -> max acc (isEnd s)) 0 specs
     -- Case-sensitive, as Python identifiers are. (Lowercasing the body — an
     -- early shortcut — made every CamelCase import unmatchable: a used
     -- `analyseOutput` read as unused. The tessera run caught it.) The body
@@ -318,7 +319,7 @@ nameUsedIn nm body
           nextC = if i + T.length nm >= T.length body then Nothing else Just (T.index body (i + T.length nm))
        in maybe True (\c -> not (isIdentChar c) && c /= '.') prevC
             && maybe True (not . isIdentChar) nextC
-    occurrences needle t = go 0 t
+    occurrences needle = go 0
       where
         go base rest = case T.breakOn needle rest of
           (pre, hit)
@@ -352,7 +353,7 @@ nameUsedIn nm body
 executableBodyLines :: Source -> [(Int, Text)]
 executableBodyLines src = [(n, stripEol l) | (n, l) <- executableLines src]
   where
-    nOf l = T.length l
+    nOf = T.length
     -- Cut at the first # outside single/double quotes on this line. A
     -- line with an unterminated quote resolves Nothing and stays verbatim
     -- (the conservative direction: a comment mention still reads as use).
@@ -366,7 +367,8 @@ executableBodyLines src = [(n, stripEol l) | (n, l) <- executableLines src]
           | c == '"' = scanPast (i + 1) '"'
           | c == '\'' = scanPast (i + 1) '\''
           | otherwise = scan (i + 1)
-          where c = T.index l i
+          where
+            c = T.index l i
         scanPast j close
           | j >= nOf l = Nothing
           | T.index l j == close = scan (j + 1)
@@ -395,29 +397,6 @@ executableLines (Source body) = go 0 (zip [1 ..] (T.lines body))
       | otherwise = (n, l) : go quotes rest
       where
         qcount x = T.count "\"\"\"" x + T.count "'''" x
-    -- Cut at the first # that is outside single/double quotes on this line.
-    -- A line with an odd quote count at scan end (apostrophes in words, an
-    -- unterminated literal) resolves nothing: keep the line verbatim.
-    stripEol l = case scan 0 0 of
-      Just i -> T.take i l
-      Nothing -> l
-      where
-        n = T.length l
-        scan i q
-          | i >= n = Nothing
-          | c == '#', q == 0 = Just i
-          | c == '"' = scanPast (i + 1) '"'
-          | c == '\'' = scanPast (i + 1) '\''
-          | otherwise = scan (i + 1) q
-          where
-            c = T.index l i
-        -- Scan past a quoted span (q = which quote kind, unused beyond
-        -- readability) and resume normal scanning after its close. An
-        -- unterminated span resolves Nothing: the line stays verbatim.
-        scanPast j close
-          | j >= n = Nothing
-          | T.index l j == close = scan (j + 1) 0
-          | otherwise = scanPast (j + 1) close
 
 -- | The real oracle over a checkout's files.
 unusedImportOracle :: CellOracle
@@ -517,9 +496,10 @@ pythonSyntaxCheck path (Source body) = do
     _ ->
       Just $
         T.pack (T.unpack path <> ": does not parse as Python")
-          <> (case (T.strip (TL.toStrict (TLE.decodeUtf8 err)), T.strip (TL.toStrict (TLE.decodeUtf8 out))) of
-                ("", o) -> if T.null o then "" else " " <> o
-                (e, o) -> " — " <> lastLine e <> (if T.null o then "" else " " <> o))
+          <> ( case (T.strip (TL.toStrict (TLE.decodeUtf8 err)), T.strip (TL.toStrict (TLE.decodeUtf8 out))) of
+                 ("", o) -> if T.null o then "" else " " <> o
+                 (e, o) -> " — " <> lastLine e <> (if T.null o then "" else " " <> o)
+             )
   where
     lastLine = T.intercalate " " . filter (not . T.null) . take 1 . reverse . T.lines
 
@@ -570,9 +550,23 @@ readProjectCell (proj, path) = do
 -- outputs, editor machinery. The scan is of the project's /source/.
 skipDirNames :: [FilePath]
 skipDirNames =
-  [ ".git", ".hg", ".svn", ".claude", ".venv", "venv", ".venv-diffusion",
-    "__pycache__", ".mypy_cache", ".pytest_cache", ".ruff_cache",
-    "node_modules", "dist", "build", ".tox", ".hypothesis", "target"
+  [ ".git",
+    ".hg",
+    ".svn",
+    ".claude",
+    ".venv",
+    "venv",
+    ".venv-diffusion",
+    "__pycache__",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    "node_modules",
+    "dist",
+    "build",
+    ".tox",
+    ".hypothesis",
+    "target"
   ]
 
 -- | The outer scan for the application phase: every @.py@ file under a
@@ -587,8 +581,8 @@ scanProjectUnusedImportCells proj = do
   candidates <- mapM (readProjectCell . (proj,)) paths
   pure
     [ pc
-    | Just pc <- candidates
-    , not (null (oracleCheck unusedImportOracle (pcPath pc) (pcSource pc)))
+    | Just pc <- candidates,
+      not (null (oracleCheck unusedImportOracle (pcPath pc) (pcSource pc)))
     ]
   where
     -- Paths are /project-root-relative/ — the invariant every downstream
@@ -603,6 +597,7 @@ scanProjectUnusedImportCells proj = do
           pyHere = sort [rel e | e <- entries, takeExtension e == ".py"]
       subdirs <-
         mapM (walk root . (dir </>))
-          =<< filterM (doesDirectoryExist . (dir </>))
+          =<< filterM
+            (doesDirectoryExist . (dir </>))
             [e | e <- entries, e `notElem` skipDirNames, takeExtension e /= ".py"]
       pure (pyHere ++ concat subdirs)

@@ -15,7 +15,6 @@ module Main (main) where
 import Baikai (Context, Response)
 import Data.Text (Text)
 import GHC.Generics (Generic)
-
 import Shikumi.Adapter (ToPrompt)
 import Shikumi.Combinator (ensemble, majorityVote, mapP, retry, validateRetry)
 import Shikumi.Module (predict)

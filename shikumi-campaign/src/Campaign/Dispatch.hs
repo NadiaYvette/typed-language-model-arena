@@ -1,7 +1,7 @@
+{-# LANGUAGE GHC2024 #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveAnyClass #-}
 {-# LANGUAGE DerivingStrategies #-}
-{-# LANGUAGE GHC2024 #-}
 {-# LANGUAGE OverloadedStrings #-}
 
 -- | The dispatch loop: the planner's plan lines become journaled work.
@@ -36,14 +36,13 @@ module Campaign.Dispatch
   )
 where
 
+import Campaign.Workflow (HumanVerdict (..), humanQueryStepName)
 import Data.Aeson (FromJSON, ToJSON)
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as T
 import Effectful (Eff, IOE, raise, (:>))
 import GHC.Generics (Generic)
-
-import Campaign.Workflow (HumanVerdict (..), humanQueryStepName)
 import Keiro.Workflow (StepName (..), Workflow, WorkflowId (..), step)
 import Keiro.Workflow.Awakeable (AwakeableId, awakeableNamed)
 import Keiro.Workflow.Resume (WorkflowDef (..), WorkflowRegistry)
@@ -136,7 +135,7 @@ planDispatchWorkflow ::
   -- | verify: re-run the real oracles the line names
   (DispatchAction -> Eff es Text) ->
   Eff es DispatchOutcome
-planDispatchWorkflow publishHumanQuery tag action execExecute execVerify =
+planDispatchWorkflow publishHumanQuery _tag action execExecute execVerify =
   case T.toLower (T.strip (daDispatch action)) of
     "execute" -> do
       result <- step (StepName "execute") (execExecute action)

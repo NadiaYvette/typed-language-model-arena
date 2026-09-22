@@ -43,7 +43,6 @@ import Effectful (Eff, IOE, liftIO, runEff, type (:>))
 import Effectful.Dispatch.Dynamic (interpret)
 import Effectful.Error.Static (runErrorNoCallStack)
 import GHC.Generics (Generic)
-
 import Shikumi.Adapter (ToPrompt)
 import Shikumi.Error (ShikumiError)
 import Shikumi.LLM (LLM (..))
@@ -78,12 +77,12 @@ answerEvents = streamEventsFor ["Hel", "lo"] markerBody
 
 streamEventsFor :: [Text] -> Text -> [AssistantMessageEvent]
 streamEventsFor deltas terminalText =
-  [ EventStart (StartPayload (AssistantMessage (emptyResponse ^. #message)) Nothing)
-  , TextStart (IndexPayload 0)
+  [ EventStart (StartPayload (AssistantMessage (emptyResponse ^. #message)) Nothing),
+    TextStart (IndexPayload 0)
   ]
     ++ [TextDelta (DeltaPayload 0 d) | d <- deltas]
-    ++ [ TextEnd (BlockEndPayload 0 (T.concat deltas))
-       , EventDone (doneTerminal Nothing Nothing Stop (AssistantMessage (payloadWith terminalText)))
+    ++ [ TextEnd (BlockEndPayload 0 (T.concat deltas)),
+         EventDone (doneTerminal Nothing Nothing Stop (AssistantMessage (payloadWith terminalText)))
        ]
   where
     payloadWith t =
@@ -98,8 +97,8 @@ terminalResponse evs =
 
 runStreamingStub :: [AssistantMessageEvent] -> Eff (LLM : es) a -> Eff es a
 runStreamingStub evs = interpret $ \_ -> \case
-  Complete _ _ _ -> pure (terminalResponse evs)
-  Stream _ _ _ -> pure evs
+  Complete {} -> pure (terminalResponse evs)
+  Stream {} -> pure evs
 
 main :: IO ()
 main = do

@@ -42,26 +42,23 @@ where
 
 import Data.Text (Text)
 import Data.Text qualified as T
+import Effectful.Error.Static (throwError)
 import GHC.Generics (Generic)
-
 import Shikumi.Adapter (ToPrompt)
 import Shikumi.Combinator ((>>>))
-import Shikumi.Eval (Metric, customMetric, mkScore, predictionPrimary)
 import Shikumi.Error (ShikumiError (..))
+import Shikumi.Eval (Metric, customMetric, mkScore, predictionPrimary)
 import Shikumi.Module (predict)
 import Shikumi.Program (Program, embed)
 import Shikumi.Schema (FromModel, ToSchema, Validatable (..))
 import Shikumi.Schema.Types (Field (..), unField)
 import Shikumi.Signature (Signature, mkSignature)
-
 import Toy.Fixer.Domain
   ( Diagnostic (..),
     Source (..),
     checkSource,
     sourceText,
   )
-
-import Effectful.Error.Static (throwError)
 
 -- ---------------------------------------------------------------------------
 -- The LM contract: diagnostics in, repaired source out
@@ -137,7 +134,7 @@ data FixResult = FixResult
 
 -- | 'fixSource' plus the report wrapper: one program over a corpus entry.
 fixAndReport :: Source -> Program DiagnosticsIn FixResult
-fixAndReport orig = fixSource orig >>> embed (\out -> pure (FixResult orig out))
+fixAndReport orig = fixSource orig >>> embed (pure . FixResult orig)
 
 -- | Score = (diagnostics before − diagnostics after) / diagnostics before,
 -- computed by the deterministic checker — never by an LM judge. A repair that

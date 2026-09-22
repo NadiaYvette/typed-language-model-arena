@@ -1,6 +1,5 @@
 {-# LANGUAGE GHC2024 #-}
 {-# LANGUAGE DeriveAnyClass #-}
-{-# LANGUAGE OverloadedStrings #-}
 
 -- | The one-cell campaign domain: what a verification cell is, and the
 -- deterministic checker that owns ground truth.
@@ -36,7 +35,6 @@ import Data.Text qualified as T
 import Data.UUID (UUID)
 import Data.UUID.V4 (nextRandom)
 import GHC.Generics (Generic)
-
 import Toy.Fixer.Domain (Source (..), SourcePath, checkSource, corpus, showDiagnostic)
 
 -- | A cell identifier: campaign-local, opaque.
@@ -66,8 +64,8 @@ data Cell = Cell
 corpusCells :: [Cell]
 corpusCells =
   [ Cell (CellId p) p orig broken
-    | (p, broken, _expected) <- corpus,
-      let orig = broken -- seeded broken; the original is the broken state
+  | (p, broken, _expected) <- corpus,
+    let orig = broken -- seeded broken; the original is the broken state
   ]
 
 -- | Look a cell up by id (corpus cells carry their path as their id).
@@ -93,7 +91,8 @@ cellIsClean = null . cellDiagnostics
 -- informed by — prompt provenance, replayable.
 data FixAttempt = FixAttempt
   { faAttempt :: !Int,
-    faSucceeded :: !Bool, -- ^ the no-regression guard accepted the repair
+    -- | the no-regression guard accepted the repair
+    faSucceeded :: !Bool,
     faDiagnosticsBefore :: ![Text],
     faDiagnosticsAfter :: ![Text],
     faRecallNotes :: ![Text],

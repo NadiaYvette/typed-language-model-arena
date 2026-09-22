@@ -1,5 +1,5 @@
-{-# LANGUAGE BlockArguments #-}
 {-# LANGUAGE GHC2024 #-}
+{-# LANGUAGE BlockArguments #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 
@@ -52,19 +52,171 @@ module Main
   )
 where
 
+-- help-check: the paced compiler build
+
+import Baikai (Context (..), Message (..), Response, TextContent (..), UserContent (..))
+import Baikai.Message (UserPayload (UserPayload))
+import Campaign.Aggregate (CellSummary (..), CellVertex (..), cellSummaryOf, replayCellJournal)
+import Campaign.Attestation (journalRefText)
+import Campaign.Bootstrap
+  ( bootstrapCampaignStore,
+    bootstrapStore,
+    ccDbname,
+    ccPassword,
+    createDatabaseIfAbsent,
+    defaultCampaignConn,
+    dropDatabase,
+    ownedServerAlive,
+    ownedServerConn,
+    ownedServerStateDir,
+    parseCampaignConn,
+    renderCampaignConn,
+    scratchConnFor,
+    sentinelRelation,
+    serverAnswers,
+    stopOwnedServer,
+    storeWorkflowCount,
+  )
+import Campaign.Cell (Cell (..), CellId (..), FixAttempt (..), cellForId, corpusCells, unCellId)
+import Campaign.Dispatch
+  ( DispatchAction (..),
+    dispatchActionOfPlanLine,
+    dispatchRegistry,
+    dispatchWorkflowIdTagged,
+    dispatchWorkflowName,
+    planDispatchWorkflow,
+  )
+import Campaign.Fanout (runCellFanout)
+import Campaign.Hands
+  ( appPhaseBranchFor,
+    campaignBranchFor,
+    campaignWorktreePath,
+    ensureCampaignWorktree,
+    gitCapture,
+    git_,
+    parentDirtyCount,
+  )
+import Campaign.Landing
+  ( LandingRecord (..),
+    landProjectCellWorkflow,
+    landingRecordOf,
+    landingWorkflowId,
+    landingWorkflowIdFor,
+    landingWorkflowName,
+  )
+import Campaign.Matrix
+  ( ArchName (..),
+    ConfigName (..),
+    MatrixAttempt (..),
+    TriageIn (..),
+    TriageOut (..),
+    matrixAttemptsOf,
+    matrixCellId,
+    matrixCellSpecs,
+    matrixCellWorkflow,
+    matrixRegistry,
+    matrixWorkflowIdTagged,
+    matrixWorkflowName,
+    mkMatrixCell,
+  )
+import Campaign.Memory
+  ( campaignAccessContext,
+    campaignInfraNamespace,
+    campaignMemorySpace,
+    campaignNamespace,
+    completeFixSession,
+    projectNamespace,
+    recallNotes,
+    recallNotesForKeyword,
+    recordFixTurn,
+    recordGlobalLesson,
+    recordGlobalLessonSuperseding,
+    recordLesson,
+    startFixSession,
+    startInfraSession,
+  )
+import Campaign.Mercury
+  ( HelpCheckVerdict (..),
+    HelpStageVerdict (..),
+    MercuryAttempt (..),
+    MercuryCell (..),
+    MercuryEngine,
+    MercuryFact (..),
+    OracleVerdict (..),
+    helpCheckCellFor,
+    helpCheckRegistry,
+    helpCheckWorkflowIdTagged,
+    helpCheckWorkflowName,
+    installedHelpCheckProbe,
+    mercuryAttemptsOf,
+    mercuryCellSpecs,
+    mercuryCellWorkflow,
+    mercuryHelpCheckWorkflow,
+    mercuryIntegrationTag,
+    mercuryOptionsPath,
+    mercuryPrivCount,
+    mercuryPromotionBranches,
+    mercuryRegistry,
+    mercuryScriptedEngine,
+    mercuryWorkflowIdTagged,
+    mercuryWorkflowName,
+    mercuryWorktreeFor,
+    oracleDumpProbe,
+    oracleFactProbe,
+    readMercuryFacts,
+  )
+import Campaign.Oracle
+  ( CellOracle (..),
+    ProjectCell (..),
+    RepairRules (..),
+    diagLineOf,
+    markerOracle,
+    projectCellSpecs,
+    readProjectCell,
+    repairRulesFor,
+    scanProjectUnusedImportCells,
+    unusedImportOracle,
+  )
+import Campaign.ReactFixer (reactEngineFor, scriptedReactEngine)
+import Campaign.Real
+import Campaign.RepairReceipt (loadRepairReceipt)
+import Campaign.Review
+  ( ApprovalOutcome (..),
+    ReviewBranch (..),
+    approveBranch,
+    journalRefFor,
+    listReviewBranches,
+    rejectBranch,
+  )
+import Campaign.Workflow
+  ( AttemptEngine,
+    EngineFor,
+    HumanVerdict (..),
+    campaignRegistry,
+    campaignStreamNameText,
+    campaignWorkflowId,
+    cellCampaignWorkflow,
+    cellCampaignWorkflowName,
+    defaultMaxAttempts,
+    projectCampaignWorkflowName,
+    projectWorkflowId,
+    stubEngine,
+  )
 import Control.Applicative ((<|>))
-import Control.Monad (filterM, foldM_, forM, forM_, unless, when)
-import Data.List (find, groupBy, nub, partition, sort, sortOn)
-import Data.Maybe (mapMaybe)
-import Data.Map.Strict qualified as Map
+import Control.Concurrent.Async (mapConcurrently)
+import Control.Exception (SomeException, try)
+import Control.Monad (filterM, foldM_, forM, forM_, unless, void, when)
+import Data.Aeson ()
 import Data.Aeson qualified as Aeson
 import Data.Aeson.Key qualified as Key
 import Data.Aeson.KeyMap qualified as KeyMap
 import Data.ByteString.Lazy qualified as BL
+import Data.Either (isRight, lefts, rights)
 import Data.Foldable (for_, traverse_)
 import Data.IORef (atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
-import Data.Maybe (catMaybes, isJust)
-import Data.Either (isRight)
+import Data.List (find, groupBy, nub, partition, sort, sortOn)
+import Data.Map.Strict qualified as Map
+import Data.Maybe (catMaybes, fromMaybe, isJust, listToMaybe, mapMaybe)
 import Data.Set qualified as SSet
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -72,11 +224,12 @@ import Data.Text.IO qualified as TIO
 import Data.Time.Clock (addUTCTime, getCurrentTime)
 import Data.Time.Clock.POSIX (utcTimeToPOSIXSeconds)
 import Data.Vector qualified as Vector
-import Control.Concurrent.Async (mapConcurrently)
 import Effectful (Eff, IOE, UnliftStrategy (..), liftIO, raise, runEff, withEffToIO)
 import Effectful.Error.Static (Error, runErrorNoCallStack)
+import GHC.Generics (Generic)
 import Keiro.Codec (decodeRecorded)
 import Keiro.Connection (keiroConnectionSettings)
+import Keiro.Timer (TimerRow (..), deadLetterTimer)
 import Keiro.Workflow
   ( WorkflowId (..),
     WorkflowJournalEvent (..),
@@ -97,8 +250,25 @@ import Keiro.Workflow.Resume
     resumeWorkflowsOnce,
   )
 import Keiro.Workflow.Sleep (drainWorkflowSleepTimers, runWorkflowTimerWorker)
-import Keiro.Timer (TimerRow (..), deadLetterTimer)
+import Kioku.AI.Config (AIExecutionError (..), AIFeature (..))
+import Kioku.AI.File (loadAIRuntime)
+import Kioku.AI.Runtime (AIRuntime, runAIProgram)
 import Kioku.Api.Scope (MemoryScope (..), Namespace)
+import Kioku.Distill.Consolidate (ConsolidateInput, ConsolidationDecision, consolidateProgram)
+import Kioku.Distill.Extract
+  ( ExtractInput (..),
+    ExtractOutput (..),
+    ExtractedAtom (..),
+    extractSignature,
+  )
+import Kioku.Distill.L1 (L1Outcome (..), L1RunMode (..), L1Summary (..), distillSessionL1, scopedScanCandidates)
+import Kioku.Distill.L2 (SceneRow (..), regenerateScene)
+import Kioku.Distill.L3 (PersonaRow (..), regeneratePersona)
+import Kioku.Distill.Persona (PersonaInput (..), PersonaOutput (..), personaSignature)
+import Kioku.Distill.Runtime (TestRunners (..), newDistillRuntime, withDistillWorkspace, withTestRunners)
+import Kioku.Distill.Scene (SceneInput (..), SceneOutput (..), sceneSignature)
+import Kioku.Id (SessionId, parseId)
+import Kioku.ReadModel (registerKiokuReadModels)
 import Kiroku.Store qualified as Store
 import Kiroku.Store.Connection (ConnectionSettings)
 import Kiroku.Store.Effect (Store, runStoreResource)
@@ -110,206 +280,23 @@ import Kiroku.Store.Types
     StreamName (..),
     StreamVersion (..),
   )
-import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesFileExist, removeFile)
-import System.Environment (lookupEnv)
-import Data.Maybe (fromMaybe, listToMaybe)
-import Text.Read (readMaybe)
-
-import Campaign.Bootstrap
-  ( bootstrapCampaignStore
-  , bootstrapStore
-  , ccDbname
-  , ccPassword
-  , createDatabaseIfAbsent
-  , defaultCampaignConn
-  , parseCampaignConn
-  , dropDatabase
-  , ownedServerAlive
-  , ownedServerConn
-  , ownedServerStateDir
-  , renderCampaignConn
-  , scratchConnFor
-  , sentinelRelation
-  , stopOwnedServer
-  , serverAnswers
-  , storeWorkflowCount
-  )
-import System.Exit (ExitCode (..), exitFailure, exitSuccess)
-import Control.Exception (try, SomeException)
-import System.IO (hClose, hPutStrLn, openTempFile, stderr)
-
-import Kioku.AI.Config (AIExecutionError (..), AIFeature (..))
-import Kioku.AI.File (loadAIRuntime)
-import Kioku.AI.Runtime (AIRuntime, runAIProgram)
-import Kioku.Distill.Consolidate (ConsolidateInput, ConsolidationDecision, consolidateProgram)
-import Kioku.Distill.Extract
-  ( ExtractInput (..),
-    ExtractOutput (..),
-    ExtractedAtom (..),
-    extractSignature,
-  )
-import Kioku.Distill.L1 (L1Outcome (..), L1RunMode (..), L1Summary (..), distillSessionL1, scopedScanCandidates)
-import Kioku.Id (parseId)
-import Kioku.Distill.L2 (SceneRow (..), regenerateScene)
-import Kioku.Distill.L3 (PersonaRow (..), regeneratePersona)
-import Kioku.Distill.Persona (PersonaInput (..), PersonaOutput (..), personaSignature)
-import Kioku.Distill.Runtime (TestRunners (..), newDistillRuntime, withDistillWorkspace, withTestRunners)
-import Kioku.Distill.Scene (SceneInput (..), SceneOutput (..), sceneSignature)
-import Kioku.Id (SessionId)
-import Kioku.ReadModel (registerKiokuReadModels)
 import Shikumi.Adapter (ToPrompt)
+import Shikumi.Coder.Pipeline (ProposeIn (..))
+import Shikumi.Coder.Task (PatchPlan (..))
 import Shikumi.Error (ShikumiError (..))
 import Shikumi.Module (predict)
 import Shikumi.Program (Program)
 import Shikumi.Schema (FromModel, ToSchema, Validatable)
 import Shikumi.Schema.Types (Field (Field, unField), field)
 import Shikumi.Signature (Demo (..), Signature, getInstruction, mkSignature, setDemos, setInstruction)
-import Shikumi.Coder.Pipeline (ProposeIn (..))
-import Shikumi.Coder.Task (PatchPlan (..))
-
-import Campaign.Aggregate (CellSummary (..), CellVertex (..), cellSummaryOf, replayCellJournal)
-import Campaign.Cell (Cell (..), CellId (..), FixAttempt (..), corpusCells, cellForId, unCellId)
-import Campaign.Fanout (runCellFanout)
-import Campaign.Hands
-  ( appPhaseBranchFor,
-    campaignBranchFor,
-    campaignWorktreePath,
-    ensureCampaignWorktree,
-    gitCapture,
-    git_,
-    parentDirtyCount,
-  )
-import Campaign.Landing
-  ( LandingRecord (..),
-    landProjectCellWorkflow,
-    landingRecordOf,
-    landingWorkflowId,
-    landingWorkflowIdFor,
-    landingWorkflowName,
-  )
-import Campaign.Memory
-  ( campaignAccessContext,
-    campaignInfraNamespace,
-    campaignMemorySpace,
-    campaignNamespace,
-    completeFixSession,
-    projectNamespace,
-    recallNotes,
-    recallNotesForKeyword,
-    recordFixTurn,
-    recordGlobalLesson,
-    recordGlobalLessonSuperseding,
-    recordLesson,
-    startFixSession,
-    startInfraSession,
-  )
-import Campaign.Matrix
-  ( ArchName (..),
-    ConfigName (..),
-    MatrixAttempt (..),
-    TriageIn (..),
-    TriageOut (..),
-    matrixAttemptsOf,
-    matrixCellFromWf,
-    matrixCellId,
-    matrixCellSpecs,
-    matrixCellWorkflow,
-    matrixRegistry,
-    matrixWorkflowIdTagged,
-    matrixWorkflowName,
-    mkMatrixCell,
-  )
-import Campaign.Dispatch
-  ( DispatchAction (..),
-    dispatchActionOfPlanLine,
-    dispatchRegistry,
-    dispatchWorkflowIdTagged,
-    dispatchWorkflowName,
-    planDispatchWorkflow,
-  )
-import Campaign.Mercury
-  ( MercuryAttempt (..),
-    MercuryCell (..),
-    MercuryEngine,
-    MercuryFact (..),
-    mercuryAttemptsOf,
-    mercuryCellFor,
-    mercuryCellSpecs,
-    mercuryCellWorkflow,
-    mercuryCellKeyFromWf,
-    mercuryOptionsPath,
-    mercuryPrivCount,
-    mercuryRegistry,
-    mercuryScriptedEngine,
-    mercuryWorkflowIdTagged,
-    mercuryWorkflowName,
-    OracleVerdict (..),
-    oracleDumpProbe,
-    oracleFactProbe,
-    readMercuryFacts,
-    -- help-check: the paced compiler build
-    HelpCheckCell (..),
-    HelpCheckVerdict (..),
-    helpCheckBranchFor,
-    helpCheckCellFor,
-    helpCheckCellKeyFromWf,
-    helpCheckProbe,
-    helpCheckRegistry,
-    helpCheckWorkflowIdTagged,
-    HelpStageVerdict (..),
-    helpCheckWorkflowName,
-    installedHelpCheckProbe,
-    mercuryBootstrapStages,
-    mercuryHelpCheckWorkflow,
-    mercuryIntegrationTag,
-    mercuryPromotionBranches,
-    mercuryWorktreeFor,
-  )
-import Baikai (Context (..), Message (..), Response, TextContent (..), UserContent (..))
-import Baikai.Message (UserPayload (UserPayload))
-import Campaign.Oracle
-  ( CellOracle (..),
-    ProjectCell (..),
-    RepairRules (..),
-    diagLineOf,
-    markerOracle,
-    projectCellSpecs,
-    readProjectCell,
-    repairRulesFor,
-    scanProjectUnusedImportCells,
-    unusedImportOracle,
-  )
-import Campaign.Review
-  ( ApprovalOutcome (..),
-    ReviewBranch (..),
-    approveBranch,
-    journalRefFor,
-    listReviewBranches,
-    rejectBranch,
-  )
-import Campaign.RepairReceipt (loadRepairReceipt)
-import Campaign.Attestation (journalRefText)
-import Campaign.Real
-import Campaign.ReactFixer (reactEngineFor, scriptedReactEngine)
-import Campaign.Workflow
-  ( AttemptEngine,
-    EngineFor,
-    HumanVerdict (..),
-    campaignRegistry,
-    campaignStreamNameText,
-    campaignWorkflowId,
-    cellCampaignWorkflow,
-    cellCampaignWorkflowName,
-    defaultMaxAttempts,
-    projectCampaignWorkflowName,
-    projectWorkflowId,
-    stubEngine,
-  )
 import Shikumi.Testing (markerResponse)
+import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesFileExist, removeFile)
+import System.Environment (lookupEnv)
+import System.Exit (ExitCode (..), exitFailure, exitSuccess)
+import System.IO (hClose, hPutStrLn, openTempFile, stderr)
+import Text.Read (readMaybe)
 import Toy.Fixer.Domain (Source (..), sourceText)
 import Toy.Fixer.Program (RepairOut (..))
-import GHC.Generics (Generic)
-import Data.Aeson ()
 
 main :: IO ()
 main = do
@@ -495,7 +482,7 @@ evidenceOperatorMode target = do
 reviewOperatorMode :: String -> IO ()
 reviewOperatorMode mode = do
   mproj <- lookupEnv "CAMPAIGN_APP_PROJECT"
-  let proj = maybe "mowgli" T.strip (T.pack <$> mproj)
+  let proj = maybe "mowgli" (T.strip . T.pack) mproj
   case mode of
     "list" -> do
       branches <- listReviewBranches proj
@@ -510,8 +497,10 @@ reviewOperatorMode mode = do
               mapM_
                 ( \b ->
                     putStrLn
-                      ( "  " <> T.unpack (rbBranch b)
-                          <> "  +" <> show (rbCommitsAhead b)
+                      ( "  "
+                          <> T.unpack (rbBranch b)
+                          <> "  +"
+                          <> show (rbCommitsAhead b)
                           <> (if rbMerged b then "  [merged — safe to prune]" else "  [open]")
                       )
                 )
@@ -519,7 +508,7 @@ reviewOperatorMode mode = do
     _ -> do
       mbranch <- lookupEnv "CAMPAIGN_REVIEW_BRANCH"
       branch <- maybe (fail ("REVIEW=" <> mode <> " needs CAMPAIGN_REVIEW_BRANCH=campaign/<run>")) (pure . T.strip . T.pack) mbranch
-      when (not ("campaign/" `T.isPrefixOf` branch)) $
+      unless ("campaign/" `T.isPrefixOf` branch) $
         fail ("CAMPAIGN_REVIEW_BRANCH must be a campaign/<run> branch, got: " <> T.unpack branch)
       case mode of
         "approve" -> reviewApprove proj branch
@@ -539,19 +528,19 @@ reviewApprove proj branch = do
   rcs <- case mrcpts of
     Nothing -> pure Nothing
     Just spec -> do
-      let paths = filter (not . null) . map T.unpack . map T.strip . T.splitOn "," $ T.pack spec
+      let paths = filter (not . null) . map (T.unpack . T.strip) . T.splitOn "," $ T.pack spec
       loaded <- forM paths $ \p -> do
         e <- loadRepairReceipt p
         case e of
           Left err -> pure (Left (p <> ": " <> T.unpack err))
           Right rc -> pure (Right rc)
-      let errs = [e | Left e <- loaded]
+      let errs = lefts loaded
       case errs of
-        [] -> pure (Just [rc | Right rc <- loaded])
+        [] -> pure (Just (rights loaded))
         es -> fail $ "[review] receipt(s) failed to load:\n  " <> unlines es
   outcome <- approveBranch unusedImportOracle rcs proj branch
   mapM_
-    ( \d -> TIO.putStrLn ("  [gate] " <> d) )
+    (\d -> TIO.putStrLn ("  [gate] " <> d))
     (aoDiagnostics outcome)
   if T.null (aoMergeCommit outcome)
     then do
@@ -559,9 +548,13 @@ reviewApprove proj branch = do
       exitFailure
     else do
       putStrLn
-        ( "[review] " <> T.unpack branch <> " merged as "
+        ( "[review] "
+            <> T.unpack branch
+            <> " merged as "
             <> T.unpack (aoMergeCommit outcome)
-            <> " (" <> show (length (aoFiles outcome)) <> " file(s), re-verified clean before merge)"
+            <> " ("
+            <> show (length (aoFiles outcome))
+            <> " file(s), re-verified clean before merge)"
         )
       mapM_ (TIO.putStrLn . ("    " <>)) (aoFiles outcome)
       let attLine =
@@ -610,7 +603,7 @@ reviewReject proj branch = do
   putStrLn ("[review] " <> T.unpack branch <> " rejected — branch and worktree removed")
   mreason <- lookupEnv "CAMPAIGN_REVIEW_REASON"
   journalVerdict proj branch "reject" $
-    maybe "(no reason given)" T.strip (T.pack <$> mreason)
+    maybe "(no reason given)" (T.strip . T.pack) mreason
 
 -- | The verdict, journaled: one fix session named for the verdict, its
 -- turns the operator's actions. Kioku's distillers can promote these the
@@ -646,7 +639,8 @@ reviewBackfillMode = do
     sid <- runKiokuWrite store (startFixSession (reviewNamespace proj) ("review " <> branch))
     _ <- runKiokuWrite store (recordFixTurn sid 1 "user" "operator verdict: approve")
     _ <-
-      runKiokuWrite store
+      runKiokuWrite
+        store
         ( recordFixTurn
             sid
             2
@@ -654,7 +648,8 @@ reviewBackfillMode = do
             ( T.unlines
                 [ "merged as 408a879",
                   "generate_data.py",
-                  "Backfilled: the verdict was carried out live (merge 408a879 on main, branch retired) but its journaling crashed on the namespace slash before the fix; this session records it for the distiller."]
+                  "Backfilled: the verdict was carried out live (merge 408a879 on main, branch retired) but its journaling crashed on the namespace slash before the fix; this session records it for the distiller."
+                ]
             )
         )
     _ <- runKiokuWrite store (completeFixSession sid "verdict approve: merged as 408a879 (backfilled)")
@@ -714,12 +709,14 @@ reviewDistillMode = do
         objAt k v = case v of
           Aeson.Object o -> KeyMap.lookup (Key.fromText k) o
           _ -> Nothing
-        -- Vector.toList is $all-forward (oldest first), so the verdicts
-        -- arrive in verdict order with no extra sort.
+    -- Vector.toList is $all-forward (oldest first), so the verdicts
+    -- arrive in verdict order with no extra sort.
     putStrLn
-      ( "[review] " <> show (length [() | ev <- Vector.toList events, EventType et <- [ev.eventType], et == "SessionStarted"]) 
+      ( "[review] "
+          <> show (length [() | ev <- Vector.toList events, EventType et <- [ev.eventType], et == "SessionStarted"])
           <> " session event(s) in the journal, "
-          <> show (length verdictSessions) <> " verdict session(s) to distill"
+          <> show (length verdictSessions)
+          <> " verdict session(s) to distill"
       )
     for_ verdictSessions $ \(sidText, focus) ->
       case parseId sidText of
@@ -745,11 +742,17 @@ reviewDistillMode = do
               putStrLn ("  up-to-date: " <> T.unpack focus)
             Right (Right (L1Distilled summary)) ->
               putStrLn
-                ( "  distilled " <> T.unpack focus <> ": "
-                    <> show summary.extracted <> " extracted, "
-                    <> show summary.stored <> " stored, "
-                    <> show summary.merged <> " merged, "
-                    <> show summary.skipped <> " skipped"
+                ( "  distilled "
+                    <> T.unpack focus
+                    <> ": "
+                    <> show summary.extracted
+                    <> " extracted, "
+                    <> show summary.stored
+                    <> " stored, "
+                    <> show summary.merged
+                    <> " merged, "
+                    <> show summary.skipped
+                    <> " skipped"
                 )
     -- The proof: what memory now holds about reviews.
     for_ ["mowgli", "tessera.third_party.sail", "tessera.third_party.islaris", "tessera.third_party.sail-x86-from-acl2"] $ \ns -> do
@@ -832,11 +835,14 @@ withCampaignStore :: (CampaignStore -> IO ()) -> IO ()
 withCampaignStore action = do
   conn <- defaultCampaignConn
   applied <- bootstrapCampaignStore conn
-  hPutStrLn stderr
+  hPutStrLn
+    stderr
     ( if applied == 0
         then "[bootstrap] store current (schema present, nothing to apply)"
         else
-          "[bootstrap] applied " <> show applied <> " migration file(s) to "
+          "[bootstrap] applied "
+            <> show applied
+            <> " migration file(s) to "
             <> T.unpack (renderCampaignConn conn)
     )
   withCampaignStoreAt (renderCampaignConn conn) action
@@ -857,7 +863,7 @@ readJournal store streamName = do
 
 decodedJournal :: [RecordedEvent] -> [WorkflowJournalEvent]
 decodedJournal events =
-  [event | Right event <- decodeRecorded workflowJournalCodec <$> events]
+  rights (decodeRecorded workflowJournalCodec <$> events)
 
 printJournal :: [RecordedEvent] -> IO ()
 printJournal = traverse_ printOne
@@ -871,7 +877,7 @@ printJournal = traverse_ printOne
             StepRecorded name result _ ->
               TIO.putStrLn (name <> "  " <> briefValue result)
             other ->
-              putStrLn (show other)
+              print other
 
 -- | Crude JSON summariser so the journal dump stays readable.
 briefValue :: Aeson.Value -> Text
@@ -957,8 +963,8 @@ cleanupStaleWorkflows = withCampaignStore $ \store -> do
           && ("sail" `T.isInfixOf` wid || "tessera" `T.isInfixOf` wid)
       discoveredStale = filter isSailUnit pairs
       knownOrphaned =
-        [ (unWorkflowName' projectCampaignWorkflowName, "pcell-app-app1789643209-sail-x86-from-acl2:translator/validation/automation/analyseOutput.py")
-        , (unWorkflowName' projectCampaignWorkflowName, "pcell-app-app1789652435-tessera/third_party/sail:test/lexing/run_tests.py")
+        [ (unWorkflowName' projectCampaignWorkflowName, "pcell-app-app1789643209-sail-x86-from-acl2:translator/validation/automation/analyseOutput.py"),
+          (unWorkflowName' projectCampaignWorkflowName, "pcell-app-app1789652435-tessera/third_party/sail:test/lexing/run_tests.py")
         ]
       allTargets = nub (discoveredStale ++ knownOrphaned)
   if null allTargets
@@ -1133,9 +1139,9 @@ runEscalationAct = do
               if aid `elem` published
                 then (published, False)
                 else (published <> [aid], True)
-        when inserted $
-          liftIO $
-            putStrLn ("  published human-query awakeable id: " <> T.unpack (awakeableIdText aid))
+        when inserted
+          $ liftIO
+          $ putStrLn ("  published human-query awakeable id: " <> T.unpack (awakeableIdText aid))
       registry = campaignRegistry [] [] (\_o _c -> stubEngine confused) publishHumanQuery
 
   withCampaignStore $ \store -> do
@@ -1267,8 +1273,9 @@ runMemoryAct = do
     putStrLn ("[memory] journal for " <> T.unpack stream <> ":")
     printJournal journal
     case attempts of
-      [fa] | fa.faAttempt == 1 && fa.faSucceeded ->
-        putStrLn "  first-try fix: ONE journaled attempt, informed by recalled memory, cleared the cell"
+      [fa]
+        | fa.faAttempt == 1 && fa.faSucceeded ->
+            putStrLn "  first-try fix: ONE journaled attempt, informed by recalled memory, cleared the cell"
       _ -> fail ("expected exactly one successful attempt, got " <> show attempts)
 
   putStrLn "[memory] --- simulated restart: re-opening the store ---"
@@ -1299,9 +1306,12 @@ runSessionAct = do
     for_ (zip [1 ..] attempts) \(idx, fa) -> do
       let diagLine = T.intercalate " | " (fa.faDiagnosticsAfter)
           turn =
-            "attempt " <> T.pack (show fa.faAttempt)
-              <> ": diagnostics before: " <> T.intercalate " | " (fa.faDiagnosticsBefore)
-              <> "; after: " <> (if T.null diagLine then "(clean)" else diagLine)
+            "attempt "
+              <> T.pack (show fa.faAttempt)
+              <> ": diagnostics before: "
+              <> T.intercalate " | " (fa.faDiagnosticsBefore)
+              <> "; after: "
+              <> (if T.null diagLine then "(clean)" else diagLine)
               <> maybe "" (\r -> "; repair: " <> T.take 60 r) fa.faRepaired
       _ <- runKiokuWrite store (recordFixTurn sid idx "assistant" turn)
       putStrLn ("  turn " <> show idx <> " recorded")
@@ -1348,30 +1358,30 @@ campaignAIConfigJSON = do
       (Just b, _) -> T.pack b
       (_, Just b) -> T.pack b
       _ -> "http://localhost:20128/v1"
-  pure $
-    Aeson.encode $
-      Aeson.object
-        [ "version" Aeson..= (1 :: Int),
-          "permissions" Aeson..= ["api" :: Text],
-          "distillation"
-            Aeson..= Aeson.object
-              [ "mode" Aeson..= ("api" :: Text),
-                "api" Aeson..= ("openai-chat-completions" :: Text),
-                "model" Aeson..= modelId,
-                -- "openai" is the wire protocol (baikai's provider registry key),
-                -- and it is what shikumi's capabilityFor checks to stamp the
-                -- strict JSON schema — OmniRoute is an OpenAI-compatible proxy,
-                -- so the native-schema path is exactly right here.
-                "provider" Aeson..= ("openai" :: Text),
-                "baseUrl" Aeson..= baseUrl,
-                "options"
-                  Aeson..= Aeson.object
-                    [ "apiKeyEnv" Aeson..= keyEnv,
-                      "maxTokens" Aeson..= (16384 :: Int),
-                      "timeoutMs" Aeson..= (120000 :: Int)
-                    ]
-              ]
-        ]
+  pure
+    $ Aeson.encode
+    $ Aeson.object
+      [ "version" Aeson..= (1 :: Int),
+        "permissions" Aeson..= ["api" :: Text],
+        "distillation"
+          Aeson..= Aeson.object
+            [ "mode" Aeson..= ("api" :: Text),
+              "api" Aeson..= ("openai-chat-completions" :: Text),
+              "model" Aeson..= modelId,
+              -- "openai" is the wire protocol (baikai's provider registry key),
+              -- and it is what shikumi's capabilityFor checks to stamp the
+              -- strict JSON schema — OmniRoute is an OpenAI-compatible proxy,
+              -- so the native-schema path is exactly right here.
+              "provider" Aeson..= ("openai" :: Text),
+              "baseUrl" Aeson..= baseUrl,
+              "options"
+                Aeson..= Aeson.object
+                  [ "apiKeyEnv" Aeson..= keyEnv,
+                    "maxTokens" Aeson..= (16384 :: Int),
+                    "timeoutMs" Aeson..= (120000 :: Int)
+                  ]
+            ]
+      ]
 
 -- | A shape contract for the extractor, worked as a demonstration: the model
 -- must reply with @atoms@ as a JSON array of /objects/ (the four named fields),
@@ -1393,28 +1403,29 @@ shapeInstruction =
        \to retain, reply with an empty array."
 
 shapeDemo :: Demo ExtractInput ExtractOutput
-shapeDemo = Demo
-  { input =
-      ExtractInput
-        { focus = field "fix cell alpha.py",
-          scopeLabel = field "cell alpha.py (verification campaign)",
-          conversation =
-            field
-              "attempt 1: diagnostics before: [W-todo] found a TODO marker; \
-               \after: (clean); repair: the TODO line was deleted entirely"
-        },
-    output =
-      ExtractOutput
-        { atoms =
-            [ ExtractedAtom
-                { atomType = field "pattern",
-                  content = field "the fixer deletes TODO lines entirely once diagnostics confirm the marker",
-                  priority = field (60 :: Int),
-                  confidence = field "medium"
-                }
-            ]
-        }
-  }
+shapeDemo =
+  Demo
+    { input =
+        ExtractInput
+          { focus = field "fix cell alpha.py",
+            scopeLabel = field "cell alpha.py (verification campaign)",
+            conversation =
+              field
+                "attempt 1: diagnostics before: [W-todo] found a TODO marker; \
+                \after: (clean); repair: the TODO line was deleted entirely"
+          },
+      output =
+        ExtractOutput
+          { atoms =
+              [ ExtractedAtom
+                  { atomType = field "pattern",
+                    content = field "the fixer deletes TODO lines entirely once diagnostics confirm the marker",
+                    priority = field (60 :: Int),
+                    confidence = field "medium"
+                  }
+              ]
+          }
+    }
 
 shapeProgram :: Program ExtractInput ExtractOutput
 shapeProgram = predict (setDemos [shapeDemo] (setInstruction shapeInstruction extractSignature))
@@ -1529,10 +1540,15 @@ runDistillAct sid = do
           putStrLn "  distiller: session already up to date — no new turns since the last pass"
         Right (L1Distilled summary) ->
           putStrLn
-            ( "  distilled: " <> show summary.extracted <> " candidate(s) extracted, "
-                <> show summary.stored <> " stored, "
-                <> show summary.merged <> " merged, "
-                <> show summary.skipped <> " skipped"
+            ( "  distilled: "
+                <> show summary.extracted
+                <> " candidate(s) extracted, "
+                <> show summary.stored
+                <> " stored, "
+                <> show summary.merged
+                <> " merged, "
+                <> show summary.skipped
+                <> " skipped"
             )
 
     -- The proof: the same read the workflow uses now returns the
@@ -1711,7 +1727,8 @@ printCellScoreboard store _registry rows =
           | cleared = "cleared"
           | otherwise = "closed without clearing"
     TIO.putStrLn
-      ( "  " <> label
+      ( "  "
+          <> label
           <> ": "
           <> (if ok then "complete" else "INCOMPLETE")
           <> ", "
@@ -1723,7 +1740,7 @@ printCellScoreboard store _registry rows =
 -- | The campaign's AI runtime, generated from the OmniRoute environment (see
 -- act 5 for the config discipline). Shared by acts 5 and 8.
 withLoadedAIRuntime :: (AIRuntime -> IO ()) -> IO ()
-withLoadedAIRuntime action = withAIRuntime (\air -> action air >> pure ())
+withLoadedAIRuntime action = withAIRuntime (void . action)
 
 -- | The same runtime, for blocks that produce a value (act 17's planner and
 -- persona distillation both need the result, not just the effect).
@@ -1829,10 +1846,13 @@ runProjectFleetAct = do
   -- Each project's campaign memory is seeded with the lesson its diagnostics
   -- call for (as a real campaign would have learned from earlier runs), so
   -- the fleet's attempts carry recalled-memory provenance like the toy fleet.
-  for_ [("mowgli", "an unused import must have its whole import line deleted"), ("peirce", "delete the whole import line flagged unused; never leave a stub")
-       ] $ \(proj, advice) ->
-    withCampaignStore $ \store ->
-      runKiokuWrite store (recordLesson (projectNamespace proj) (proj <> "/imports") advice)
+  for_
+    [ ("mowgli", "an unused import must have its whole import line deleted"),
+      ("peirce", "delete the whole import line flagged unused; never leave a stub")
+    ]
+    $ \(proj, advice) ->
+      withCampaignStore $ \store ->
+        runKiokuWrite store (recordLesson (projectNamespace proj) (proj <> "/imports") advice)
 
   putStrLn ("[projects] launching " <> show (length specs) <> " cells concurrently")
   launchCells specs honestEngineFor
@@ -1885,10 +1905,11 @@ runL2L3Act = do
   withLoadedAIRuntime $ \air -> do
     let mirrorRoot = "/tmp/campaign-mirrors"
         distillRT =
-          withDistillWorkspace mirrorRoot
+          withDistillWorkspace
+            mirrorRoot
             ( withTestRunners
                 (newDistillRuntime air Nothing)
-                (\tr -> tr{runScene = campaignSceneRunner air, runPersona = campaignPersonaRunner air})
+                (\tr -> tr {runScene = campaignSceneRunner air, runPersona = campaignPersonaRunner air})
             )
     for_ ["mowgli", "peirce"] $ \proj -> do
       let ns = projectNamespace proj
@@ -1901,8 +1922,11 @@ runL2L3Act = do
           Right (Just row) -> do
             TIO.putStrLn ("  [" <> proj <> "] scene: " <> row.title)
             putStrLn
-              ( "    body: " <> show (T.length row.bodyMd) <> " chars, "
-                  <> show (length row.atomIds) <> " atom(s) distilled"
+              ( "    body: "
+                  <> show (T.length row.bodyMd)
+                  <> " chars, "
+                  <> show (length row.atomIds)
+                  <> " atom(s) distilled"
               )
         personaR <- requireEither =<< runCampaignStore store (regeneratePersona distillRT campaignMemorySpace gscope)
         case personaR of
@@ -1910,8 +1934,13 @@ runL2L3Act = do
           Right Nothing -> putStrLn ("  [" <> T.unpack proj <> "] persona: no scenes to distill")
           Right (Just prow) ->
             putStrLn
-              ( "  [" <> T.unpack proj <> "] persona: " <> show prow.sceneCount <> " scene(s), "
-                  <> show (T.length prow.bodyMd) <> " chars of markdown"
+              ( "  ["
+                  <> T.unpack proj
+                  <> "] persona: "
+                  <> show prow.sceneCount
+                  <> " scene(s), "
+                  <> show (T.length prow.bodyMd)
+                  <> " chars of markdown"
               )
       putStrLn ("    (mirrors under " <> mirrorRoot <> ")")
 
@@ -2080,10 +2109,11 @@ runPlannerAct = do
           ns -> T.unlines ns
     withLoadedAIRuntime $ \air -> do
       let distillRT =
-            withDistillWorkspace "/tmp/campaign-mirrors"
+            withDistillWorkspace
+              "/tmp/campaign-mirrors"
               ( withTestRunners
                   (newDistillRuntime air Nothing)
-                  (\tr -> tr{runScene = campaignSceneRunner air, runPersona = campaignPersonaRunner air})
+                  (\tr -> tr {runScene = campaignSceneRunner air, runPersona = campaignPersonaRunner air})
               )
           gscope = ScopeGlobal campaignNamespace
       -- Distill the toy campaign's own memory (its lessons live in
@@ -2120,10 +2150,9 @@ runPlannerAct = do
           =<< runCampaignStore
             store
             (recordLesson campaignNamespace ("planner/" <> picked) ("planner chose " <> picked <> ": " <> unField choice.reason))
-      pure ()
 
       -- The chosen cell runs the live campaign under a fresh journal prefix.
-      let cell = chosenCell{cellId = CellId ("live2:" <> chosenCellName)}
+      let cell = chosenCell {cellId = CellId ("live2:" <> chosenCellName)}
           wfId = campaignWorkflowId (CellId ("live2:" <> chosenCellName))
           stream = campaignStreamNameText cellCampaignWorkflowName wfId
           liveRegistry = campaignRegistry [] [cell] (\_oracle _c -> liveEngine air) noPublisherEff
@@ -2180,7 +2209,7 @@ runLandingAct = do
   withCampaignStore $ \store ->
     forM_ pcs $ \pc -> do
       journal <- readJournal store (campaignStreamNameText projectCampaignWorkflowName (projectWorkflowId (pcProject pc) (pcPath pc)))
-      let accepted = [r | FixAttempt{faRepaired = Just r} <- journaledAttempts (decodedJournal journal)]
+      let accepted = [r | FixAttempt {faRepaired = Just r} <- journaledAttempts (decodedJournal journal)]
       case accepted of
         [] -> fail ("landing: no accepted repair journaled for " <> T.unpack (pcProject pc <> ":" <> pcPath pc))
         (r : _) -> modifyIORef' repairsRef ((pc, r) :)
@@ -2195,10 +2224,15 @@ runLandingAct = do
   let reportLanding recd
         | lrVerified recd =
             putStrLn
-              ( "  landed " <> T.unpack (lrProject recd <> ":" <> lrPath recd)
-                  <> " — commit " <> T.unpack (lrCommit recd)
-                  <> " on " <> T.unpack (lrBranch recd)
-                  <> " (" <> T.unpack (lrWorktree recd) <> ")"
+              ( "  landed "
+                  <> T.unpack (lrProject recd <> ":" <> lrPath recd)
+                  <> " — commit "
+                  <> T.unpack (lrCommit recd)
+                  <> " on "
+                  <> T.unpack (lrBranch recd)
+                  <> " ("
+                  <> T.unpack (lrWorktree recd)
+                  <> ")"
               )
         | otherwise = do
             putStrLn ("  NOT LANDED " <> T.unpack (lrProject recd <> ":" <> lrPath recd) <> " — on-disk verification failed:")
@@ -2300,8 +2334,8 @@ runReactAct = do
 
   -- Scripted run: offline, journaled.
   putStrLn "[react] scripted agent over the project cells"
-  let scriptedRegistry = campaignRegistry pcs [] (\o c -> scriptedReactEngine o c) noPublisherEff
-  launchCells specs (\o c -> scriptedReactEngine o c)
+  let scriptedRegistry = campaignRegistry pcs [] scriptedReactEngine noPublisherEff
+  launchCells specs scriptedReactEngine
   withCampaignStore $ \store -> do
     fireTimerSweep store scriptedRegistry [(s, "sleep:settle-" <> T.pack (show n)) | (_, s, _, _) <- rows, n <- [1 :: Int .. 3]]
     drainFleet store scriptedRegistry ourIds
@@ -2313,11 +2347,11 @@ runReactAct = do
     putStrLn "[react-live] launching the same cells under the live agent"
     let livePrefix = "react-live-"
         lspecs =
-          [ ( rcell' pc
-            , unusedImportOracle
-            , projectNamespace (pcProject pc)
-            , projectCampaignWorkflowName
-            , projectWorkflowId2 livePrefix (pcProject pc) (pcPath pc)
+          [ ( rcell' pc,
+              unusedImportOracle,
+              projectNamespace (pcProject pc),
+              projectCampaignWorkflowName,
+              projectWorkflowId2 livePrefix (pcProject pc) (pcPath pc)
             )
           | pc <- pcs
           ]
@@ -2334,8 +2368,8 @@ runReactAct = do
           (rcell pc)
             { cellId = CellId ("pcell-" <> livePrefix <> pcProject pc <> ":" <> pcPath pc)
             }
-        liveRegistry = campaignRegistry pcs [] (\o c -> reactEngineFor air o c) noPublisherEff
-    launchCells lspecs (\o c -> reactEngineFor air o c)
+        liveRegistry = campaignRegistry pcs [] (reactEngineFor air) noPublisherEff
+    launchCells lspecs (reactEngineFor air)
     withCampaignStore $ \store -> do
       fireTimerSweep store liveRegistry [(s, "sleep:settle-" <> T.pack (show n)) | (_, s, _, _) <- lrows, n <- [1 :: Int .. 3]]
       drainFleet store liveRegistry ourLIds
@@ -2345,7 +2379,8 @@ runReactAct = do
       remaining <- ourUnfinished store ourLIds
       unless (null remaining) $
         putStrLn
-          ( "  [react-live] " <> show (length remaining)
+          ( "  [react-live] "
+              <> show (length remaining)
               <> " workflow(s) still suspended \8212 live-model budget or provider"
               <> " rate limits ran out; the journals hold every partial attempt and"
               <> " a later resume pass continues exactly where they stopped"
@@ -2374,7 +2409,7 @@ runReactAct = do
           let proj = pcProject pc
               path = pcPath pc
           journal <- readJournal store (campaignStreamNameText projectCampaignWorkflowName (projectWorkflowId2 pfx proj path))
-          let accepted = [r | FixAttempt{faRepaired = Just r} <- journaledAttempts (decodedJournal journal)]
+          let accepted = [r | FixAttempt {faRepaired = Just r} <- journaledAttempts (decodedJournal journal)]
           case accepted of
             [] -> putStrLn ("  [" <> labelOf pfx <> "] no accepted repair for " <> T.unpack (proj <> ":" <> path) <> " — nothing to land")
             (repair : _) -> do
@@ -2401,9 +2436,14 @@ runReactAct = do
               if lrVerified recd
                 then
                   putStrLn
-                    ( "  [" <> labelOf pfx <> "] landed " <> T.unpack (lrProject recd <> ":" <> lrPath recd)
-                        <> " — commit " <> T.unpack (lrCommit recd)
-                        <> " on " <> T.unpack (lrBranch recd)
+                    ( "  ["
+                        <> labelOf pfx
+                        <> "] landed "
+                        <> T.unpack (lrProject recd <> ":" <> lrPath recd)
+                        <> " — commit "
+                        <> T.unpack (lrCommit recd)
+                        <> " on "
+                        <> T.unpack (lrBranch recd)
                     )
                 else do
                   putStrLn ("  [" <> labelOf pfx <> "] NOT LANDED " <> T.unpack (lrProject recd <> ":" <> lrPath recd) <> " — on-disk verification failed:")
@@ -2510,25 +2550,25 @@ infraEvidence =
       "an empty database is bootstrapped in-process: Campaign.Bootstrap applies"
         <> " all three migration sets (kiroku, keiro, kioku — 56 idempotent SQL files)"
         <> " as one Session.script transaction each; no external psql or migrate tool"
-    )
-  , ( "freshness",
+    ),
+    ( "freshness",
       "store freshness is data, not schema: keiro.keiro_workflows absent means"
         <> " unmigrated, present and empty means fresh; the driver self-boots before"
         <> " opening the store, so dropdb followed by a rerun just works"
-    )
-  , ( "server",
+    ),
+    ( "server",
       "the private Postgres cluster lives in the arena repo (db/campaign-private,"
         <> " socket db/campaign-private-socket, trust auth, user campaign);"
         <> " PG_CONNECTION_STRING carries user= explicitly because the notifier"
         <> " does not inherit PGUSER"
-    )
-  , ( "read-model",
+    ),
+    ( "read-model",
       "the campaign's read model is one keiki symbolic-register transducer over"
         <> " cell journals (CellOpen -> Cleared/Escalated with a non-terminal"
         <> " CellHumanQueried vertex), fed two ways: offline replay via keiro's"
         <> " replayEvents, and live through a shibuya app over the shibuya-kiroku adapter"
-    )
-  , ( "agreement",
+    ),
+    ( "agreement",
       "the live fan-out and the offline replay must agree on every cell journal;"
         <> " act 13 proves it (13 match, 0 diff), and the per-act hand-rolled journal"
         <> " decoders were retired in favor of the one verified read model"
@@ -2578,10 +2618,15 @@ runInfraMemoryAct = do
             putStrLn "  distiller: session already up to date"
           Right (L1Distilled summary) ->
             putStrLn
-              ( "  distilled: " <> show summary.extracted <> " candidate(s) extracted, "
-                  <> show summary.stored <> " stored, "
-                  <> show summary.merged <> " merged, "
-                  <> show summary.skipped <> " skipped"
+              ( "  distilled: "
+                  <> show summary.extracted
+                  <> " candidate(s) extracted, "
+                  <> show summary.stored
+                  <> " stored, "
+                  <> show summary.merged
+                  <> " merged, "
+                  <> show summary.skipped
+                  <> " skipped"
               )
 
     -- (3) Promote the operational essentials to the infra namespace's global
@@ -2590,8 +2635,7 @@ runInfraMemoryAct = do
       [ "the store self-boots: an empty database gets the kiroku, keiro and kioku"
           <> " migrations applied in-process (56 idempotent files); freshness is"
           <> " keiro.keiro_workflows being present and empty; the private cluster"
-          <> " lives at db/campaign-private with its socket at db/campaign-private-socket"
-      ,
+          <> " lives at db/campaign-private with its socket at db/campaign-private-socket",
         "the read model is one keiki aggregate over cell journals, fed two ways"
           <> " (offline replay and a live shibuya fan-out over the kiroku adapter);"
           <> " the two paths must agree — act 13 proves 13 match, 0 diff"
@@ -2654,8 +2698,9 @@ runMatrixAct = do
               if aid `elem` published
                 then (published, False)
                 else (published <> [aid], True)
-        when inserted $
-          liftIO $ putStrLn ("  published human-query awakeable id: " <> T.unpack (awakeableIdText aid))
+        when inserted
+          $ liftIO
+          $ putStrLn ("  published human-query awakeable id: " <> T.unpack (awakeableIdText aid))
 
       scriptedTriage :: Campaign.Matrix.TriageIn -> TriageOut
       scriptedTriage input =
@@ -2717,7 +2762,8 @@ runMatrixAct = do
       let attempts = matrixAttemptsOf (decodedJournal journal)
           verdicts = [ma.maVerdict | ma <- attempts]
       putStrLn
-        ( "  " <> T.unpack (unCellId (matrixCellId mc))
+        ( "  "
+            <> T.unpack (unCellId (matrixCellId mc))
             <> ": "
             <> ( if journalIsComplete (decodedJournal journal)
                    then "complete"
@@ -2757,8 +2803,14 @@ runCrossPlanAct = do
   putStrLn ("  priority: " <> T.unpack (unField plan.ppPriority))
   for_ plan.ppNext $ \nx ->
     putStrLn
-      ( "    " <> T.unpack (unField nx.anProject) <> " -> " <> T.unpack (unField nx.anAction)
-          <> " [" <> T.unpack (unField nx.anDispatch) <> "] :: " <> T.unpack (T.take 110 (unField nx.anWhy))
+      ( "    "
+          <> T.unpack (unField nx.anProject)
+          <> " -> "
+          <> T.unpack (unField nx.anAction)
+          <> " ["
+          <> T.unpack (unField nx.anDispatch)
+          <> "] :: "
+          <> T.unpack (T.take 110 (unField nx.anWhy))
       )
   putStrLn "[cross-plan] done — one portfolio, one persona, one plan, recorded"
 
@@ -2775,7 +2827,7 @@ planPortfolio = do
     summaries <-
       forM journalRows $ \(label, stream, vertexHint) -> do
         events <- readJournal store stream
-        let wjes = [wje | Right wje <- decodeRecorded workflowJournalCodec <$> events]
+        let wjes = rights (decodeRecorded workflowJournalCodec <$> events)
         pure
           ( PortfolioRow
               { prLabel = label,
@@ -2806,12 +2858,22 @@ planPortfolio = do
           partition ((\v -> v == "cleared" || v == "escalated") . prVertex) toyRows
 
     putStrLn
-      ( "  toy cells: " <> show (length toyRows) <> " (" <> show (length toyDone) <> " done, "
-          <> show (length toyOpen) <> " open)"
+      ( "  toy cells: "
+          <> show (length toyRows)
+          <> " ("
+          <> show (length toyDone)
+          <> " done, "
+          <> show (length toyOpen)
+          <> " open)"
       )
     putStrLn
-      ( "  project cells: " <> show (length projectRows) <> " (" <> show (length projectDone) <> " done, "
-          <> show (length projectOpen) <> " open)"
+      ( "  project cells: "
+          <> show (length projectRows)
+          <> " ("
+          <> show (length projectDone)
+          <> " done, "
+          <> show (length projectOpen)
+          <> " open)"
       )
     putStrLn ("  matrix cells: " <> show (length matrixRows) <> " (" <> show (length matrixRows) <> " terminal)")
     for_ toyOpen $ \r -> putStrLn ("    open: " <> T.unpack (prLabel r) <> " [" <> T.unpack (prVertex r) <> "]")
@@ -2844,18 +2906,22 @@ planPortfolio = do
     unless (any ("matrix" `T.isInfixOf`) peirceRecallEarly) $
       fail "act 17: the matrix->peirce cross lesson is not recallable in the peirce namespace"
     putStrLn
-      ( "  cross lessons recallable: mowgli " <> show (length mowgliRecall) <> " note(s), peirce "
-          <> show (length peirceRecallEarly) <> " note(s)"
+      ( "  cross lessons recallable: mowgli "
+          <> show (length mowgliRecall)
+          <> " note(s), peirce "
+          <> show (length peirceRecallEarly)
+          <> " note(s)"
       )
 
     -- One distilled persona at the portfolio's global scope, read back
     -- through kioku's own L3 API (the same path act 8 uses per project).
     personaText <- withAIRuntime $ \air -> do
       let distillRT =
-            withDistillWorkspace "/tmp/campaign-mirrors"
+            withDistillWorkspace
+              "/tmp/campaign-mirrors"
               ( withTestRunners
                   (newDistillRuntime air Nothing)
-                  (\tr -> tr{runScene = campaignSceneRunner air, runPersona = campaignPersonaRunner air})
+                  (\tr -> tr {runScene = campaignSceneRunner air, runPersona = campaignPersonaRunner air})
               )
           gscope = ScopeGlobal campaignNamespace
       _ <- requireEither =<< runCampaignStore store (regenerateScene distillRT campaignMemorySpace gscope)
@@ -2892,8 +2958,14 @@ planPortfolio = do
     putStrLn ("  priority: " <> T.unpack (unField plan.ppPriority))
     for_ plan.ppNext $ \nx ->
       putStrLn
-        ( "    " <> T.unpack (unField nx.anProject) <> " -> " <> T.unpack (unField nx.anAction)
-            <> " [" <> T.unpack (unField nx.anDispatch) <> "] :: " <> T.unpack (T.take 110 (unField nx.anWhy))
+        ( "    "
+            <> T.unpack (unField nx.anProject)
+            <> " -> "
+            <> T.unpack (unField nx.anAction)
+            <> " ["
+            <> T.unpack (unField nx.anDispatch)
+            <> "] :: "
+            <> T.unpack (T.take 110 (unField nx.anWhy))
         )
 
     -- The plan is honest: every dispatch class must be one of the three;
@@ -2990,11 +3062,6 @@ classifyJournalStream sname
       Just ("matrix/" <> wid, sname, "open")
   | otherwise = Nothing
 
--- | A journal whose events we could not decode is a foreign stream; the
--- aggregate replay is the shared fold over the decoded events.
-journalEventsOfLocal :: [RecordedEvent] -> [WorkflowJournalEvent]
-journalEventsOfLocal events = [wje | Right wje <- decodeRecorded workflowJournalCodec <$> events]
-
 -- | The typed plan the planner emits.
 data PortfolioInput = PortfolioInput
   { piState :: Field "the portfolio's real state read off the journals" Text,
@@ -3079,7 +3146,7 @@ portfolioPlanText out =
 
 portfolioStateText :: [PortfolioRow] -> Bool -> Text
 portfolioStateText rows matrixHealthy =
-  T.unlines $
+  T.unlines
     [ "campaign: " <> T.pack (show (length toyOpen')) <> " open / " <> T.pack (show (length toyDone')) <> " done toy cells",
       "mowgli: " <> T.pack (show (length moOpen)) <> " open / " <> T.pack (show (length moDone)) <> " done project cells",
       "peirce: " <> T.pack (show (length peOpen)) <> " open / " <> T.pack (show (length peDone)) <> " done project cells",
@@ -3091,8 +3158,7 @@ portfolioStateText rows matrixHealthy =
     (toyDone', toyOpen') = splitDone [r | r@(PortfolioRow l _ _ _) <- rows, "toy/" `T.isPrefixOf` l]
     (moDone, moOpen) = splitDone (projectLabel "mowgli")
     (peDone, peOpen) = splitDone (projectLabel "peirce")
-    splitDone rs = partition ((\v -> v == "cleared" || v == "escalated") . prVertex) rs
-
+    splitDone = partition ((\v -> v == "cleared" || v == "escalated") . prVertex)
 
 -- ===========================================================================
 -- Act 18: the Mercury promotion campaign — the codegen pipeline on a real
@@ -3145,8 +3211,9 @@ runMercuryAct = do
               if aid `elem` published
                 then (published, False)
                 else (published <> [aid], True)
-        when inserted $
-          liftIO $ putStrLn ("  published human-query awakeable id: " <> T.unpack (awakeableIdText aid))
+        when inserted
+          $ liftIO
+          $ putStrLn ("  published human-query awakeable id: " <> T.unpack (awakeableIdText aid))
       streamOf opt = campaignStreamNameText mercuryWorkflowName (mercuryWorkflowIdTagged opt runTag)
 
       -- The GOOD responder builds the marker sections from the TYPED
@@ -3156,10 +3223,10 @@ runMercuryAct = do
       -- is exactly what a good model emits.
       factOldLine :: ProposeIn -> Text
       factOldLine pin
-        | h : _t <- T.lines . unField $ piFact pin
-        = snd $ T.breakOnEnd ": " h
-        | otherwise
-        = ""
+        | h : _t <- T.lines . unField $ piFact pin =
+            snd $ T.breakOnEnd ": " h
+        | otherwise =
+            ""
       swapCtor :: Text -> Text
       swapCtor = T.replace "priv_alt_arg_help" "alt_arg_help" . T.replace "priv_arg_help" "arg_help"
       goodPlan :: ProposeIn -> Response
@@ -3195,8 +3262,15 @@ runMercuryAct = do
   facts <- readMercuryFacts campaignTree
   for_ facts $ \f ->
     putStrLn
-      ( "  fact: --" <> T.unpack (mfOption f) <> " at options.m:" <> show (mfLineNo f)
-          <> " (" <> T.unpack (mfConstructor f) <> " -> " <> T.unpack (mfPublicConstructor f) <> ")"
+      ( "  fact: --"
+          <> T.unpack (mfOption f)
+          <> " at options.m:"
+          <> show (mfLineNo f)
+          <> " ("
+          <> T.unpack (mfConstructor f)
+          <> " -> "
+          <> T.unpack (mfPublicConstructor f)
+          <> ")"
       )
   when (null facts) $ putStrLn "  (the family is already promoted — nothing to do)"
   priv0 <- mercuryPrivCount campaignTree
@@ -3221,7 +3295,8 @@ runMercuryAct = do
       putStrLn
         ( "  fact probe on pristine tree: "
             <> (if ovOk negV then "UNEXPECTEDLY ok" else "correctly rejects")
-            <> " — " <> T.unpack (ovDetail negV)
+            <> " — "
+            <> T.unpack (ovDetail negV)
         )
       when (ovOk negV) $ fail "act 18: the fact probe accepted the pristine tree — the oracle is broken"
 
@@ -3269,7 +3344,10 @@ runMercuryAct = do
       putStrLn ("  --" <> T.unpack opt <> ":")
       for_ attempts $ \ma ->
         putStrLn
-          ( "    attempt " <> show (meAttempt ma) <> ": " <> T.unpack (meVerdict ma)
+          ( "    attempt "
+              <> show (meAttempt ma)
+              <> ": "
+              <> T.unpack (meVerdict ma)
               <> (if T.null (meOld ma) then "" else "  [old: " <> T.unpack (T.take 46 (T.strip (meOld ma))) <> "…]")
           )
       remaining <- ourUnfinished store [wfIdText (mercuryWorkflowIdTagged opt runTag)]
@@ -3323,14 +3401,16 @@ runMercuryAct = do
           Right L1SkippedUpToDate -> putStrLn "  distiller: session already up to date"
           Right (L1Distilled summary) ->
             putStrLn
-              ( "  distilled: " <> show summary.extracted <> " candidate(s) extracted, "
-                  <> show summary.stored <> " stored"
+              ( "  distilled: "
+                  <> show summary.extracted
+                  <> " candidate(s) extracted, "
+                  <> show summary.stored
+                  <> " stored"
               )
     for_
       [ "mercury promotion = one cell per private option: propose ONE verbatim-line edit,"
           <> " exact-once guard, then the two-probe oracle (fact probe: private gone, public in,"
-          <> " priv-count -1; dump probe: mmc --grade hlc.gc --dump-mlds 99 emits .c_dump.099-final)"
-      ,
+          <> " priv-count -1; dump probe: mmc --grade hlc.gc --dump-mlds 99 emits .c_dump.099-final)",
         "mercury cells land on per-run branches (campaign/mercury-<option>-<tag>) so every"
           <> " campaign run replays reviewably; the parent checkout is never touched"
       ]
@@ -3351,6 +3431,7 @@ runMercuryAct = do
         ("engine", "propose is the coder patch program (PatchPlan: one exact-match replacement); guard failures and no-decode replies are typed rejections that feed the informed retry"),
         ("guard", "the no-regression denominator is the options.m private-registration count (368 in the campaign clone); promoting one option must lower it by exactly one")
       ]
+
 -- ===========================================================================
 -- The Mercury replayable demo: the whole promotion drama on demand
 -- ===========================================================================
@@ -3395,12 +3476,18 @@ runMercuryReplay = do
             <> mercuryOptionsPath mercuryCampaignClone
             <> ") — scripted/live runs have nothing to do; use MERCURY_ENGINE=replay"
         )
-    else
-      for_ facts $ \f ->
-        putStrLn
-          ( "  fact: --" <> T.unpack (mfOption f) <> " at options.m:" <> show (mfLineNo f)
-              <> " (" <> T.unpack (mfConstructor f) <> " -> " <> T.unpack (mfPublicConstructor f) <> ")"
-          )
+    else for_ facts $ \f ->
+      putStrLn
+        ( "  fact: --"
+            <> T.unpack (mfOption f)
+            <> " at options.m:"
+            <> show (mfLineNo f)
+            <> " ("
+            <> T.unpack (mfConstructor f)
+            <> " -> "
+            <> T.unpack (mfPublicConstructor f)
+            <> ")"
+        )
   privNow <- mercuryPrivCount mercuryCampaignClone
   putStrLn ("  private registrations in the tree: " <> show privNow)
 
@@ -3414,18 +3501,16 @@ runMercuryReplay = do
   -- workflows parked on old cool-down timers will RE-LAND their branches on
   -- the next scripted/live run — cleanup clears the git artifacts, not the
   -- durable intentions.
-  doClean <- (== "1") <$> fromMaybe "" <$> lookupEnv "MERCURY_CLEAN"
+  doClean <- (== "1") . fromMaybe "" <$> lookupEnv "MERCURY_CLEAN"
   when doClean $ do
     putStrLn "[cleanup] pruning every campaign/mercury-* worktree and branch"
     branches <- map snd <$> mercuryPromotionBranches mercuryCampaignClone
     for_ branches $ \b -> do
       let wt = mercuryWorktreeFor "mercury" b
       wtExists <- doesDirectoryExist wt
-      if wtExists
-        then do
-          _ <- guardTry (git_ mercuryCampaignClone ["worktree", "remove", "--force", wt])
-          pure ()
-        else pure ()
+      when wtExists $ do
+        _ <- guardTry (git_ mercuryCampaignClone ["worktree", "remove", "--force", wt])
+        pure ()
       _ <- guardTry (git_ mercuryCampaignClone ["branch", "-D", T.unpack b])
       pure ()
     git_ mercuryCampaignClone ["worktree", "prune"]
@@ -3460,24 +3545,32 @@ runMercuryReplay = do
           landings = [(opt, b) | b <- branches, Just opt <- [mercuryBranchOwner b]]
       if null landings
         then putStrLn "  no campaign/mercury-* landings exist yet — nothing to replay"
-        else
-          for_ landings $ \(opt, branch) -> do
-            mf <- case [f | f <- facts, mfOption f == opt] of
-              (f : _) -> pure (Just f)
-              [] -> pure Nothing
-            case mf of
-              Nothing ->
-                putStrLn
-                  ( "  --" <> T.unpack opt <> " [" <> T.unpack branch <> "]: no fact for this option"
-                      <> " — fact probe not applicable"
-                  )
-              Just f -> do
-                v <- withVerifyWorktree branch $ \vt -> oracleFactProbe vt f
-                putStrLn
-                  ( "  --" <> T.unpack opt <> " [" <> T.unpack branch <> "]: "
-                      <> (if ovOk v then "still verifies" else "REGRESSED")
-                      <> " — " <> T.unpack (ovDetail v)
-                  )
+        else for_ landings $ \(opt, branch) -> do
+          mf <- case [f | f <- facts, mfOption f == opt] of
+            (f : _) -> pure (Just f)
+            [] -> pure Nothing
+          case mf of
+            Nothing ->
+              putStrLn
+                ( "  --"
+                    <> T.unpack opt
+                    <> " ["
+                    <> T.unpack branch
+                    <> "]: no fact for this option"
+                    <> " — fact probe not applicable"
+                )
+            Just f -> do
+              v <- withVerifyWorktree branch $ \vt -> oracleFactProbe vt f
+              putStrLn
+                ( "  --"
+                    <> T.unpack opt
+                    <> " ["
+                    <> T.unpack branch
+                    <> "]: "
+                    <> (if ovOk v then "still verifies" else "REGRESSED")
+                    <> " — "
+                    <> T.unpack (ovDetail v)
+                )
     "live" -> do
       putStrLn "[campaign] the promotion cells under the live engine (REPLAY running act-19's shape)"
       runLiveMercuryAct
@@ -3493,16 +3586,15 @@ runMercuryReplay = do
   landingsT <- nub . map snd <$> mercuryPromotionBranches mercuryCampaignClone
   if null landingsT
     then putStrLn "  (none)"
-    else
-      for_ landingsT $ \branch -> do
-        subject <- gitCapture mercuryCampaignClone ["log", "-1", "--format=%s", T.unpack branch]
-        age <- gitCapture mercuryCampaignClone ["log", "-1", "--format=%cr", T.unpack branch]
-        putStrLn ("  " <> T.unpack branch <> "  “" <> T.unpack subject <> "”  (" <> T.unpack age <> ")")
+    else for_ landingsT $ \branch -> do
+      subject <- gitCapture mercuryCampaignClone ["log", "-1", "--format=%s", T.unpack branch]
+      age <- gitCapture mercuryCampaignClone ["log", "-1", "--format=%cr", T.unpack branch]
+      putStrLn ("  " <> T.unpack branch <> "  “" <> T.unpack subject <> "”  (" <> T.unpack age <> ")")
   dirty <- parentDirtyCount "mercury"
   putStrLn ("  parent checkout dirty entries: " <> show dirty)
   putStrLn "[mercury replay] done"
   where
-    -- | The option a @campaign/mercury-…@ branch lands: the leaf after
+    -- \| The option a @campaign/mercury-…@ branch lands: the leaf after
     -- @mercury-@ STARTS with the option name (then @-<runtag>@ or the
     -- help/integration shapes, which own no option). Longest target first
     -- so @dump-mlds-pred-name-…@ is not misread as @dump-mlds@.
@@ -3513,7 +3605,7 @@ runMercuryReplay = do
         (c : _) -> Just c
         [] -> Nothing
 
-    -- | Run an IO action that may throw (git_ uses runProcess_, which
+    -- \| Run an IO action that may throw (git_ uses runProcess_, which
     -- throws on nonzero exit), swallowing ANY exception as Left — the
     -- cleanup/verify paths must never die on a missing ref or worktree.
     guardTry :: IO a -> IO (Either () a)
@@ -3523,7 +3615,7 @@ runMercuryReplay = do
         Right v -> pure (Right v)
         Left (_ :: SomeException) -> pure (Left ())
 
-    -- | A detached verify-worktree for one landing: the branch's parent
+    -- \| A detached verify-worktree for one landing: the branch's parent
     -- commit checked out, the landing's options.m diff applied as
     -- working-tree changes — exactly the state the fact probe expects
     -- (edit present, pre-edit HEAD for the no-regression leg). Always
@@ -3540,15 +3632,14 @@ runMercuryReplay = do
       r <-
         if not added
           then pure (Left ())
-          else
-            guardTry $
-              do
-                -- Materialize the landing's options.m WITHOUT moving HEAD:
-                -- HEAD stays at the parent commit (the pre-edit baseline the
-                -- no-regression leg compares against), the working file is
-                -- the landing's version.
-                git_ vt ["checkout", T.unpack branch, "--", "compiler/options.m"]
-                probe vt
+          else guardTry $
+            do
+              -- Materialize the landing's options.m WITHOUT moving HEAD:
+              -- HEAD stays at the parent commit (the pre-edit baseline the
+              -- no-regression leg compares against), the working file is
+              -- the landing's version.
+              git_ vt ["checkout", T.unpack branch, "--", "compiler/options.m"]
+              probe vt
       _ <- guardTry (git_ mercuryCampaignClone ["worktree", "remove", "--force", vt])
       case r of
         Right v -> pure v
@@ -3597,16 +3688,17 @@ runLiveMercuryAct = do
                 if aid `elem` published
                   then (published, False)
                   else (published <> [aid], True)
-          when inserted $
-            liftIO $ putStrLn ("  published human-query awakeable id: " <> T.unpack (awakeableIdText aid))
+          when inserted
+            $ liftIO
+            $ putStrLn ("  published human-query awakeable id: " <> T.unpack (awakeableIdText aid))
         streamOf opt = campaignStreamNameText mercuryWorkflowName (mercuryWorkflowIdTagged opt liveTag)
 
         -- The live engine: 'runAIProgram' behind the 'MercuryEngine' shape,
         -- with the bounded retry that is part of the live contract. The
         -- propose program is the same 'mercuryPromotionSignature' the stub
         -- ran; only the interpreter differs.
-        liveEngine :: MercuryEngine
-        liveEngine n prog input _notes = do
+        mercuryLiveEngine :: MercuryEngine
+        mercuryLiveEngine n prog input _notes = do
           let go :: Int -> IO (Maybe PatchPlan)
               go 0 = pure Nothing
               go k =
@@ -3631,8 +3723,15 @@ runLiveMercuryAct = do
     facts <- readMercuryFacts campaignTree
     for_ facts $ \f ->
       putStrLn
-        ( "  fact: --" <> T.unpack (mfOption f) <> " at options.m:" <> show (mfLineNo f)
-            <> " (" <> T.unpack (mfConstructor f) <> " -> " <> T.unpack (mfPublicConstructor f) <> ")"
+        ( "  fact: --"
+            <> T.unpack (mfOption f)
+            <> " at options.m:"
+            <> show (mfLineNo f)
+            <> " ("
+            <> T.unpack (mfConstructor f)
+            <> " -> "
+            <> T.unpack (mfPublicConstructor f)
+            <> ")"
         )
     when (null facts) $ fail "act 19: no facts — the campaign clone changed under us"
     cells <- mercuryCellSpecs campaignTree liveTag
@@ -3654,14 +3753,14 @@ runLiveMercuryAct = do
           requireEither
             =<< runCampaignStore
               store
-              (runWorkflowWith defaultWorkflowRunOptions mercuryWorkflowName wid (mercuryCellWorkflow liveEngine (raise . publishHumanQuery) cell (projectNamespace "mercury") 3))
+              (runWorkflowWith defaultWorkflowRunOptions mercuryWorkflowName wid (mercuryCellWorkflow mercuryLiveEngine (raise . publishHumanQuery) cell (projectNamespace "mercury") 3))
         putStrLn ("  launch --" <> T.unpack (mcOption cell) <> ": " <> show outcome)
 
     -- The adaptive driver: each round demands exactly the cool-down timers
     -- that journaled failures prove will exist, resumes, and repeats while
     -- anything is unfinished (bounded — 3 attempts + the park). One round,
     -- one store block: the recursion happens OUTSIDE it.
-    let registry = mercuryRegistry liveEngine publishHumanQuery
+    let registry = mercuryRegistry mercuryLiveEngine publishHumanQuery
         ourIds = [wfIdText (mercuryWorkflowIdTagged (mcOption c) liveTag) | c <- cells]
         driveRound :: IO Bool
         driveRound = do
@@ -3712,7 +3811,10 @@ runLiveMercuryAct = do
         putStrLn ("  --" <> T.unpack opt <> ":")
         for_ attempts $ \ma -> do
           putStrLn
-            ( "    attempt " <> show (meAttempt ma) <> ": " <> T.unpack (meVerdict ma)
+            ( "    attempt "
+                <> show (meAttempt ma)
+                <> ": "
+                <> T.unpack (meVerdict ma)
                 <> (if T.null (meOld ma) then "" else "\n      old: " <> T.unpack (T.strip (meOld ma)))
                 <> (if T.null (meNew ma) then "" else "\n      new: " <> T.unpack (T.strip (meNew ma)))
             )
@@ -3764,14 +3866,16 @@ runLiveMercuryAct = do
           Right L1SkippedUpToDate -> putStrLn "  distiller: session already up to date"
           Right (L1Distilled summary) ->
             putStrLn
-              ( "  distilled: " <> show summary.extracted <> " candidate(s) extracted, "
-                  <> show summary.stored <> " stored"
+              ( "  distilled: "
+                  <> show summary.extracted
+                  <> " candidate(s) extracted, "
+                  <> show summary.stored
+                  <> " stored"
               )
       for_
         [ "the live mercury engine is one function swap: runAIProgram behind the MercuryEngine"
             <> " shape; the facts, guard, oracle, cool-downs and landings are identical, and a"
-            <> " journal cannot tell a live attempt from a scripted one by shape"
-        ,
+            <> " journal cannot tell a live attempt from a scripted one by shape",
           "live-model failures are typed: a malformed reply is an AIProgramFailed surfaced and"
             <> " retried up to three times before the attempt records a guard-failed verdict"
         ]
@@ -3813,8 +3917,9 @@ runHelpCheckAct = do
               if aid `elem` published
                 then (published, False)
                 else (published <> [aid], True)
-        when inserted $
-          liftIO $ putStrLn ("  published human-query awakeable id: " <> T.unpack (awakeableIdText aid))
+        when inserted
+          $ liftIO
+          $ putStrLn ("  published human-query awakeable id: " <> T.unpack (awakeableIdText aid))
       parent = "/home/nyc/src/mercury"
       streamOf tag = campaignStreamNameText helpCheckWorkflowName (helpCheckWorkflowIdTagged tag)
 
@@ -3831,8 +3936,12 @@ runHelpCheckAct = do
       cell = helpCheckCellFor opts tag
       wid = helpCheckWorkflowIdTagged tag
   putStrLn
-    ( "  tag " <> T.unpack tag <> ": one help-check cell proving "
-        <> show (length opts) <> " promoted option(s): " <> T.unpack (T.intercalate ", " opts)
+    ( "  tag "
+        <> T.unpack tag
+        <> ": one help-check cell proving "
+        <> show (length opts)
+        <> " promoted option(s): "
+        <> T.unpack (T.intercalate ", " opts)
     )
 
   -- The negative control, run for real: the INSTALLED compiler's --help —
@@ -3931,7 +4040,9 @@ runHelpCheckAct = do
   stillOpen <- readIORef stillOpenRef
   when stillOpen $
     putStrLn
-      ( "  BUDGET: " <> show probeBudget <> " driver rounds used without finishing — the cell remains open in its journal."
+      ( "  BUDGET: "
+          <> show probeBudget
+          <> " driver rounds used without finishing — the cell remains open in its journal."
           <> " Re-run ACTS=20 to resume the same build (mmake is idempotent; no work is lost)."
       )
 
@@ -3956,8 +4067,12 @@ runHelpCheckAct = do
         Aeson.Success vs ->
           for_ (zip [1 :: Int ..] vs) $ \(i, hv) ->
             putStrLn
-              ( "  assertion " <> show i <> ": " <> (if hvShows hv then "SHOWN" else "ABSENT")
-                  <> " — " <> T.unpack (hvDetail hv)
+              ( "  assertion "
+                  <> show i
+                  <> ": "
+                  <> (if hvShows hv then "SHOWN" else "ABSENT")
+                  <> " — "
+                  <> T.unpack (hvDetail hv)
               )
         Aeson.Error err -> putStrLn ("  help-check verdict undecodable: " <> err)
       [] -> putStrLn "  no help-check verdict yet — the build is still pacing"
@@ -4014,8 +4129,9 @@ runDispatchAct = do
               if aid `elem` published
                 then (published, False)
                 else (published <> [aid], True)
-        when inserted $
-          liftIO $ putStrLn ("  published human-query awakeable id: " <> T.unpack (awakeableIdText aid))
+        when inserted
+          $ liftIO
+          $ putStrLn ("  published human-query awakeable id: " <> T.unpack (awakeableIdText aid))
 
   -- The real cells the execute lines name, read once — the executors and the
   -- drive registry share them. Each nested launch runs under a fresh
@@ -4039,7 +4155,7 @@ runDispatchAct = do
           let WorkflowId t = projectWorkflowId (pcProject pc) (pcPath pc)
            in WorkflowId (T.replace "pcell-" "pcell-dispatch-" t)
         [] -> WorkflowId "pcell-dispatch-missing"
-      toyCellD = dispatchCell (head (drop 3 corpusCells))
+      toyCellD = dispatchCell (corpusCells !! 3)
       matrixCellD = mkMatrixCell (ArchName "riscv") (ConfigName "debug")
       matrixWfId = matrixWorkflowIdTagged matrixCellD tag
 
@@ -4049,8 +4165,13 @@ runDispatchAct = do
   putStrLn ("  priority: " <> T.unpack (unField plan.ppPriority))
   for_ plan.ppNext $ \nx ->
     putStrLn
-      ( "    " <> T.unpack (unField nx.anProject) <> " -> " <> T.unpack (unField nx.anAction)
-          <> " [" <> T.unpack (unField nx.anDispatch) <> "]"
+      ( "    "
+          <> T.unpack (unField nx.anProject)
+          <> " -> "
+          <> T.unpack (unField nx.anAction)
+          <> " ["
+          <> T.unpack (unField nx.anDispatch)
+          <> "]"
       )
 
   -- Same honesty checks as act 17: closed dispatch vocabulary, full project
@@ -4076,156 +4197,155 @@ runDispatchAct = do
   putStrLn "[dispatch] the plan becomes journaled work"
   -- The real executors, one per dispatch class. execute runs the actual
   -- cell campaign the line names; verify re-runs the actual oracles.
-  let
-    execExecute :: DispatchAction -> Eff CampaignEffects Text
-    execExecute action = case daProject action of
-      p
-        | "mowgli" `T.isInfixOf` p -> case mowgliCell of
-            Nothing -> pure "execute: mowgli's cell file is missing — nothing to run"
-            Just cell -> do
-              -- Launch the real project-cell campaign (act 7's machinery)
-              -- under its own fresh journal: the same workflow body the
-              -- registry rebuilds. The resume worker drives it to its
-              -- verdict through the merged registry.
+  let execExecute :: DispatchAction -> Eff CampaignEffects Text
+      execExecute action = case daProject action of
+        p
+          | "mowgli" `T.isInfixOf` p -> case mowgliCell of
+              Nothing -> pure "execute: mowgli's cell file is missing — nothing to run"
+              Just cell -> do
+                -- Launch the real project-cell campaign (act 7's machinery)
+                -- under its own fresh journal: the same workflow body the
+                -- registry rebuilds. The resume worker drives it to its
+                -- verdict through the merged registry.
+                r <-
+                  runWorkflowWith
+                    defaultWorkflowRunOptions
+                    projectCampaignWorkflowName
+                    mowgliWfId
+                    ( cellCampaignWorkflow
+                        (honestEngineFor unusedImportOracle cell)
+                        (raise . publishHumanQuery)
+                        cell
+                        unusedImportOracle
+                        (projectNamespace "mowgli")
+                        defaultMaxAttempts
+                    )
+                pure
+                  ( "execute(mowgli fixer): launched project-cell campaign "
+                      <> wfIdText mowgliWfId
+                      <> " ("
+                      <> T.pack (show r)
+                      <> ")"
+                  )
+          | "peirce" `T.isInfixOf` p || "matrix" `T.isInfixOf` p -> do
+              -- The real verification-matrix machinery (act 16's pattern), one
+              -- staged boot/stress cell under the dispatch tag: launched here,
+              -- driven to its verdict by the resume worker through the merged
+              -- registry. The planner names this work peirce or matrix depending
+              -- on which project's line carries it — both get real cells.
               r <-
                 runWorkflowWith
                   defaultWorkflowRunOptions
-                  projectCampaignWorkflowName
-                  mowgliWfId
-                  ( cellCampaignWorkflow
-                      (honestEngineFor unusedImportOracle cell)
+                  matrixWorkflowName
+                  matrixWfId
+                  ( matrixCellWorkflow
+                      matrixEngine
                       (raise . publishHumanQuery)
-                      cell
-                      unusedImportOracle
-                      (projectNamespace "mowgli")
-                      defaultMaxAttempts
+                      matrixCellD
+                      (projectNamespace "matrix")
+                      3
                   )
               pure
-                ( "execute(mowgli fixer): launched project-cell campaign "
-                    <> wfIdText mowgliWfId
+                ( "execute(peirce matrix cell): launched matrix cell "
+                    <> wfIdText matrixWfId
                     <> " ("
                     <> T.pack (show r)
                     <> ")"
                 )
-        | "peirce" `T.isInfixOf` p || "matrix" `T.isInfixOf` p -> do
-            -- The real verification-matrix machinery (act 16's pattern), one
-            -- staged boot/stress cell under the dispatch tag: launched here,
-            -- driven to its verdict by the resume worker through the merged
-            -- registry. The planner names this work peirce or matrix depending
-            -- on which project's line carries it — both get real cells.
-            r <-
-              runWorkflowWith
-                defaultWorkflowRunOptions
-                matrixWorkflowName
-                matrixWfId
-                ( matrixCellWorkflow
-                    matrixEngine
-                    (raise . publishHumanQuery)
-                    matrixCellD
-                    (projectNamespace "matrix")
-                    3
+          | otherwise -> do
+              -- The toy corpus cell the plan line names (or the first open
+              -- one): the real fixer campaign, the real marker oracle —
+              -- launched under a fresh dispatch-instance id, driven by the
+              -- resume worker through the merged registry.
+              let wfId = campaignWorkflowId (cellId toyCellD)
+              r <-
+                runWorkflowWith
+                  defaultWorkflowRunOptions
+                  cellCampaignWorkflowName
+                  wfId
+                  ( cellCampaignWorkflow
+                      (honestEngineFor markerOracle toyCellD)
+                      (raise . publishHumanQuery)
+                      toyCellD
+                      markerOracle
+                      campaignNamespace
+                      defaultMaxAttempts
+                  )
+              pure
+                ( "execute(campaign fixer): launched cell campaign "
+                    <> wfIdText wfId
+                    <> " ("
+                    <> T.pack (show r)
+                    <> ")"
                 )
-            pure
-              ( "execute(peirce matrix cell): launched matrix cell "
-                  <> wfIdText matrixWfId
-                  <> " ("
-                  <> T.pack (show r)
-                  <> ")"
-              )
-        | otherwise -> do
-            -- The toy corpus cell the plan line names (or the first open
-            -- one): the real fixer campaign, the real marker oracle —
-            -- launched under a fresh dispatch-instance id, driven by the
-            -- resume worker through the merged registry.
-            let wfId = campaignWorkflowId (cellId toyCellD)
-            r <-
-              runWorkflowWith
-                defaultWorkflowRunOptions
-                cellCampaignWorkflowName
-                wfId
-                ( cellCampaignWorkflow
-                    (honestEngineFor markerOracle toyCellD)
-                    (raise . publishHumanQuery)
-                    toyCellD
-                    markerOracle
-                    campaignNamespace
-                    defaultMaxAttempts
-                )
-            pure
-              ( "execute(campaign fixer): launched cell campaign "
-                  <> wfIdText wfId
-                  <> " ("
-                  <> T.pack (show r)
-                  <> ")"
-              )
 
-    execVerify :: DispatchAction -> Eff CampaignEffects Text
-    execVerify action = case daProject action of
-      p
-        | "mowgli" `T.isInfixOf` p -> do
-            -- The real unused-import oracle over the real checkout file:
-            -- the claim "mowgli's file carries unused imports" is checked
-            -- against ground truth before any fixer runs on it.
-            mpc <- liftIO (readProjectCell ("mowgli", "src/adapters/llada_interface.py"))
-            pure $ case mpc of
-              Nothing -> "verify(mowgli): file missing — claim uncheckable"
-              Just pc ->
-                let diags = oracleCheck unusedImportOracle (pcPath pc) (pcSource pc)
-                 in "verify(mowgli): " <> T.pack (show (length diags)) <> " unused-import diagnostic(s) confirmed in the real checkout"
-        | "peirce" `T.isInfixOf` p -> do
-            -- The real compiler oracle: the dump probe against the
-            -- installed compiler (the promotion's capability, live).
-            v <- liftIO (oracleDumpProbe ("dispatch-" <> tag))
-            pure ("verify(peirce): " <> ovDetail v)
-        | otherwise -> do
-            -- The toy corpus's marker oracle over one known cell.
-            v <- liftIO (oracleDumpProbe ("dispatch-campaign-" <> tag))
-            mpc <- liftIO (readProjectCell ("mowgli", "src/adapters/llada_interface.py"))
-            pure $ case mpc of
-              Just pc ->
-                let diags = oracleCheck unusedImportOracle (pcPath pc) (pcSource pc)
-                 in "verify(campaign): marker oracle ready; mowgli's real file carries "
-                      <> T.pack (show (length diags))
-                      <> " checkable diagnostic(s)"
-              Nothing -> "verify(campaign): marker oracle ready; dump probe ok"
+      execVerify :: DispatchAction -> Eff CampaignEffects Text
+      execVerify action = case daProject action of
+        p
+          | "mowgli" `T.isInfixOf` p -> do
+              -- The real unused-import oracle over the real checkout file:
+              -- the claim "mowgli's file carries unused imports" is checked
+              -- against ground truth before any fixer runs on it.
+              mpc <- liftIO (readProjectCell ("mowgli", "src/adapters/llada_interface.py"))
+              pure $ case mpc of
+                Nothing -> "verify(mowgli): file missing — claim uncheckable"
+                Just pc ->
+                  let diags = oracleCheck unusedImportOracle (pcPath pc) (pcSource pc)
+                   in "verify(mowgli): " <> T.pack (show (length diags)) <> " unused-import diagnostic(s) confirmed in the real checkout"
+          | "peirce" `T.isInfixOf` p -> do
+              -- The real compiler oracle: the dump probe against the
+              -- installed compiler (the promotion's capability, live).
+              v <- liftIO (oracleDumpProbe ("dispatch-" <> tag))
+              pure ("verify(peirce): " <> ovDetail v)
+          | otherwise -> do
+              -- The toy corpus's marker oracle over one known cell.
+              _v <- liftIO (oracleDumpProbe ("dispatch-campaign-" <> tag))
+              mpc <- liftIO (readProjectCell ("mowgli", "src/adapters/llada_interface.py"))
+              pure $ case mpc of
+                Just pc ->
+                  let diags = oracleCheck unusedImportOracle (pcPath pc) (pcSource pc)
+                   in "verify(campaign): marker oracle ready; mowgli's real file carries "
+                        <> T.pack (show (length diags))
+                        <> " checkable diagnostic(s)"
+                Nothing -> "verify(campaign): marker oracle ready; dump probe ok"
 
-    -- The dispatch registry: executors closed over the run's machinery.
-    dispatchDefs =
-      dispatchRegistry
-        publishHumanQuery
-        tag
-        actions
-        (\a -> execExecute a)
-        execVerify
-    -- The nested campaigns this run launches, rebuilt from the SAME bodies
-    -- the executors used at launch: the resume worker drives a suspended
-    -- campaign to its verdict through its own journal (the settle/cool
-    -- sleeps between attempts are real durable timers). The engine is the
-    -- honest stub, exactly what the launches closed over; a live run is
-    -- the same registry with a live engine.
-    campaignDefs =
-      campaignRegistry
-        pcsM
-        [toyCellD]
-        (\oracle cell -> honestEngineFor oracle cell)
-        publishHumanQuery
-    matrixDefs = matrixRegistry matrixEngine publishHumanQuery
-    registry = Map.unions [dispatchDefs, campaignDefs, matrixDefs]
-    nestedIds =
-      [ wfIdText mowgliWfId,
-        wfIdText matrixWfId,
-        wfIdText (campaignWorkflowId (cellId toyCellD))
-      ]
-    -- Which projects the plan actually dispatched as execute — the nested
-    -- campaigns only exist for those lines (a verify/delegate line launches
-    -- nothing, and the scoreboard must not pretend it did).
-    isExecuteFor proj a = daDispatch a == "execute" && proj (daProject a)
-    mowgliLaunched = any (isExecuteFor ("mowgli" `T.isInfixOf`)) actions
-    peirceLaunched = any (isExecuteFor ("peirce" `T.isInfixOf`)) actions
-    campaignLaunched = any (isExecuteFor (\p -> not ("mowgli" `T.isInfixOf` p || "peirce" `T.isInfixOf` p || "matrix" `T.isInfixOf` p))) actions
-    ourIds =
-      [wfIdText (dispatchWorkflowIdTagged (daProject a) tag) | a <- actions]
-        <> nestedIds
+      -- The dispatch registry: executors closed over the run's machinery.
+      dispatchDefs =
+        dispatchRegistry
+          publishHumanQuery
+          tag
+          actions
+          execExecute
+          execVerify
+      -- The nested campaigns this run launches, rebuilt from the SAME bodies
+      -- the executors used at launch: the resume worker drives a suspended
+      -- campaign to its verdict through its own journal (the settle/cool
+      -- sleeps between attempts are real durable timers). The engine is the
+      -- honest stub, exactly what the launches closed over; a live run is
+      -- the same registry with a live engine.
+      campaignDefs =
+        campaignRegistry
+          pcsM
+          [toyCellD]
+          honestEngineFor
+          publishHumanQuery
+      matrixDefs = matrixRegistry matrixEngine publishHumanQuery
+      registry = Map.unions [dispatchDefs, campaignDefs, matrixDefs]
+      nestedIds =
+        [ wfIdText mowgliWfId,
+          wfIdText matrixWfId,
+          wfIdText (campaignWorkflowId (cellId toyCellD))
+        ]
+      -- Which projects the plan actually dispatched as execute — the nested
+      -- campaigns only exist for those lines (a verify/delegate line launches
+      -- nothing, and the scoreboard must not pretend it did).
+      isExecuteFor proj a = daDispatch a == "execute" && proj (daProject a)
+      mowgliLaunched = any (isExecuteFor ("mowgli" `T.isInfixOf`)) actions
+      peirceLaunched = any (isExecuteFor ("peirce" `T.isInfixOf`)) actions
+      campaignLaunched = any (isExecuteFor (\p -> not ("mowgli" `T.isInfixOf` p || "peirce" `T.isInfixOf` p || "matrix" `T.isInfixOf` p))) actions
+      ourIds =
+        [wfIdText (dispatchWorkflowIdTagged (daProject a) tag) | a <- actions]
+          <> nestedIds
   for_ actions $ \a -> do
     let wid = dispatchWorkflowIdTagged (daProject a) tag
         stream = campaignStreamNameText dispatchWorkflowName wid
@@ -4318,7 +4438,11 @@ runDispatchAct = do
         (v : _) -> case Aeson.fromJSON v of
           Aeson.Success d ->
             putStrLn
-              ( "  " <> T.unpack (daProject a) <> " [" <> T.unpack (daDispatch a) <> "]: "
+              ( "  "
+                  <> T.unpack (daProject a)
+                  <> " ["
+                  <> T.unpack (daDispatch a)
+                  <> "]: "
                   <> T.unpack (T.take 160 d)
               )
           Aeson.Error err -> putStrLn ("  " <> T.unpack (daProject a) <> ": undecodable outcome: " <> err)
@@ -4366,13 +4490,14 @@ runDispatchAct = do
             | StepRecorded name v _ <- journal,
               name `elem` ["execute", "verify", "delegate", "unknown"]
             ]
-      outcomeText <- pure $ case reverse outcomes of
-        (v : _) -> case Aeson.fromJSON v of
-          Aeson.Success d -> d
-          Aeson.Error _ -> "(undecodable)"
-        [] -> "(open)"
+      let outcomeText = case reverse outcomes of
+            (v : _) -> case Aeson.fromJSON v of
+              Aeson.Success d -> d
+              Aeson.Error _ -> "(undecodable)"
+            [] -> "(open)"
       _ <-
-        runKiokuWrite store
+        runKiokuWrite
+          store
           ( recordFixTurn
               sid
               (idx + 1)
@@ -4390,11 +4515,11 @@ runDispatchAct = do
     -- physical-board corruptions go to the human. Typed on TriageIn, no
     -- stub-LM round trip.
     matrixEngine _n _prog input _notes =
-      pure $
-        Just $
-          if any ("corruption" `T.isInfixOf`) (unField input.tiStress)
-            then TriageOut (Field False) (Field "board corruption: human inspection required")
-            else TriageOut (Field True) (Field "kvm misconfiguration clears by re-applying the config")
+      pure
+        $ Just
+        $ if any ("corruption" `T.isInfixOf`) (unField input.tiStress)
+          then TriageOut (Field False) (Field "board corruption: human inspection required")
+          else TriageOut (Field True) (Field "kvm misconfiguration clears by re-applying the config")
 
 -- ===========================================================================
 -- Act 22: the application phase — mowgli's real corpus, live, landed
@@ -4439,8 +4564,8 @@ runAppPhaseAct = do
   -- that run's branch — so consecutive runs partition the scan by offset.
   mlimit <- (>>= readMaybe) <$> lookupEnv "CAMPAIGN_APP_LIMIT"
   moffset <- (>>= readMaybe) <$> lookupEnv "CAMPAIGN_APP_OFFSET"
-  let windowed = maybe cells0 (\o -> drop o cells0) moffset
-      cells = maybe windowed (\n -> take n windowed) (mlimit :: Maybe Int)
+  let windowed = maybe cells0 (`drop` cells0) moffset
+      cells = maybe windowed (`take` windowed) (mlimit :: Maybe Int)
   case (mlimit, length cells0) of
     (Just n, total) | n < total -> putStrLn ("  (run limit " <> show n <> " of " <> show total <> " scanned cells — the rest wait for a later run)")
     _ -> pure ()
@@ -4448,8 +4573,11 @@ runAppPhaseAct = do
     putStrLn "  the scan found no cells — the oracle speaks nowhere in this checkout (nothing to do)"
   for_ cells $ \pc ->
     putStrLn
-      ( "  cell " <> T.unpack (pcProject pc <> ":" <> pcPath pc)
-          <> " — " <> show (length (oracleCheck unusedImportOracle (pcPath pc) (pcSource pc))) <> " diagnostic(s)"
+      ( "  cell "
+          <> T.unpack (pcProject pc <> ":" <> pcPath pc)
+          <> " — "
+          <> show (length (oracleCheck unusedImportOracle (pcPath pc) (pcSource pc)))
+          <> " diagnostic(s)"
       )
   -- CAMPAIGN_APP_SCAN_ONLY=1: the validation run — compare this scan against
   -- an independent detector, attempt nothing, land nothing.
@@ -4483,7 +4611,6 @@ runAppPhaseFixAndLand proj runTag branch cells = do
           let WorkflowId t = projectWorkflowId (pcProject pc) (pcPath pc)
            in WorkflowId (T.replace "pcell-" ("pcell-app-" <> runTag <> "-") t)
         rows = [(pc, campaignStreamNameText projectCampaignWorkflowName (instWfId pc)) | pc <- cells]
-        ourIds = [wfIdText (instWfId pc) | pc <- cells]
         registry =
           Map.unions
             [ campaignRegistry
@@ -4502,16 +4629,23 @@ runAppPhaseFixAndLand proj runTag branch cells = do
           then putStrLn ("  " <> T.unpack (cellKey pc) <> ": journal exists — resuming in place")
           else do
             requireFreshJournal store stream
-            outcome <- requireEither =<< runCampaignStore store
-              (runWorkflowWith defaultWorkflowRunOptions projectCampaignWorkflowName wid
-                ( cellCampaignWorkflow
-                    (liveEngine air)
-                    (raise . publishHumanQuery)
-                    (Cell (CellId (cellKey pc)) (pcPath pc) (pcSource pc) (pcSource pc))
-                    unusedImportOracle
-                    (projectNamespace "mowgli")
-                    defaultMaxAttempts
-                ))
+            outcome <-
+              requireEither
+                =<< runCampaignStore
+                  store
+                  ( runWorkflowWith
+                      defaultWorkflowRunOptions
+                      projectCampaignWorkflowName
+                      wid
+                      ( cellCampaignWorkflow
+                          (liveEngine air)
+                          (raise . publishHumanQuery)
+                          (Cell (CellId (cellKey pc)) (pcPath pc) (pcSource pc) (pcSource pc))
+                          unusedImportOracle
+                          (projectNamespace "mowgli")
+                          defaultMaxAttempts
+                      )
+                  )
             putStrLn ("  launch " <> T.unpack (cellKey pc) <> ": " <> show outcome)
 
     -- Operator hygiene, act 21's rule applied to the app phase: retire any
@@ -4521,7 +4655,7 @@ runAppPhaseFixAndLand proj runTag branch cells = do
     withCampaignStore $ \store -> do
       now <- getCurrentTime
       pairs <- requireEither =<< runCampaignStore store (findUnfinishedWorkflowIds now)
-      let ours = SSet.fromList (map wfIdText (map instWfId cells))
+      let ours = SSet.fromList (map (wfIdText . instWfId) cells)
       for_ pairs $ \(nameText, idText) ->
         when (nameText == unWorkflowName' projectCampaignWorkflowName && not (idText `SSet.member` ours)) $ do
           _ <- requireEither =<< runCampaignStore store (cancelWorkflow projectCampaignWorkflowName (WorkflowId idText))
@@ -4540,8 +4674,11 @@ runAppPhaseFixAndLand proj runTag branch cells = do
           doneRef <- newIORef False
           withCampaignStore $ \store -> do
             fireTime <- addUTCTime 3600 <$> getCurrentTime
-            _ <- requireEither =<< runCampaignStore store
-              (drainWorkflowSleepTimers Nothing fireTime 100 campaignTimerPmFallback)
+            _ <-
+              requireEither
+                =<< runCampaignStore
+                  store
+                  (drainWorkflowSleepTimers Nothing fireTime 100 campaignTimerPmFallback)
             driveResumeOnce store registry
             driveResumeOnce store registry
             statuses <- forM rows $ \(_, stream) -> do
@@ -4596,9 +4733,16 @@ runAppPhaseFixAndLand proj runTag branch cells = do
         case landingRecordOf existing of
           (recd : _) -> putStrLn ("  already landed " <> T.unpack (lrProject recd <> ":" <> lrPath recd) <> " — " <> T.unpack (lrCommit recd))
           [] -> do
-            _ <- requireEither =<< runCampaignStore store
-              (runWorkflowWith defaultWorkflowRunOptions landingWorkflowName wid
-                (landProjectCellWorkflow pc unusedImportOracle branch repair))
+            _ <-
+              requireEither
+                =<< runCampaignStore
+                  store
+                  ( runWorkflowWith
+                      defaultWorkflowRunOptions
+                      landingWorkflowName
+                      wid
+                      (landProjectCellWorkflow pc unusedImportOracle branch repair)
+                  )
             journal <- decodedJournal <$> readJournal store stream
             case landingRecordOf journal of
               (recd : _) ->
@@ -4632,20 +4776,31 @@ runAppPhaseFixAndLand proj runTag branch cells = do
               | cleared = "cleared"
               | otherwise = "closed without clearing"
         putStrLn
-          ( "  " <> T.unpack (cellKey pc) <> ": "
-              <> (if ok then "complete" else "INCOMPLETE") <> ", "
-              <> show (length attempts) <> " attempt(s) — " <> verdict
+          ( "  "
+              <> T.unpack (cellKey pc)
+              <> ": "
+              <> (if ok then "complete" else "INCOMPLETE")
+              <> ", "
+              <> show (length attempts)
+              <> " attempt(s) — "
+              <> verdict
           )
       sid <- runKiokuWrite store (startInfraSession ("application phase (act 22): " <> proj <> " corpus, live, landed"))
-      _ <- runKiokuWrite store
-        ( recordFixTurn
-            sid
-            1
-            "assistant"
-            ( "act 22 scanned " <> T.pack (show (length cells)) <> " real cells in mowgli, fixed them live, and landed "
-                <> T.pack (show (length cellsWithRepairs)) <> " repair(s) on " <> branch
-            )
-        )
+      _ <-
+        runKiokuWrite
+          store
+          ( recordFixTurn
+              sid
+              1
+              "assistant"
+              ( "act 22 scanned "
+                  <> T.pack (show (length cells))
+                  <> " real cells in mowgli, fixed them live, and landed "
+                  <> T.pack (show (length cellsWithRepairs))
+                  <> " repair(s) on "
+                  <> branch
+              )
+          )
       _ <- runKiokuWrite store (completeFixSession sid "the stack applied to a real checkout: scan by oracle, fix by live model, land by worktree, prove by parent-dirty-count")
       putStrLn "  infra session recorded"
     putStrLn "[app] done — a real checkout's real defects, decided by the journals"
@@ -4676,14 +4831,16 @@ runRealAct = do
   units0 <- realUnitCells
   -- REAL_UNIT=<project/arch@config> restricts the act to one cell — the
   -- live one-cell proof pays for one QEMU boot, not seventy.
-  mSel <- maybe Nothing (Just . T.strip . T.pack) <$> lookupEnv "REAL_UNIT"
+  mSel <- fmap (T.strip . T.pack) <$> lookupEnv "REAL_UNIT"
   selected <- case mSel of
     Nothing -> pure units0
     Just sel -> do
       let hits = filter (\u -> realCellKey u == sel) units0
       when (null hits) $
         error
-          ( "REAL_UNIT=" <> T.unpack sel <> " matches no discovered unit. Discovered:\n"
+          ( "REAL_UNIT="
+              <> T.unpack sel
+              <> " matches no discovered unit. Discovered:\n"
               <> T.unpack (T.intercalate "\n" (map realCellKey units0))
           )
       pure hits
@@ -4703,14 +4860,21 @@ runRealAct = do
       schedule = scheduleFromEvidence selected evidence
       units = map seUnit (schRows schedule)
   putStrLn
-    ( "[real] schedule from " <> show (Map.size lessonsByProject) <> " namespace(s) of memory: "
-        <> show (Map.size evidence) <> " cell(s) with evidence"
+    ( "[real] schedule from "
+        <> show (Map.size lessonsByProject)
+        <> " namespace(s) of memory: "
+        <> show (Map.size evidence)
+        <> " cell(s) with evidence"
     )
   let rows = schRows schedule
   for_ (take 8 rows) $ \row ->
     putStrLn
-      ( "  #" <> show (seRank row) <> " " <> T.unpack (realCellKey (seUnit row))
-          <> " — " <> T.unpack (seWhy row)
+      ( "  #"
+          <> show (seRank row)
+          <> " "
+          <> T.unpack (realCellKey (seUnit row))
+          <> " — "
+          <> T.unpack (seWhy row)
       )
   -- A long schedule hides its passed tier at the tail — show it: the tail
   -- is where the evidence (and the money) actually sits.
@@ -4718,8 +4882,12 @@ runRealAct = do
     putStrLn "  …"
     for_ (drop (length rows - 3) rows) $ \row ->
       putStrLn
-        ( "  #" <> show (seRank row) <> " " <> T.unpack (realCellKey (seUnit row))
-            <> " — " <> T.unpack (seWhy row)
+        ( "  #"
+            <> show (seRank row)
+            <> " "
+            <> T.unpack (realCellKey (seUnit row))
+            <> " — "
+            <> T.unpack (seWhy row)
         )
   -- The pacing gate: with REAL_LIMIT=n, exactly the first n schedule
   -- ranks go live and the rest plan — the mode is decided per cell, from
@@ -4735,21 +4903,30 @@ runRealAct = do
       pgclUnits = [u | u <- units, ruProject u == "pgcl"]
       hostUnits = [u | u <- units, ruKind u == "host-verify"]
   putStrLn
-    ( "[real] discovered " <> show (length pgclUnits) <> " pgcl cell(s) across "
-        <> show (length (nub (map ruArch pgclUnits))) <> " arch(es), "
-        <> show (length hostUnits) <> " host unit(s)"
+    ( "[real] discovered "
+        <> show (length pgclUnits)
+        <> " pgcl cell(s) across "
+        <> show (length (nub (map ruArch pgclUnits)))
+        <> " arch(es), "
+        <> show (length hostUnits)
+        <> " host unit(s)"
     )
   for_ (groupSortOn ruProject units) $ \group ->
     let keyOf u = ruArch u <> "@" <> ruConfig u
+        projectOf = case group of
+          (u : _) -> ruProject u
+          [] -> ""
      in putStrLn
-          ( "  " <> T.unpack (ruProject (head group)) <> ": "
+          ( "  "
+              <> T.unpack projectOf
+              <> ": "
               <> T.unpack (T.intercalate ", " (sort (nub (map keyOf group))))
           )
 
   ts <- genTag
   let outDir = "/tmp/real-cells-" <> T.unpack ts
-      rows = [(u, realWorkflowIdTagged u ts) | u <- units]
-      streamOf wid = campaignStreamNameText realWorkflowName wid
+      taggedRows = [(u, realWorkflowIdTagged u ts) | u <- units]
+      streamOf = campaignStreamNameText realWorkflowName
       registry = realRegistry (\u -> (modeFor u, planWhyFor u)) outDir :: WorkflowRegistry CampaignEffects
   createDirectoryIfMissing True outDir
 
@@ -4757,8 +4934,8 @@ runRealAct = do
   -- step is a pure record); live it runs the tool synchronously inside the
   -- step and completes the same way — either way no timers, so one launch
   -- sweep per run and one resume pass to drain.
-  putStrLn ("[real] dispatching " <> show (length rows) <> " cell workflow(s) into keiro")
-  for_ rows $ \(u, wid) ->
+  putStrLn ("[real] dispatching " <> show (length taggedRows) <> " cell workflow(s) into keiro")
+  for_ taggedRows $ \(u, wid) ->
     withCampaignStore $ \store -> do
       requireFreshJournal store (streamOf wid)
       outcome <-
@@ -4775,7 +4952,7 @@ runRealAct = do
 
   putStrLn "[real] scoreboard — from the journals:"
   verdictsRef <- newIORef []
-  forM_ rows $ \(u, wid) ->
+  forM_ taggedRows $ \(u, wid) ->
     withCampaignStore $ \store -> do
       journal <- readJournal store (streamOf wid)
       modifyIORef' verdictsRef ((u, realAttemptsOf (decodedJournal journal)) :)
@@ -4783,7 +4960,11 @@ runRealAct = do
   for_ verdicts $ \(u, attempts) ->
     for_ attempts $ \a -> do
       putStrLn
-        ( "  " <> T.unpack (realCellKey u) <> " [" <> T.unpack a.raMode <> "] "
+        ( "  "
+            <> T.unpack (realCellKey u)
+            <> " ["
+            <> T.unpack a.raMode
+            <> "] "
             <> T.unpack a.raVerdict
             <> (if T.null a.raLog then "" else "  log: " <> T.unpack a.raLog)
         )
@@ -4806,19 +4987,25 @@ runRealAct = do
   withCampaignStore $ \store -> do
     sid <- runKiokuWrite store (startInfraSession "act 23: real verification dispatch")
     _ <-
-      runKiokuWrite store
+      runKiokuWrite
+        store
         ( recordFixTurn
             sid
             1
             "assistant"
-            ( "dispatched " <> T.pack (show (length rows)) <> " real cells in "
-                <> T.pack modeText <> " mode, scheduled from memory ("
-                <> T.pack (show (Map.size evidence)) <> " cell(s) with evidence): "
-                <> T.intercalate ", " [realCellKey u | (u, _) <- rows]
+            ( "dispatched "
+                <> T.pack (show (length taggedRows))
+                <> " real cells in "
+                <> T.pack modeText
+                <> " mode, scheduled from memory ("
+                <> T.pack (show (Map.size evidence))
+                <> " cell(s) with evidence): "
+                <> T.intercalate ", " [realCellKey u | (u, _) <- taggedRows]
             )
         )
     _ <-
-      runKiokuWrite store
+      runKiokuWrite
+        store
         (completeFixSession sid ("real-cell dispatch (" <> T.pack modeText <> ") over pgcl and telix: verdicts from the tools' own logs"))
     putStrLn "  infra session recorded"
 
@@ -4862,7 +5049,7 @@ runEscalationDistillAct = do
   withCampaignStore $ \store -> do
     evsE <- runCampaignStore store (Store.readAllForward (Store.GlobalPosition 0) 100000)
     events <- requireEither evsE
-    let wjes = [wje | Right wje <- decodeRecorded workflowJournalCodec <$> Vector.toList events]
+    let wjes = rights (decodeRecorded workflowJournalCodec <$> Vector.toList events)
         textOf v = case Aeson.fromJSON v of
           Aeson.Success t -> Just (t :: Text)
           Aeson.Error _ -> Nothing
@@ -4877,16 +5064,22 @@ runEscalationDistillAct = do
             | "awk:" `T.isPrefixOf` name,
               Just v <- textOf result,
               v `elem` ["VerdictApproved", "VerdictRejected"] ->
-              Just (T.drop 4 name, v)
+                Just (T.drop 4 name, v)
           _ -> Nothing
         verdicts = mapMaybe verdictOf wjes
         answeredCount = length verdicts
         approvedCount = length [() | (_, "VerdictApproved") <- verdicts]
         n = length publishes
     putStrLn
-      ( "[escalation] " <> show n <> " human query(ies) published, "
-          <> show answeredCount <> " answered ("
-          <> show approvedCount <> " approved, " <> show (answeredCount - approvedCount) <> " rejected)"
+      ( "[escalation] "
+          <> show n
+          <> " human query(ies) published, "
+          <> show answeredCount
+          <> " answered ("
+          <> show approvedCount
+          <> " approved, "
+          <> show (answeredCount - approvedCount)
+          <> " rejected)"
       )
     for_ publishes $ \(aid, at) ->
       putStrLn ("  query " <> T.unpack aid <> " @ " <> show at)
@@ -4927,20 +5120,28 @@ runEscalationDistillAct = do
 classifyProbeMode :: String -> IO ()
 classifyProbeMode spec =
   for_ (T.splitOn "," (T.strip (T.pack spec))) $ \item ->
-    if T.null item then pure () else do
-      let (archPart, path) = case T.breakOn ":" item of
-            (_, rest) | T.null rest -> ("", item)
-            (a, r) -> (a, T.drop 1 r)
-          (arch, baseline) = case T.breakOn "@" archPart of
-            (a, r) | T.null r -> (a, ([] :: [Text]))
-            (a, r) -> (a, T.splitOn ";" (T.drop 1 r))
-      body <- T.pack <$> readFile (T.unpack path)
-      -- No `@baseline` in the spec: exercise the arch built-in only (the
-      -- pre-existing behaviour). With it: union the built-in with the named
-      -- baselines, exactly as the manifest path does.
-      let v =
-            if null baseline
-              then verdictFrom ExitSuccess arch body
-              else verdictFromBaseline ExitSuccess arch (knownFailuresFor arch <> baseline) body
-      putStrLn $ "  " <> T.unpack arch <> (if null baseline then "" else "@" <> T.unpack (T.intercalate ";" baseline)) <> ":" <> T.unpack path
-        <> " -> " <> T.unpack v
+    if T.null item
+      then pure ()
+      else do
+        let (archPart, path) = case T.breakOn ":" item of
+              (_, rest) | T.null rest -> ("", item)
+              (a, r) -> (a, T.drop 1 r)
+            (arch, baseline) = case T.breakOn "@" archPart of
+              (a, r) | T.null r -> (a, [] :: [Text])
+              (a, r) -> (a, T.splitOn ";" (T.drop 1 r))
+        body <- T.pack <$> readFile (T.unpack path)
+        -- No `@baseline` in the spec: exercise the arch built-in only (the
+        -- pre-existing behaviour). With it: union the built-in with the named
+        -- baselines, exactly as the manifest path does.
+        let v =
+              if null baseline
+                then verdictFrom ExitSuccess arch body
+                else verdictFromBaseline ExitSuccess arch (knownFailuresFor arch <> baseline) body
+        putStrLn $
+          "  "
+            <> T.unpack arch
+            <> (if null baseline then "" else "@" <> T.unpack (T.intercalate ";" baseline))
+            <> ":"
+            <> T.unpack path
+            <> " -> "
+            <> T.unpack v

@@ -1,105 +1,106 @@
-cabal-version:   3.4
-name:            shikumi-hello
-version:         0.1.0.0
-synopsis:        Shikumi playground: hello world and tutorial tiers
+cabal-version: 3.4
+name:          shikumi-hello
+version:       0.1.0.0
+synopsis:      Shikumi playground: hello world and tutorial tiers
 description:
   A minimal standalone shikumi program: declare input/output records, derive
   the schema/decode/prompt contract, wrap a Signature in predict, and run it
   under the offline stub LM from shikumi-testing. No API key, no network.
   Tier 2 adds composition, combinators, and evaluation examples.
-license:         BSD-3-Clause
-build-type:      Simple
+
+license:       BSD-3-Clause
+build-type:    Simple
 
 common common-all
   default-language: GHC2024
   ghc-options:      -Wall -threaded
   hs-source-dirs:   . tier2 tier3 tier4 tier5 tier6 tier7
   build-depends:
-    , aeson           ^>=2.2
-    , baikai          >=0.7.0.0 && <0.8
-    , baikai-openai   >=0.7.0.0 && <0.8
-    , base            >=4.20    && <5
+    , aeson            ^>=2.2
+    , baikai           >=0.7.0.0  && <0.8
+    , baikai-openai    >=0.7.0.0  && <0.8
+    , base             >=4.20     && <5
     , bytestring
-    , effectful       >=2.5     && <2.7
-    , generic-lens    >=2.2     && <2.4
-    , lens            ^>=5.3
-    , shikumi         ^>=0.4.0.0
-    , shikumi-testing ^>=0.1.0.0
-    , text            ^>=2.1
+    , effectful        >=2.5      && <2.7
+    , generic-lens     >=2.2      && <2.4
+    , lens             ^>=5.3
+    , shikumi          ^>=0.4.0.0
+    , shikumi-testing  ^>=0.1.0.0
+    , text             ^>=2.1
     , vector
 
 -- Tier 1: hello world — one program, offline stub + live provider modes.
 executable shikumi-hello
-  import:         common-all
-  main-is:        Main.hs
+  import:  common-all
+  main-is: Main.hs
 
 -- Tier 2a: compose typed programs with (>>>); mismatches are compile errors.
 executable tier2-compose
-  import:         common-all
-  main-is:        Tier2Compose.hs
+  import:  common-all
+  main-is: Tier2Compose.hs
 
 -- Tier 2b: control flow as combinators — every one still a Program value.
 executable tier2-combinators
-  import:         common-all
-  main-is:        Tier2Combinators.hs
+  import:  common-all
+  main-is: Tier2Combinators.hs
 
 -- Tier 2c: evaluate a program against a typed dataset with a typed metric.
 executable tier2-evaluate
-  import:         common-all
-  main-is:        Tier2Evaluate.hs
-  build-depends:  shikumi-eval ^>=0.3.0.0
+  import:        common-all
+  main-is:       Tier2Evaluate.hs
+  build-depends: shikumi-eval ^>=0.3.0.0
 
 -- Tier 3: optimize demos against data, then serialize/reload the params.
 executable tier3-optimize
-  import:         common-all
-  main-is:        Tier3Optimize.hs
+  import:        common-all
+  main-is:       Tier3Optimize.hs
   build-depends:
-    , shikumi-compile ^>=0.2.1.0
-    , shikumi-eval    ^>=0.3.0.0
-    , shikumi-optimize ^>=0.3.0.0
+    , shikumi-compile   ^>=0.2.1.0
+    , shikumi-eval      ^>=0.3.0.0
+    , shikumi-optimize  ^>=0.3.0.0
 
 -- Tier 4: caching, tracing, and deterministic replay of one program.
 executable tier4-trace-replay
-  import:         common-all
-  main-is:        Tier4TraceReplay.hs
+  import:        common-all
+  main-is:       Tier4TraceReplay.hs
   build-depends:
     , filepath
-    , shikumi-cache ^>=0.2.0.0
-    , shikumi-trace ^>=0.3.0.0
+    , shikumi-cache  ^>=0.2.0.0
+    , shikumi-trace  ^>=0.3.0.0
     , temporary
 
 -- Tier 5: a typed tool and a ReAct agent loop, driven by a scripted offline LM.
 executable tier5-react-agent
-  import:         common-all
-  main-is:        Tier5ReActAgent.hs
+  import:        common-all
+  main-is:       Tier5ReActAgent.hs
   build-depends:
-    , shikumi-tools ^>=0.4.0.0
-    , vector        ^>=0.13
+    , shikumi-tools  ^>=0.4.0.0
+    , vector         ^>=0.13
 
 -- Tier 6: the CLI — subcommand builders wired around our own task.
 executable tier6-cli
-  import:         common-all
-  main-is:        Tier6Cli.hs
+  import:        common-all
+  main-is:       Tier6Cli.hs
   build-depends:
     , containers
-    , shikumi-cli     ^>=0.1.0.0
-    , shikumi-eval    ^>=0.3.0.0
-    , shikumi-optimize ^>=0.3.0.0
+    , shikumi-cli       ^>=0.1.0.0
+    , shikumi-eval      ^>=0.3.0.0
+    , shikumi-optimize  ^>=0.3.0.0
 
 -- Side dish: program-level streaming.
 executable tier7-streaming
-  import:         common-all
-  main-is:        Tier7Streaming.hs
+  import:  common-all
+  main-is: Tier7Streaming.hs
 
 -- Side dish: multimodal input — an Image field the model actually sees.
 executable tier7-multimodal
-  import:         common-all
-  main-is:        Tier7Multimodal.hs
+  import:  common-all
+  main-is: Tier7Multimodal.hs
 
 -- Side dish: code execution — programOfThought and codeAct over the sandbox.
 executable tier7-codeexec
-  import:         common-all
-  main-is:        Tier7CodeExec.hs
+  import:        common-all
+  main-is:       Tier7CodeExec.hs
   build-depends:
-    , shikumi-tools ^>=0.4.0.0
-    , vector        ^>=0.13
+    , shikumi-tools  ^>=0.4.0.0
+    , vector         ^>=0.13

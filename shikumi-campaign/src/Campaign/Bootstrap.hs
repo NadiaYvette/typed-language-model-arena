@@ -41,12 +41,14 @@ module Campaign.Bootstrap
     stopOwnedServer,
     serverAnswers,
     scratchConnFor,
+
     -- * Boot
     bootstrapCampaignStore,
     bootstrapStore,
     createDatabaseIfAbsent,
     storeWorkflowCount,
     dropDatabase,
+
     -- * Plumbing (for the driver's act 14)
     withPool,
     sentinelRelation,
@@ -55,12 +57,11 @@ where
 
 import Control.Concurrent (threadDelay)
 import Control.Exception (SomeException, bracket, try)
-import Control.Monad (forM, forM_, unless, when)
+import Control.Monad (forM, forM_, unless)
 import Data.Char qualified as Char
 import Data.List (sort)
 import Data.Maybe (fromMaybe)
 import Data.Text qualified as T
-import Hasql.Connection qualified as Conn
 import Hasql.Connection.Settings qualified as ConnSettings
 import Hasql.Decoders qualified as D
 import Hasql.Encoders qualified as E
@@ -75,12 +76,11 @@ import System.Directory
     doesFileExist,
     getXdgDirectory,
     listDirectory,
-    removeFile,
   )
 import System.Environment (lookupEnv)
 import System.Exit (ExitCode (..), exitFailure)
 import System.FilePath (takeExtension, (</>))
-import System.IO (hPutStrLn, stderr)
+import System.IO (hPrint, hPutStrLn, stderr)
 import System.Process (proc, readCreateProcessWithExitCode)
 import Text.Read (readMaybe)
 
@@ -91,11 +91,11 @@ import Text.Read (readMaybe)
 -- ---------------------------------------------------------------------------
 
 data CampaignConn = CampaignConn
-  { ccHost :: Maybe T.Text
-  , ccPort :: Maybe Int
-  , ccUser :: Maybe T.Text
-  , ccPassword :: Maybe T.Text
-  , ccDbname :: T.Text
+  { ccHost :: Maybe T.Text,
+    ccPort :: Maybe Int,
+    ccUser :: Maybe T.Text,
+    ccPassword :: Maybe T.Text,
+    ccDbname :: T.Text
   }
   deriving stock (Eq, Show)
 
@@ -107,19 +107,19 @@ parseCampaignConn raw
   | T.null (T.strip raw) = CampaignConn Nothing Nothing Nothing Nothing "campaign"
   | otherwise =
       CampaignConn
-        { ccHost = val "host"
-        , ccPort = val "port" >>= (readMaybe . T.unpack)
-        , ccUser = val "user"
-        , ccPassword = val "password"
-        , ccDbname = fromMaybe "campaign" (val "dbname")
+        { ccHost = val "host",
+          ccPort = val "port" >>= (readMaybe . T.unpack),
+          ccUser = val "user",
+          ccPassword = val "password",
+          ccDbname = fromMaybe "campaign" (val "dbname")
         }
   where
     pairs =
       [ (k, T.strip v)
-      | kv <- T.words (T.strip raw)
-      , let (k, rest) = T.break (== '=') kv
-      , not (T.null rest)
-      , let v = T.drop 1 rest
+      | kv <- T.words (T.strip raw),
+        let (k, rest) = T.break (== '=') kv,
+        not (T.null rest),
+        let v = T.drop 1 rest
       ]
     val k = lookup k pairs
 
@@ -127,11 +127,11 @@ renderCampaignConn :: CampaignConn -> T.Text
 renderCampaignConn c =
   T.unwords $
     concat
-      [ maybe [] (\h -> ["host=" <> h]) c.ccHost
-      , maybe [] (\p -> ["port=" <> T.pack (show p)]) c.ccPort
-      , maybe [] (\u -> ["user=" <> u]) c.ccUser
-      , maybe [] (\p -> ["password=" <> p]) c.ccPassword
-      , ["dbname=" <> c.ccDbname]
+      [ maybe [] (\h -> ["host=" <> h]) c.ccHost,
+        maybe [] (\p -> ["port=" <> T.pack (show p)]) c.ccPort,
+        maybe [] (\u -> ["user=" <> u]) c.ccUser,
+        maybe [] (\p -> ["password=" <> p]) c.ccPassword,
+        ["dbname=" <> c.ccDbname]
       ]
 
 -- | The campaign's own connection, three modes:
@@ -350,8 +350,8 @@ withPool conn =
     ( P.acquire
         ( PC.settings
             [ PC.staticConnectionSettings
-                (ConnSettings.connectionString (renderCampaignConn conn))
-            , PC.size 2
+                (ConnSettings.connectionString (renderCampaignConn conn)),
+              PC.size 2
             ]
         )
     )
@@ -379,7 +379,8 @@ quoteIdent t = "\"" <> T.replace "\"" "\"\"" t <> "\""
 createDatabaseIfAbsent :: CampaignConn -> IO Bool
 createDatabaseIfAbsent conn = withServerPool conn $ \pool -> do
   exists <-
-    usePool pool
+    usePool
+      pool
       ( Session.statement
           conn.ccDbname
           ( unpreparable
@@ -391,7 +392,8 @@ createDatabaseIfAbsent conn = withServerPool conn $ \pool -> do
   if exists
     then pure False
     else do
-      usePool pool
+      usePool
+        pool
         ( Session.statement
             ()
             ( unpreparable
@@ -417,7 +419,8 @@ createDatabaseIfAbsent conn = withServerPool conn $ \pool -> do
 -- backends so a re-run of the act always starts clean.
 dropDatabase :: CampaignConn -> IO ()
 dropDatabase conn = withServerPool conn $ \pool ->
-  usePool pool
+  usePool
+    pool
     ( Session.statement
         ()
         ( unpreparable
@@ -440,7 +443,8 @@ sentinelRelation = "keiro.keiro_workflows"
 storeWorkflowCount :: CampaignConn -> IO (Maybe Int)
 storeWorkflowCount conn = withPool conn $ \pool -> do
   schemaOk <-
-    usePool pool
+    usePool
+      pool
       ( Session.statement
           ()
           ( unpreparable
@@ -453,7 +457,8 @@ storeWorkflowCount conn = withPool conn $ \pool -> do
     then pure Nothing
     else do
       n <-
-        usePool pool
+        usePool
+          pool
           ( Session.statement
               ()
               ( unpreparable
@@ -484,8 +489,8 @@ bootstrapStore conn = do
         let sqls =
               sort
                 [ dir </> e
-                | e <- entries
-                , takeExtension e == ".sql"
+                | e <- entries,
+                  takeExtension e == ".sql"
                 ]
         pure [(layer, f) | f <- sqls]
   withPool conn $ \pool ->
@@ -497,7 +502,7 @@ bootstrapStore conn = do
         Right () -> pure ()
         Left err -> do
           hPutStrLn stderr ("bootstrap: migration failed: layer " <> show layer <> ", file " <> f)
-          hPutStrLn stderr (show err)
+          hPrint stderr err
           exitFailure
   pure (length files)
 

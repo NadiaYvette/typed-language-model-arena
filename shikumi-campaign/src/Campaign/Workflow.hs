@@ -56,34 +56,7 @@ module Campaign.Workflow
   )
 where
 
-import Data.Aeson (FromJSON, ToJSON)
-import Data.Map.Strict qualified as Map
-import Data.Maybe (fromMaybe)
-import Data.Text (Text)
-import Data.Text qualified as T
-import Data.Time.Clock (NominalDiffTime)
-import Control.Applicative ((<|>))
-import Effectful (Eff, IOE, liftIO, raise, (:>))
-import Effectful.Error.Static (throwError)
-import GHC.Generics (Generic)
-
 import Baikai (Context, Response)
-import Campaign.Memory (campaignNamespace, projectNamespace, projectNamespaceSafe, recallNotesForKeyword)
-import Campaign.Oracle (CellOracle (..), ProjectCell (..), RepairRules (..), markerOracle, pythonSyntaxCheck, repairRulesFor, unusedImportOracle)
-import Data.Char (isDigit)
-import Data.List (find)
-import Kioku.Api.Scope (Namespace)
-import Kiroku.Store.Effect.Resource (KirokuStoreResource)
-import Shikumi.Combinator ((>>>))
-import Shikumi.Error (ShikumiError (..))
-import Shikumi.Module (predict)
-import Shikumi.Program (Program, embed, runProgram)
-import Shikumi.Schema.Types (Field (..))
-import Shikumi.Signature (Demo (..), Signature, getInstruction, setDemos, setInstruction)
-import Shikumi.Testing (runStubEval)
-import Toy.Fixer.Domain (Source (..), SourcePath, diagLine, showDiagnostic, sourceText)
-import Toy.Fixer.Program (DiagnosticsIn (..), RepairOut (..), applyRepair, repairSignature)
-
 import Campaign.Cell
   ( Cell (..),
     CellId (..),
@@ -91,8 +64,20 @@ import Campaign.Cell
     cellForId,
     unCellId,
   )
+import Campaign.Memory (campaignNamespace, projectNamespaceSafe, recallNotesForKeyword)
+import Campaign.Oracle (CellOracle (..), ProjectCell (..), RepairRules (..), markerOracle, pythonSyntaxCheck, repairRulesFor, unusedImportOracle)
+import Control.Applicative ((<|>))
+import Data.Aeson (FromJSON, ToJSON)
+import Data.Char (isDigit)
 import Data.List (find)
-
+import Data.Map.Strict qualified as Map
+import Data.Maybe (fromMaybe, isNothing)
+import Data.Text (Text)
+import Data.Text qualified as T
+import Data.Time.Clock (NominalDiffTime)
+import Effectful (Eff, IOE, liftIO, raise, (:>))
+import Effectful.Error.Static (throwError)
+import GHC.Generics (Generic)
 import Keiro.Workflow
   ( StepName (..),
     Workflow,
@@ -104,8 +89,19 @@ import Keiro.Workflow.Awakeable (AwakeableId, awakeableNamed)
 import Keiro.Workflow.Resume (WorkflowDef (..), WorkflowRegistry)
 import Keiro.Workflow.Sleep (sleepNamed)
 import Keiro.Workflow.Types (WorkflowName (..))
+import Kioku.Api.Scope (Namespace)
 import Kiroku.Store.Effect (Store)
+import Kiroku.Store.Effect.Resource (KirokuStoreResource)
 import Kiroku.Store.Types (StreamName (..))
+import Shikumi.Combinator ((>>>))
+import Shikumi.Error (ShikumiError (..))
+import Shikumi.Module (predict)
+import Shikumi.Program (Program, embed, runProgram)
+import Shikumi.Schema.Types (Field (..))
+import Shikumi.Signature (Demo (..), Signature, getInstruction, setDemos, setInstruction)
+import Shikumi.Testing (runStubEval)
+import Toy.Fixer.Domain (Source (..), SourcePath, diagLine, showDiagnostic, sourceText)
+import Toy.Fixer.Program (DiagnosticsIn (..), RepairOut (..), applyRepair, repairSignature)
 
 -- ---------------------------------------------------------------------------
 -- Names and identity
@@ -269,8 +265,10 @@ liveInstruction orig notes mRewrite =
     rewriteClause = case mRewrite of
       Nothing -> ""
       Just (ln, txt) ->
-        ", except that line " <> T.pack (show ln)
-          <> " must read exactly: " <> txt
+        ", except that line "
+          <> T.pack (show ln)
+          <> " must read exactly: "
+          <> txt
     example =
       Demo
         ( DiagnosticsIn
@@ -341,7 +339,8 @@ runFixAttempt engine orig rules path input notes n = go notes (0 :: Int)
       liftIO $ putStrLn "    [guard] rejection — fed back as a lesson"
       go
         ( ns
-            <> [ "Your previous reply was rejected: " <> why
+            <> [ "Your previous reply was rejected: "
+                   <> why
                    <> " Return the complete file with ONLY the flagged import statements removed (rewriting a partially-used statement to keep its used names is allowed)."
                ]
         )
@@ -372,7 +371,7 @@ runFixAttempt engine orig rules path input notes n = go notes (0 :: Int)
 -- file would otherwise clear.
 surgicalRepair :: Source -> RepairRules -> Source -> Either ShikumiError Source
 surgicalRepair orig rules (Source new)
-  | null (rrDroppableLines rules) && rrRewrite rules == Nothing = Right (Source new)
+  | null (rrDroppableLines rules) && isNothing (rrRewrite rules) = Right (Source new)
   | Just ds <- alignment, all allowed ds, not keptLineDeleted = Right (Source new)
   | otherwise =
       Left
@@ -398,7 +397,7 @@ surgicalRepair orig rules (Source new)
         go _ [] ys = if null ys then Just [] else Nothing
         -- The repair ended early: every remaining original line is a
         -- deletion (the missing clause once crashed a live drive round).
-        go n (x : xs) [] = (n :) <$> go (n + 1) xs []
+        go n (_ : xs) [] = (n :) <$> go (n + 1) xs []
         go n (x : xs) (y : ys)
           | x == y = go (n + 1) xs ys
           | Just (rn, txt) <- mRewrite, n == rn, y == txt = go (n + 1) xs ys
@@ -563,7 +562,7 @@ campaignRegistry projectCells extraCells engine publishHumanQuery =
       ( projectCampaignWorkflowName,
         WorkflowDef $ \wid ->
           case projectCellFromWf wid of
-            Nothing -> error ("campaignRegistry: malformed project workflow id")
+            Nothing -> error "campaignRegistry: malformed project workflow id"
             Just (proj, path) ->
               case find (\pc -> pcProject pc == proj && pcPath pc == path) projectCells of
                 Nothing -> error ("campaignRegistry: unknown project cell " <> T.unpack (proj <> ":" <> path))

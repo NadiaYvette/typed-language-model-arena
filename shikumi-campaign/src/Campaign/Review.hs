@@ -39,29 +39,25 @@ module Campaign.Review
   )
 where
 
+import Campaign.Attestation (Attestation (..), JournalRef (..), VerificationTrailer (..), appendVerificationTrailer, attestationHash, didKeyFromRaw)
+import Campaign.Hands (campaignWorktreePath, gitCapture, parentRepoPath)
+import Campaign.Oracle (CellOracle (..))
+import Campaign.RepairReceipt (RepairReceipt, admitReceiptsForFiles)
+import Campaign.SshAgent (getSshAgentKey, pubKeyBlobForEd25519, signWithAgent)
 import Control.Exception (try)
+import Control.Monad (when)
+import Data.Aeson qualified as Aeson
+import Data.Base64.Types qualified as B64
+import Data.ByteString.Base64 qualified as B64
 import Data.List (sort)
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Text.Encoding qualified as T
+import GHC.Generics (Generic)
 import System.Directory (doesDirectoryExist, doesFileExist)
 import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
 import System.Process.Typed (proc, readProcess)
-
-import Data.Aeson qualified as Aeson
-import GHC.Generics (Generic)
-
-import Campaign.Hands (campaignWorktreePath, gitCapture, parentRepoPath)
-import Campaign.Oracle (CellOracle (..))
-import Campaign.RepairReceipt (RepairReceipt, admitReceiptsForFiles)
-import qualified Data.ByteString as B
-import qualified Data.ByteString.Base64 as B64
-import qualified Data.Base64.Types as B64
-import qualified Data.Text as T
-import qualified Data.Text.Encoding as T
-import Campaign.Attestation (Attestation(..), JournalRef(..), VerificationTrailer(..), appendVerificationTrailer, attestationHash, didKeyFromRaw)
-import Campaign.SshAgent (getSshAgentKey, signWithAgent, pubKeyBlobForEd25519)
-import Crypto.PubKey.Ed25519 (SecretKey, sign, PublicKey)
 import Toy.Fixer.Domain (Source (..), showDiagnostic)
 
 -- | One reviewable branch of one project, as 'listReviewBranches' reports it.
@@ -174,7 +170,7 @@ approveBranch oracle receipts proj branch = do
   def <- defaultBranchOf proj
   let parent = parentRepoPath proj
   -- The branch's worktree must exist (it is where the branch's bytes live).
-  gitIn parent ["worktree", "prune"]
+  _ <- gitIn parent ["worktree", "prune"]
   hasWt <- doesDirectoryExist (campaignWorktreePath proj branch)
   if not hasWt
     then pure (ApprovalOutcome "" [] ["branch worktree missing: " <> T.pack wt <> " — nothing to verify, nothing merged"] Nothing)
@@ -231,15 +227,15 @@ approveBranch oracle receipts proj branch = do
                   -- itself).
                   let att =
                         Attestation
-                          { attProject = proj
-                          , attBranch = branch
-                          , attOracleId = oracleId oracle
-                          , attFiles = sort files
-                          , attJournal = journalRefFor proj branch
+                          { attProject = proj,
+                            attBranch = branch,
+                            attOracleId = oracleId oracle,
+                            attFiles = sort files,
+                            attJournal = journalRefFor proj branch
                           }
                       attHash = attestationHash att
 
-                      -- Use SSH Agent to sign attHash
+                  -- Use SSH Agent to sign attHash
                   rawKey <- getSshAgentKey
                   let pubKeyBlob = pubKeyBlobForEd25519 rawKey
                   sig <- signWithAgent pubKeyBlob (T.encodeUtf8 attHash)
@@ -249,9 +245,9 @@ approveBranch oracle receipts proj branch = do
 
                       attTrailer =
                         VerificationTrailer
-                          { vtHash = attHash
-                          , vtJournal = journalRefFor proj branch
-                          , vtSigner = Just $ didKey <> ":" <> B64.extractBase64 signature
+                          { vtHash = attHash,
+                            vtJournal = journalRefFor proj branch,
+                            vtSigner = Just $ didKey <> ":" <> B64.extractBase64 signature
                           }
                   -- HEAD is the merge target (the parent is on a branch and
                   -- clean — checked above). origin/<def> is a remote-tracking
@@ -264,8 +260,8 @@ approveBranch oracle receipts proj branch = do
                   already <- gitProbe parent ["merge-base", "--is-ancestor", T.unpack branch, "HEAD"]
                   if already
                     then do
-                      gitIn parent ["worktree", "remove", "--force", wt]
-                      gitIn parent ["branch", "-d", T.unpack branch]
+                      _ <- gitIn parent ["worktree", "remove", "--force", wt]
+                      _ <- gitIn parent ["branch", "-d", T.unpack branch]
                       pure (ApprovalOutcome before files [] Nothing)
                     else do
                       -- The merge commit carries the attestation trailer
@@ -287,7 +283,8 @@ approveBranch oracle receipts proj branch = do
                                 T.unpack mergeMessage,
                                 T.unpack branch
                               ]
-                          ) :: IO (Either IOError Text)
+                          ) ::
+                          IO (Either IOError Text)
                       case mergedOr of
                         Left _ -> do
                           -- A conflict leaves the parent's index and worktree
@@ -317,15 +314,15 @@ approveBranch oracle receipts proj branch = do
                               -- fixed). Content-wise idempotent: retire.
                               if "Already up to date" `T.isInfixOf` out
                                 then do
-                                  gitIn parent ["worktree", "remove", "--force", wt]
-                                  gitIn parent ["branch", "-d", T.unpack branch]
+                                  _ <- gitIn parent ["worktree", "remove", "--force", wt]
+                                  _ <- gitIn parent ["branch", "-d", T.unpack branch]
                                   pure (ApprovalOutcome before files [] Nothing)
                                 else pure (ApprovalOutcome "" files ["merge produced no new commit on the checked-out branch — unexpected; investigate"] Nothing)
                             else do
                               -- Merged: retire the branch and its worktree. -d
                               -- (not -D) refuses if git disagrees that it merged.
-                              gitIn parent ["worktree", "remove", "--force", wt]
-                              gitIn parent ["branch", "-d", T.unpack branch]
+                              _ <- gitIn parent ["worktree", "remove", "--force", wt]
+                              _ <- gitIn parent ["branch", "-d", T.unpack branch]
                               pure (ApprovalOutcome mc files [] (Just attHash))
   where
     wt = campaignWorktreePath proj branch
@@ -348,19 +345,19 @@ rejectBranch :: Text -> Text -> IO ()
 rejectBranch proj branch = do
   let parent = parentRepoPath proj
       wt = campaignWorktreePath proj branch
-  gitIn parent ["worktree", "prune"]
+  _ <- gitIn parent ["worktree", "prune"]
   hasWt <- doesDirectoryExist wt
-  if hasWt
-    then do
-      _ <- gitIn parent ["worktree", "remove", "--force", wt]
-      pure ()
-    else pure ()
+  when hasWt $ do
+    _ <- gitIn parent ["worktree", "remove", "--force", wt]
+    pure ()
   _ <- gitIn parent ["branch", "-D", T.unpack branch]
   pure ()
 
 mergeMsg :: Text -> Text
 mergeMsg branch =
-  "Merge " <> branch <> ": campaign repairs, approved by the operator\n\n"
+  "Merge "
+    <> branch
+    <> ": campaign repairs, approved by the operator\n\n"
     <> "Landed by the shikumi-campaign application phase, verified by the\n"
     <> "oracle, re-verified at the merge seam, and approved by a human\n"
     <> "verdict (journaled in the campaign's memory).\n"

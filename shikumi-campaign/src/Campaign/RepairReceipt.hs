@@ -1,7 +1,7 @@
 {-# LANGUAGE GHC2024 #-}
-{-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE DeriveAnyClass #-}
 {-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE OverloadedStrings #-}
 
 -- | Repair blueprints and receipts (Track 10, milestone 3 — Vector D model).
 --
@@ -18,7 +18,6 @@
 -- admissible only if every re-derived fact matches what it recorded. An
 -- admitted receipt is evidence for the review gate — approveBranch still
 -- owns the final oracle re-verification of the branch's actual files.
-
 module Campaign.RepairReceipt
   ( -- * Schemas
     RepairOp (..),
@@ -38,17 +37,15 @@ module Campaign.RepairReceipt
   )
 where
 
-import Control.Exception qualified as E
+import Campaign.Oracle (CellOracle (..))
 import Control.Exception (SomeException)
+import Control.Exception qualified as E
 import Data.Text (Text)
 import Data.Text qualified as T
+import Dhall qualified
 import GHC.Generics (Generic)
 import GHC.Natural (Natural)
-
-import Dhall qualified as Dhall
 import Toy.Fixer.Domain (Source (..), showDiagnostic)
-
-import Campaign.Oracle (CellOracle (..))
 
 -- ---------------------------------------------------------------------------
 -- Schema types (field names mirror the Dhall record keys exactly, so the
@@ -68,10 +65,10 @@ import Campaign.Oracle (CellOracle (..))
 -- derive to its own Dhall union type — the dhall package derives it to the
 -- payload record — so the record is the honest first shape.)
 data RepairOp = DeleteLine
-  { opLine :: !Natural,
-    -- ^ the ORIGINAL line number the operation deletes
+  { -- | the ORIGINAL line number the operation deletes
+    opLine :: !Natural,
+    -- | the line's text, recorded so a tampered op fails re-derivation
     opText :: !Text
-    -- ^ the line's text, recorded so a tampered op fails re-derivation
   }
   deriving stock (Eq, Show, Generic)
   deriving anyclass (Dhall.FromDhall, Dhall.ToDhall)
@@ -131,8 +128,8 @@ data RepairReceipt = RepairReceipt
 loadRepairBlueprint :: FilePath -> IO (Either Text RepairBlueprint)
 loadRepairBlueprint path = do
   m <-
-    E.try (Dhall.inputFileWithSettings Dhall.defaultEvaluateSettings Dhall.auto path)
-      :: IO (Either SomeException RepairBlueprint)
+    E.try (Dhall.inputFileWithSettings Dhall.defaultEvaluateSettings Dhall.auto path) ::
+      IO (Either SomeException RepairBlueprint)
   pure $ case m of
     Left e -> Left (T.pack (show e))
     Right t -> Right t
@@ -140,8 +137,8 @@ loadRepairBlueprint path = do
 loadRepairReceipt :: FilePath -> IO (Either Text RepairReceipt)
 loadRepairReceipt path = do
   m <-
-    E.try (Dhall.inputFileWithSettings Dhall.defaultEvaluateSettings Dhall.auto path)
-      :: IO (Either SomeException RepairReceipt)
+    E.try (Dhall.inputFileWithSettings Dhall.defaultEvaluateSettings Dhall.auto path) ::
+      IO (Either SomeException RepairReceipt)
   pure $ case m of
     Left e -> Left (T.pack (show e))
     Right t -> Right t
@@ -160,27 +157,29 @@ loadRepairReceipt path = do
 --
 -- Returns 'Right' with the admitted per-file evidence when both hold, or
 -- 'Left' with the reasons the gate should refuse to merge.
-admitReceiptsForFiles
-  :: CellOracle -> [RepairReceipt] -> [Text] -> Either [Text] [(Text, RepairReceipt)]
+admitReceiptsForFiles ::
+  CellOracle -> [RepairReceipt] -> [Text] -> Either [Text] [(Text, RepairReceipt)]
 admitReceiptsForFiles oracle rcs files =
   let receiptFiles = [rcPath rc | rc <- rcs]
       admissionFailures =
-        [ "receipt for " <> rcPath rc <> " not admissible: "
-          <> T.intercalate "; " fails
+        [ "receipt for "
+            <> rcPath rc
+            <> " not admissible: "
+            <> T.intercalate "; " fails
         | rc <- rcs,
           Left fails <- [admitReceipt oracle rc]
         ]
       -- every changed file has at least one receipt (evidence is complete)
-      uncovered = [f | f <- files, not (any (== f) receiptFiles)]
+      uncovered = [f | f <- files, f `notElem` receiptFiles]
       coverageFailures =
         [ "changed file " <> f <> " has no repair receipt — evidence is incomplete"
         | f <- uncovered
         ]
           -- every receipt names a file the branch changed (no orphans)
           <> [ "receipt for " <> f <> " does not name a file this branch changed — orphan evidence"
-              | f <- receiptFiles,
-                not (any (== f) files)
-              ]
+             | f <- receiptFiles,
+               f `notElem` files
+             ]
       failures = admissionFailures <> coverageFailures
    in if null failures
         then Right [(rcPath rc, rc) | rc <- rcs]
@@ -198,7 +197,7 @@ admitReceiptsForFiles oracle rcs files =
 -- recorded after-state, and each op's text must match the original line it
 -- names (a tampered op fails re-derivation).
 replayOps :: Text -> [RepairOp] -> Text
-replayOps src ops = T.intercalate "\n" [l | (i, l) <- zip [1 ..] (T.lines src), i `notElem` deletedLines]
+replayOps src ops = T.intercalate "\n" [l | (i, l) <- zip [1 :: Int ..] (T.lines src), i `notElem` deletedLines]
   where
     -- intercalate (not T.unlines) so no trailing newline is added: the
     -- recorded before/after states are stored without one, and the replay
@@ -211,9 +210,9 @@ replayOps src ops = T.intercalate "\n" [l | (i, l) <- zip [1 ..] (T.lines src), 
 
 opApplies :: Text -> RepairOp -> Bool
 opApplies src (DeleteLine {opLine = ln, opText = tx}) =
-  let lines = T.lines src
+  let srcLines = T.lines src
       i = fromIntegral ln - 1
-   in 0 <= i && i < length lines && lines !! i == tx
+   in 0 <= i && i < length srcLines && srcLines !! i == tx
 
 -- | Admit a receipt: re-derive its claims under 'oracle'. Returns
 -- 'Right ()' when every fact matches (the receipt is admissible evidence) or
@@ -231,29 +230,29 @@ admitReceipt oracle rc =
 
       failures =
         [ "replayed operations do not reproduce the recorded after-state"
-            | replayedAfterSrc /= recordedAfterSrc
+        | replayedAfterSrc /= recordedAfterSrc
         ]
           <> [ "recorded before-diagnostics do not match the oracle: "
-                <> T.intercalate "; " reBeforeDiags
-            | reBeforeDiags /= ssDiagnostics (rcBefore rc)
-        ]
+                 <> T.intercalate "; " reBeforeDiags
+             | reBeforeDiags /= ssDiagnostics (rcBefore rc)
+             ]
           <> [ "recorded after-diagnostics do not match the oracle: "
-                <> T.intercalate "; " reAfterDiags
-            | reAfterDiags /= ssDiagnostics (rcAfter rc)
-        ]
+                 <> T.intercalate "; " reAfterDiags
+             | reAfterDiags /= ssDiagnostics (rcAfter rc)
+             ]
           -- the pass-to-fail-to-pass shape: the before-state must actually fail
           <> [ "before-state has no diagnostics — not a failing repair"
-              | null reBeforeDiags
-          ]
+             | null reBeforeDiags
+             ]
           -- and the replayed after-state must actually pass
           <> [ "after-state still has diagnostics: " <> T.intercalate "; " reAfterDiags
-              | not (null reAfterDiags)
-          ]
+             | not (null reAfterDiags)
+             ]
           -- each operation must be a faithful deletion of a real original line
           <> [ "operation " <> T.pack (show (i + 1)) <> " is not a faithful deletion of an original line"
-          | (i, op) <- zip [0 :: Int ..] (rcOperations rc),
-            not (opApplies beforeSrc op)
-          ]
+             | (i, op) <- zip [0 :: Int ..] (rcOperations rc),
+               not (opApplies beforeSrc op)
+             ]
    in if null failures then Right () else Left failures
   where
     renderDiagnostics p s = map showDiagnostic (oracleCheck oracle p (Source s))

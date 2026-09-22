@@ -1,33 +1,34 @@
-cabal-version:   3.4
-name:            shikumi-coder
-version:         0.1.0.0
-synopsis:        Drive LLM codegen over a real codebase with shikumi
+cabal-version: 3.4
+name:          shikumi-coder
+version:       0.1.0.0
+synopsis:      Drive LLM codegen over a real codebase with shikumi
 description:
   A shikumi driver for AI codegen on a real codebase: analyze a code fact,
   propose a minimal edit plan, and apply it through deterministic,
   exact-match, guarded application. The model decides; Haskell verifies.
   The worked task is a real Mercury compiler change: promoting the private
-  --dump-mlds option to a public one.
-license:         BSD-3-Clause
-build-type:      Simple
+
+--dump-mlds option to a public one.
+license:       BSD-3-Clause
+build-type:    Simple
 
 common common-all
   default-language: GHC2024
   ghc-options:      -Wall
   build-depends:
-    , aeson           ^>=2.2
-    , base            >=4.20    && <5
-    , Diff            >=1.0     && <2.1
+    , aeson            ^>=2.2
+    , base             >=4.20     && <5
     , bytestring
-    , effectful       >=2.5     && <2.7
-    , shikumi         ^>=0.4.0.0
-    , shikumi-eval    ^>=0.3.0.0
-    , shikumi-testing ^>=0.1.0.0
-    , text            ^>=2.1
+    , Diff             >=1.0      && <2.1
+    , effectful        >=2.5      && <2.7
+    , shikumi          ^>=0.4.0.0
+    , shikumi-eval     ^>=0.3.0.0
+    , shikumi-testing  ^>=0.1.0.0
+    , text             ^>=2.1
 
 library
-  import:         common-all
-  hs-source-dirs: src
+  import:          common-all
+  hs-source-dirs:  src
   exposed-modules:
     Shikumi.Coder.Pipeline
     Shikumi.Coder.Task

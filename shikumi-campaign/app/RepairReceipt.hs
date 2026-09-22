@@ -10,27 +10,24 @@
 -- receipt's outcome.
 --
 -- Usage: repair-receipt [REPAIRS_DIR]
-
 module Main (main) where
-
-import Control.Monad (forM_)
-import Data.List (nub)
-import Data.Text qualified as T
-import System.Directory (listDirectory)
-import System.Environment (getArgs)
-import System.Exit (exitFailure)
-import System.FilePath ((</>), takeExtension)
 
 import Campaign.Oracle (markerOracle)
 import Campaign.RepairReceipt
   ( RepairBlueprint (..),
-    RepairOp (..),
     RepairReceipt (..),
     SourceState (..),
     admitReceipt,
     loadRepairBlueprint,
     loadRepairReceipt,
   )
+import Control.Monad (forM_)
+import Data.List (nub)
+import Data.Text qualified as T
+import System.Directory (listDirectory)
+import System.Environment (getArgs)
+import System.Exit (exitFailure)
+import System.FilePath (takeExtension, (</>))
 
 main :: IO ()
 main = do
@@ -64,8 +61,8 @@ main = do
                       [ "blueprint name mismatch (receipt names " <> T.unpack (rcBlueprint r) <> ", found " <> T.unpack (rbName b) <> ")"
                       | rcBlueprint r /= rbName b
                       ]
-                        <> [ "oracle mismatch" | rcOracleId r /= rbOracleId b ]
-                        <> [ "path mismatch" | rcPath r /= rbPath b ]
+                        <> ["oracle mismatch" | rcOracleId r /= rbOracleId b]
+                        <> ["path mismatch" | rcPath r /= rbPath b]
                 case (xref, result) of
                   (x, Right ())
                     | null x -> putStrLn "  ADMISSIBLE — re-derived under the oracle: replay reproduces the after-state, diagnostics match, pass-to-fail-to-pass holds"

@@ -33,20 +33,6 @@ module Campaign.Landing
   )
 where
 
-import Data.Aeson (FromJSON, ToJSON)
-import Data.Aeson qualified as Aeson
-import Data.Map.Strict qualified as Map
-import Data.Maybe (mapMaybe)
-import Data.Text (Text)
-import Data.Text qualified as T
-import System.FilePath ((</>))
-import Effectful (Eff, IOE, liftIO, (:>))
-import GHC.Generics (Generic)
-
-import Keiro.Workflow (StepName (..), Workflow, WorkflowId (..), WorkflowJournalEvent (..), step, unWorkflowId)
-import Keiro.Workflow.Resume (WorkflowDef (..), WorkflowRegistry)
-import Keiro.Workflow.Types (WorkflowName (..))
-
 import Campaign.Hands
   ( applyRepairInWorktree,
     commitLanding,
@@ -55,6 +41,18 @@ import Campaign.Hands
   )
 import Campaign.Oracle (CellOracle (..), ProjectCell (..), pythonSyntaxCheck, unusedImportOracle)
 import Campaign.Workflow (campaignStreamNameText)
+import Data.Aeson (FromJSON, ToJSON)
+import Data.Aeson qualified as Aeson
+import Data.Map.Strict qualified as Map
+import Data.Maybe (mapMaybe)
+import Data.Text (Text)
+import Data.Text qualified as T
+import Effectful (Eff, IOE, liftIO, (:>))
+import GHC.Generics (Generic)
+import Keiro.Workflow (StepName (..), Workflow, WorkflowId (..), WorkflowJournalEvent (..), step, unWorkflowId)
+import Keiro.Workflow.Resume (WorkflowDef (..), WorkflowRegistry)
+import Keiro.Workflow.Types (WorkflowName (..))
+import System.FilePath ((</>))
 import Toy.Fixer.Domain (Source (..), SourcePath, showDiagnostic)
 
 -- | The journaled result of one landing: where the repair now lives, whether
@@ -179,7 +177,7 @@ registerLanding cellsWithRepairs =
   Map.fromList
     [ ( landingWorkflowName,
         WorkflowDef $ \wid ->
-          case [ (pc, r) | (pc, r) <- cellsWithRepairs, unWorkflowId (landingWorkflowId (pcProject pc, pcPath pc)) == unWorkflowId wid ] of
+          case [(pc, r) | (pc, r) <- cellsWithRepairs, unWorkflowId (landingWorkflowId (pcProject pc, pcPath pc)) == unWorkflowId wid] of
             [(pc, repair)] -> landProjectCellWorkflow pc unusedImportOracle "campaign/unused-imports" repair
             _ -> error ("registerLanding: no cell for workflow " <> show wid)
       )

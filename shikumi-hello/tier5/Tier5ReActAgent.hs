@@ -27,7 +27,6 @@ import Data.Aeson (ToJSON)
 import Data.Text (Text)
 import Data.Vector qualified as V
 import GHC.Generics (Generic)
-
 import Shikumi.Adapter (ToPrompt)
 import Shikumi.Agent.ReAct
   ( Action (..),
@@ -78,9 +77,9 @@ weatherSignature = mkSignature "Answer the user's weather question, using tools 
 -- finish, then extract the typed answer.
 cleanScript :: [Text]
 cleanScript =
-  [ "{\"thought\": \"I should look up Paris.\", \"action\": {\"tool\": \"get_weather\", \"args\": {\"city\": \"Paris\", \"units\": \"c\"}}}"
-  , "{\"thought\": \"I have the forecast.\", \"action\": {\"finish\": true}}"
-  , "{\"tempC\": 12.0, \"summary\": \"mild\"}"
+  [ "{\"thought\": \"I should look up Paris.\", \"action\": {\"tool\": \"get_weather\", \"args\": {\"city\": \"Paris\", \"units\": \"c\"}}}",
+    "{\"thought\": \"I have the forecast.\", \"action\": {\"finish\": true}}",
+    "{\"tempC\": 12.0, \"summary\": \"mild\"}"
   ]
 
 -- The recovery run's script: a call whose args do not decode against the
@@ -88,10 +87,10 @@ cleanScript =
 -- as the observation), then a corrected call, then finish, then extract.
 recoveryScript :: [Text]
 recoveryScript =
-  [ "{\"thought\": \"I should look up Paris.\", \"action\": {\"tool\": \"get_weather\", \"args\": {\"town\": \"Paris\"}}}"
-  , "{\"thought\": \"The schema wants city and units; retrying.\", \"action\": {\"tool\": \"get_weather\", \"args\": {\"city\": \"Paris\", \"units\": \"c\"}}}"
-  , "{\"thought\": \"I have the forecast.\", \"action\": {\"finish\": true}}"
-  , "{\"tempC\": 12.0, \"summary\": \"mild\"}"
+  [ "{\"thought\": \"I should look up Paris.\", \"action\": {\"tool\": \"get_weather\", \"args\": {\"town\": \"Paris\"}}}",
+    "{\"thought\": \"The schema wants city and units; retrying.\", \"action\": {\"tool\": \"get_weather\", \"args\": {\"city\": \"Paris\", \"units\": \"c\"}}}",
+    "{\"thought\": \"I have the forecast.\", \"action\": {\"finish\": true}}",
+    "{\"tempC\": 12.0, \"summary\": \"mild\"}"
   ]
 
 printTrajectory :: Trajectory -> IO ()

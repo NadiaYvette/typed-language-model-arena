@@ -1,7 +1,8 @@
 {-# LANGUAGE GHC2024 #-}
 {-# LANGUAGE OverloadedLabels #-}
 {-# LANGUAGE OverloadedStrings #-}
-{-# OPTIONS_GHC -Wno-incomplete-uni-patterns #-} -- corpus is a compile-time constant, non-empty by construction
+-- corpus is a compile-time constant, non-empty by construction
+{-# OPTIONS_GHC -Wno-incomplete-uni-patterns #-}
 
 -- | The toy fixer, act by act, fully offline.
 --
@@ -20,11 +21,12 @@ module Main (main) where
 import Baikai (Context, Message (UserMessage), Response, TextContent (..), UserContent (..))
 import Control.Lens ((^.))
 import Data.Generics.Labels ()
+import Data.List (find)
+import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
 import Data.Vector qualified as V
-
 import Shikumi.Eval
   ( Dataset,
     EvalConfig (concurrency),
@@ -40,9 +42,6 @@ import Shikumi.Eval
 import Shikumi.Program (Program, embed, runProgram)
 import Shikumi.Schema.Types (Field (..))
 import Shikumi.Testing (markerResponse, runStubEval)
-
-import Data.List (find)
-
 import Toy.Fixer.Domain (Source (..), checkSource, corpus, showDiagnostic, sourceDiff, sourceText)
 import Toy.Fixer.Program
   ( DiagnosticsIn (..),
@@ -50,9 +49,9 @@ import Toy.Fixer.Program
     RepairOut (..),
     Submission (..),
     buildSubmission,
-    fixesSource,
     fixAndReport,
     fixSource,
+    fixesSource,
   )
 
 -- The dataset input: a corpus entry (path, broken source, expected repair).
@@ -68,7 +67,7 @@ renderedContext :: Context -> Text
 renderedContext c =
   T.intercalate
     "\n"
-    ( maybe "" id (c ^. #systemPrompt)
+    ( fromMaybe "" (c ^. #systemPrompt)
         : [t | UserMessage p <- V.toList (c ^. #messages), UserText (TextContent t) <- V.toList (p ^. #content)]
     )
 
@@ -166,7 +165,7 @@ main = do
   -- Act 1 — the ask ---------------------------------------------------------
   putStrLn "[act 1] what the model is asked:"
   TIO.putStr (numbered (sourceText s0))
-  mapM_ (TIO.putStrLn . ("  diagnostic: " <>)) (map showDiagnostic (checkSource p0 s0))
+  mapM_ ((TIO.putStrLn . ("  diagnostic: " <>)) . showDiagnostic) (checkSource p0 s0)
   putStrLn "\n  what the scripted model replies on the wire:"
   TIO.putStr (indented (wireReply e0))
 
@@ -208,8 +207,8 @@ main = do
       let repairedText = unRepaired (result out)
       putStrLn "  diff of what the over-eager repair did:"
       TIO.putStr (indented (sourceDiff sEps (Source repairedText)))
-      putStrLn $ "  checker on the repair -> "
-      mapM_ (TIO.putStrLn . ("    " <>)) (map showDiagnostic (checkSource "epsilon.py" (Source repairedText)))
+      putStrLn "  checker on the repair -> "
+      mapM_ ((TIO.putStrLn . ("    " <>)) . showDiagnostic) (checkSource "epsilon.py" (Source repairedText))
       putStrLn $ "  metric score for this repair -> " <> show (scoreFor sEps repairedText)
 
   putStrLn "\n[act 5b] the negative control: a string-literal TODO needs no repair:"

@@ -1,5 +1,4 @@
 {-# LANGUAGE GHC2024 #-}
-{-# LANGUAGE DeriveAnyClass #-}
 {-# LANGUAGE DerivingStrategies #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
@@ -96,9 +95,9 @@ checkSource path (Source body) =
 
     lineDiags =
       [ Diagnostic path n code msg
-      | (n, raw) <- numberedLines
-      , let masked = maskStrings raw
-      , (code, msg) <-
+      | (n, raw) <- numberedLines,
+        let masked = maskStrings raw,
+        (code, msg) <-
           [ ("W-todo", "found a TODO marker")
           | "TODO" `T.isInfixOf` masked
           ]
@@ -124,12 +123,12 @@ checkSource path (Source body) =
     -- returns are skipped).
     undefDiags =
       [ Diagnostic path n "E-undef" ("undefined reference to " <> t)
-      | (n, raw) <- numberedLines
-      , let stripped = T.strip raw
-      , Just rhs <- [T.stripPrefix "return " stripped]
-      , let t = T.takeWhile (\c -> isAlphaNum c || c == '_') (T.strip rhs)
-      , isIdent t
-      , t `notElem` definedNames
+      | (n, raw) <- numberedLines,
+        let stripped = T.strip raw,
+        Just rhs <- [T.stripPrefix "return " stripped],
+        let t = T.takeWhile (\c -> isAlphaNum c || c == '_') (T.strip rhs),
+        isIdent t,
+        t `notElem` definedNames
       ]
 
     -- Names any line defines: the identifier left of the first '='.
@@ -323,13 +322,13 @@ fixedString = seedString
 -- all the \"dataset\" the fixer trains and evaluates against.
 corpus :: [(SourcePath, Source, Source)]
 corpus =
-  [ ("alpha.py", Source seedTodos, Source fixedTodos)
-  , ("beta.py", Source seedUnused, Source fixedUnused)
-  , ("gamma.py", Source seedMixed, Source fixedMixed)
-  , ("delta.py", Source seedSameLine, Source fixedSameLine)
-  , ("epsilon.py", Source seedScatter, Source fixedScatter)
-  , ("zeta.py", Source seedDuplicate, Source fixedDuplicate)
-  , ("eta.py", Source seedString, Source fixedString)
+  [ ("alpha.py", Source seedTodos, Source fixedTodos),
+    ("beta.py", Source seedUnused, Source fixedUnused),
+    ("gamma.py", Source seedMixed, Source fixedMixed),
+    ("delta.py", Source seedSameLine, Source fixedSameLine),
+    ("epsilon.py", Source seedScatter, Source fixedScatter),
+    ("zeta.py", Source seedDuplicate, Source fixedDuplicate),
+    ("eta.py", Source seedString, Source fixedString)
   ]
 
 sourcesOf :: [(SourcePath, Source, Source)] -> [Source]
@@ -339,7 +338,7 @@ pathOf :: (SourcePath, Source, Source) -> SourcePath
 pathOf (p, _, _) = p
 
 expectedOf :: (SourcePath, Source, Source) -> Source
-expectedOf = \(_, _, e) -> e
+expectedOf (_, _, e) = e
 
 -- ---------------------------------------------------------------------------
 -- Diffing (for observations and review)

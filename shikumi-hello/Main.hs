@@ -18,26 +18,21 @@
 --    key @OMNIROUTE_API_KEY@) — with ambient routing and the resilience stack.
 module Main (main) where
 
+import Baikai (Api (OpenAIChatCompletions), ApiKeySource (ApiKeyEnv), Model (..), Options (..), emptyOptions, flattenAssistantBlocks, flattenAssistantText, globalProviderRegistry, mkModel)
+import Baikai.Provider.OpenAI.Api qualified as OpenAI
+import Control.Lens ((^.))
 import Control.Monad (unless)
 import Data.Aeson (Value (Null), object, (.=))
 import Data.Generics.Labels ()
+import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Text.IO qualified as Text.IO
-import GHC.Generics (Generic)
-
-import Baikai (ApiKeySource (ApiKeyEnv), Api (OpenAIChatCompletions), Model (..), Options (..), emptyOptions, flattenAssistantBlocks, flattenAssistantText, globalProviderRegistry, mkModel)
-import Control.Lens ((^.))
-import Baikai.Provider.OpenAI.Api qualified as OpenAI
 import Effectful (Eff, IOE, liftIO, runEff, type (:>))
 import Effectful.Concurrent (runConcurrent)
 import Effectful.Dispatch.Dynamic (interpose)
 import Effectful.Error.Static (runErrorNoCallStack)
-import System.Environment (lookupEnv)
-import System.Exit (exitSuccess)
-import Data.Maybe (fromMaybe)
-import Text.Printf (printf)
-
+import GHC.Generics (Generic)
 import Shikumi.Adapter (ToPrompt (..))
 import Shikumi.Combinator (retry)
 import Shikumi.Error (ShikumiError)
@@ -53,6 +48,9 @@ import Shikumi.Schema.Types (Field, field, unField)
 import Shikumi.Signature (Signature, mkSignature)
 import Shikumi.Testing (markerResponse, runStub)
 import Shikumi.Testing.Responses (withTransportOptions)
+import System.Environment (lookupEnv)
+import System.Exit (exitSuccess)
+import Text.Printf (printf)
 
 -- ---------------------------------------------------------------------------
 -- 1. The types are the program. A one-line description per field via the
@@ -61,8 +59,8 @@ import Shikumi.Testing.Responses (withTransportOptions)
 -- ---------------------------------------------------------------------------
 
 data Article = Article
-  { title :: Field "The article's headline" Text
-  , body  :: Field "The full article text" Text
+  { title :: Field "The article's headline" Text,
+    body :: Field "The full article text" Text
   }
   deriving stock (Generic, Show, Eq)
   deriving anyclass (ToSchema, FromModel, ToPrompt)
@@ -72,10 +70,10 @@ data Sentiment = Positive | Neutral | Negative
   deriving anyclass (ToSchema, FromModel)
 
 data Summary = Summary
-  { headline  :: Field "A one-line summary" Text
-  , bullets   :: Field "Three to five key points" [Text]
-  , sentiment :: Sentiment        -- an enum-like sum
-  , note      :: Maybe Text       -- optional / nullable
+  { headline :: Field "A one-line summary" Text,
+    bullets :: Field "Three to five key points" [Text],
+    sentiment :: Sentiment, -- an enum-like sum
+    note :: Maybe Text -- optional / nullable
   }
   deriving stock (Generic, Show, Eq)
   deriving anyclass (ToSchema, FromModel, ToPrompt)
@@ -85,7 +83,7 @@ data Summary = Summary
 instance Validatable Summary where
   validate s
     | n < 3 || n > 5 = Left "bullets: must have 3 to 5 items"
-    | otherwise      = Right s
+    | otherwise = Right s
     where
       n = length (unField (bullets s))
 
@@ -114,15 +112,15 @@ demoParams =
         [ P.Demo
             { input =
                 object
-                  [ "title" .= ("Compound interest" :: Text)
-                  , "body" .= ("Compound interest grows savings faster than simple interest, because interest itself earns interest." :: Text)
-                  ]
-            , output =
+                  [ "title" .= ("Compound interest" :: Text),
+                    "body" .= ("Compound interest grows savings faster than simple interest, because interest itself earns interest." :: Text)
+                  ],
+              output =
                 object
-                  [ "headline" .= ("Compound interest beats simple interest" :: Text)
-                  , "bullets" .= (["Interest earns interest over time", "Growth accelerates the longer you save"] :: [Text])
-                  , "sentiment" .= ("Neutral" :: Text)
-                  , "note" .= Null
+                  [ "headline" .= ("Compound interest beats simple interest" :: Text),
+                    "bullets" .= (["Interest earns interest over time", "Growth accelerates the longer you save"] :: [Text]),
+                    "sentiment" .= ("Neutral" :: Text),
+                    "note" .= Null
                   ]
             }
         ]
@@ -143,8 +141,8 @@ summarizeRobust = retry 2 summarizeP
 sampleArticle :: Article
 sampleArticle =
   Article
-    { title = field "Typed LM programs"
-    , body = field "Shikumi makes LM calls behave like ordinary typed software."
+    { title = field "Typed LM programs",
+      body = field "Shikumi makes LM calls behave like ordinary typed software."
     }
 
 main :: IO ()
@@ -153,15 +151,15 @@ main = do
   -- which the derived FromModel decoder turns into a typed Summary.
   let stub _ctx =
         markerResponse
-          [ ("headline", "Rates held steady")
-          , ("bullets", "[\"point one\",\"point two\",\"point three\"]")
-          , ("sentiment", "Neutral")
+          [ ("headline", "Rates held steady"),
+            ("bullets", "[\"point one\",\"point two\",\"point three\"]"),
+            ("sentiment", "Neutral")
           ]
 
   result <- runStub stub summarizeRobust sampleArticle
   putStrLn "offline (stub):"
   case result of
-    Right s  -> print s                     -- a fully-typed Summary
+    Right s -> print s -- a fully-typed Summary
     Left err -> print (err :: ShikumiError) -- an enumerated failure
 
   -- The same program, but the stub replies with only two bullets: the derived
@@ -169,9 +167,9 @@ main = do
   -- instead of an exception or a Maybe.
   let badStub _ctx =
         markerResponse
-          [ ("headline", "Rates held steady")
-          , ("bullets", "[\"point one\",\"point two\"]")
-          , ("sentiment", "Neutral")
+          [ ("headline", "Rates held steady"),
+            ("bullets", "[\"point one\",\"point two\"]"),
+            ("sentiment", "Neutral")
           ]
 
   bad <- runStub badStub summarizeRobust sampleArticle
@@ -206,8 +204,8 @@ runLive = do
   -- SHIKUMI_MODEL wins; otherwise OMNIROUTE_CHAT_MODEL; otherwise free-models.
   modelId <-
     fmap (Text.pack . fromMaybe "free-models") $
-      lookupEnv "SHIKUMI_MODEL" >>= 
-        maybe (lookupEnv "OMNIROUTE_CHAT_MODEL") (pure . Just)
+      lookupEnv "SHIKUMI_MODEL"
+        >>= maybe (lookupEnv "OMNIROUTE_CHAT_MODEL") (pure . Just)
   let baseUrl = case (openAiBase, omniBase) of
         (Just b, _) -> Text.pack b
         (_, Just b) -> Text.pack b <> "/v1"
@@ -218,8 +216,8 @@ runLive = do
           }
       creds =
         emptyOptions
-          { apiKey = Just (ApiKeyEnv "OMNIROUTE_API_KEY")
-          , timeoutMs = Just 30000
+          { apiKey = Just (ApiKeyEnv "OMNIROUTE_API_KEY"),
+            timeoutMs = Just 30000
           }
       cfg = defaultLLMConfig globalProviderRegistry
       defaults = emptyRequestDefaults {defaultMaxTokens = Just 1024}
@@ -230,16 +228,16 @@ runLive = do
     runEff
       . runConcurrent
       . runErrorNoCallStack @ShikumiError
-      . runRouting target            -- supplies the ambient model
-      . runLLMResilient cfg          -- retries / rate limit / budget
-      . withTransportOptions creds   -- credentials + timeout on every request
-      . teeLLM                       -- DEBUG: print each raw model reply
+      . runRouting target -- supplies the ambient model
+      . runLLMResilient cfg -- retries / rate limit / budget
+      . withTransportOptions creds -- credentials + timeout on every request
+      . teeLLM -- DEBUG: print each raw model reply
       . withRequestDefaults defaults -- cap output tokens for the demo
-      . routeLLM                     -- stamps the ambient model onto calls
+      . routeLLM -- stamps the ambient model onto calls
       $ runProgram summarizeRobust sampleArticle
 
   case liveResult of
-    Right s  -> print s
+    Right s -> print s
     Left err -> print (err :: ShikumiError)
 
 -- DEBUG: pass-through LLM interpreter that prints every raw completion.

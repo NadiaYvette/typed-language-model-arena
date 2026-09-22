@@ -1,7 +1,7 @@
+{-# LANGUAGE GHC2024 #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveAnyClass #-}
 {-# LANGUAGE DerivingStrategies #-}
-{-# LANGUAGE GHC2024 #-}
 {-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE OverloadedStrings #-}
 
@@ -40,6 +40,7 @@ module Campaign.Matrix
     matrixCellSpecs,
     matrixFaultKind,
     FaultKind (..),
+
     -- * Workflow
     matrixWorkflowName,
     campaignMatrixWorkflowId,
@@ -51,6 +52,7 @@ module Campaign.Matrix
     matrixStubEngine,
     MatrixAttempt (..),
     matrixAttemptsOf,
+
     -- * The triage program
     TriageIn (..),
     TriageOut (..),
@@ -58,24 +60,23 @@ module Campaign.Matrix
   )
 where
 
+import Baikai (Context, Response)
+import Campaign.Cell (CellId (..), unCellId)
+import Campaign.Memory (projectNamespace, recallNotesForKeyword)
+import Campaign.Workflow
+  ( HumanVerdict (..),
+    humanQueryStepName,
+  )
 import Data.Aeson (FromJSON, ToJSON)
 import Data.Aeson qualified as Aeson
-import Data.List (isPrefixOf, stripPrefix)
+import Data.List (stripPrefix)
 import Data.Map.Strict qualified as Map
-import Data.Maybe (fromMaybe, mapMaybe)
+import Data.Maybe (mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Time.Clock (NominalDiffTime)
 import Effectful (Eff, IOE, liftIO, raise, (:>))
 import GHC.Generics (Generic)
-
-import Campaign.Cell (CellId (..), unCellId)
-import Campaign.Memory (projectNamespace, recallNotesForKeyword)
-import Campaign.Workflow
-  ( HumanVerdict (..),
-    campaignStreamNameText,
-    humanQueryStepName,
-  )
 import Keiro.Workflow
   ( StepName (..),
     Workflow,
@@ -86,7 +87,6 @@ import Keiro.Workflow.Awakeable (AwakeableId, awakeableNamed)
 import Keiro.Workflow.Resume (WorkflowDef (..), WorkflowRegistry)
 import Keiro.Workflow.Sleep (sleepNamed)
 import Keiro.Workflow.Types (WorkflowJournalEvent (..), WorkflowName (..))
-import Baikai (Context, Response)
 import Kioku.Api.Scope (Namespace)
 import Kiroku.Store.Effect (Store)
 import Kiroku.Store.Effect.Resource (KirokuStoreResource)
@@ -114,9 +114,9 @@ newtype ConfigName = ConfigName Text
 -- | One matrix cell: an architecture × configuration entry, plus the
 -- synthetic device identity the boot log is generated against.
 data MatrixCell = MatrixCell
-  { mcArch :: ArchName
-  , mcConfig :: ConfigName
-  , mcDevice :: Text
+  { mcArch :: ArchName,
+    mcConfig :: ConfigName,
+    mcDevice :: Text
   }
   deriving stock (Eq, Ord, Show)
 
@@ -139,8 +139,8 @@ mkMatrixCell a@(ArchName at) c@(ConfigName ct) =
 matrixCellSpecs :: [MatrixCell]
 matrixCellSpecs =
   [ mkMatrixCell arch config
-  | arch <- [ArchName "riscv", ArchName "x86_64", ArchName "arm"]
-  , config <- [ConfigName "std", ConfigName "kvm", ConfigName "rt"]
+  | arch <- [ArchName "riscv", ArchName "x86_64", ArchName "arm"],
+    config <- [ConfigName "std", ConfigName "kvm", ConfigName "rt"]
   ]
 
 -- | Which fault a cell carries, if any. The two fault classes are the two
@@ -166,17 +166,17 @@ matrixFaultKind mc = case (archText mc, configText mc) of
 -- ---------------------------------------------------------------------------
 
 data TriageIn = TriageIn
-  { tiArch :: Field "Target architecture" Text
-  , tiConfig :: Field "Kernel configuration" Text
-  , tiBoot :: Field "Boot stage results, one per line" [Text]
-  , tiStress :: Field "Stress test summary, one per line" [Text]
+  { tiArch :: Field "Target architecture" Text,
+    tiConfig :: Field "Kernel configuration" Text,
+    tiBoot :: Field "Boot stage results, one per line" [Text],
+    tiStress :: Field "Stress test summary, one per line" [Text]
   }
   deriving stock (Generic, Show, Eq)
   deriving anyclass (FromModel, ToPrompt)
 
 data TriageOut = TriageOut
-  { needsHardware :: Field "True only if the fault requires real hardware" Bool
-  , advice :: Field "One-sentence instruction for the operator" Text
+  { needsHardware :: Field "True only if the fault requires real hardware" Bool,
+    advice :: Field "One-sentence instruction for the operator" Text
   }
   deriving stock (Generic, Show, Eq)
   deriving anyclass (FromModel, ToPrompt, ToSchema, Validatable)
@@ -199,17 +199,17 @@ triageSignature =
 
 -- | Boot stage results, journaled as data.
 data BootStage = BootStage
-  { bsKernel :: Bool
-  , bsInit :: Bool
-  , bsNet :: Bool
+  { bsKernel :: Bool,
+    bsInit :: Bool,
+    bsNet :: Bool
   }
   deriving stock (Eq, Show, Generic)
   deriving anyclass (ToJSON, FromJSON)
 
 -- | Stress results, journaled as data.
 data StressResult = StressResult
-  { srIterations :: Int
-  , srFails :: Int
+  { srIterations :: Int,
+    srFails :: Int
   }
   deriving stock (Eq, Show, Generic)
   deriving anyclass (ToJSON, FromJSON)
@@ -217,10 +217,10 @@ data StressResult = StressResult
 -- | One matrix attempt: the staged world it saw and the verdict the
 -- decision layer produced.
 data MatrixAttempt = MatrixAttempt
-  { maAttempt :: Int
-  , maBoot :: BootStage
-  , maStress :: StressResult
-  , maVerdict :: Text
+  { maAttempt :: Int,
+    maBoot :: BootStage,
+    maStress :: StressResult,
+    maVerdict :: Text
   }
   deriving stock (Eq, Show, Generic)
   deriving anyclass (ToJSON, FromJSON)
@@ -254,10 +254,10 @@ stressFor mc n = case matrixFaultKind mc of
 -- story, stage by stage.
 bootLogFor :: MatrixCell -> BootStage -> [Text]
 bootLogFor mc bs =
-  [ "kernel: " <> archText mc <> " " <> deviceLine <> " booting"
-  , "kernel: " <> (if bs.bsKernel then "ok" else "FAILED")
-  , "init: applying config " <> configText mc <> " -> " <> (if bs.bsInit then "ok" else "FAILED")
-  , "net: link " <> deviceLine <> " -> " <> (if bs.bsNet then "up" else "DOWN (kvm misconfiguration)")
+  [ "kernel: " <> archText mc <> " " <> deviceLine <> " booting",
+    "kernel: " <> (if bs.bsKernel then "ok" else "FAILED"),
+    "init: applying config " <> configText mc <> " -> " <> (if bs.bsInit then "ok" else "FAILED"),
+    "net: link " <> deviceLine <> " -> " <> (if bs.bsNet then "up" else "DOWN (kvm misconfiguration)")
   ]
   where
     deviceLine = "device " <> mc.mcDevice
@@ -265,8 +265,8 @@ bootLogFor mc bs =
 -- | The stress summary lines the triage program reads.
 stressLogFor :: MatrixCell -> StressResult -> [Text]
 stressLogFor mc sr =
-  [ "stress: " <> T.pack (show sr.srIterations) <> " iterations on " <> mc.mcDevice
-  , "stress: " <> (if sr.srFails == 0 then "no failures" else T.pack (show sr.srFails) <> " failures (data corruption under load — hardware-only symptom)")
+  [ "stress: " <> T.pack (show sr.srIterations) <> " iterations on " <> mc.mcDevice,
+    "stress: " <> (if sr.srFails == 0 then "no failures" else T.pack (show sr.srFails) <> " failures (data corruption under load — hardware-only symptom)")
   ]
 
 bootClean :: BootStage -> Bool
@@ -355,8 +355,6 @@ matrixAttemptRecord ::
 matrixAttemptRecord mc ns engine n = do
   let boot = bootStageFor mc n
       stress = stressFor mc n
-      bootLog = bootLogFor mc boot
-      stressLog = stressLogFor mc stress
   -- Both stages are journaled as ordinary steps: a replay never re-runs a
   -- "device", it reads what the stages produced — the same property the
   -- real matrix gets from writing boot logs into the journal.
@@ -380,8 +378,8 @@ matrixAttemptRecord mc ns engine n = do
         mTriage <- liftIO (engine n (guidedTriage notes) input notes)
         pure $ case mTriage of
           Just t
-            | not (unField (t.needsHardware)) -> "retry: " <> unField (t.advice)
-            | otherwise -> "escalate: " <> unField (t.advice)
+            | not (unField t.needsHardware) -> "retry: " <> unField t.advice
+            | otherwise -> "escalate: " <> unField t.advice
           Nothing -> "retry: triage unavailable, retrying"
   pure (MatrixAttempt n jBoot jStress verdict)
 

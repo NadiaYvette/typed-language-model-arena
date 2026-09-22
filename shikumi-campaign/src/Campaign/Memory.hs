@@ -1,5 +1,5 @@
-{-# LANGUAGE BlockArguments #-}
 {-# LANGUAGE GHC2024 #-}
+{-# LANGUAGE BlockArguments #-}
 {-# LANGUAGE OverloadedStrings #-}
 
 -- | The campaign's kioku memory: lessons recorded per cell, recalled into
@@ -49,16 +49,14 @@ module Campaign.Memory
   )
 where
 
-import Data.Maybe (listToMaybe)
+import Control.Monad (void)
+import Data.Maybe (fromMaybe, listToMaybe)
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Time.Clock (getCurrentTime)
 import Effectful (Eff, IOE, liftIO, (:>))
 import Effectful.Error.Static (Error)
-import Kiroku.Store.Effect (Store)
-import Kiroku.Store.Effect.Resource (KirokuStoreResource)
-import Kiroku.Store.Error (StoreError)
 import Kioku.Api.Access
   ( MemoryAccessContext,
     MemoryActor (..),
@@ -87,6 +85,9 @@ import Kioku.Session
     startWithContext,
   )
 import Kioku.Session.Domain (CompleteSessionData (..), RecordTurnData (..), StartSessionData (..))
+import Kiroku.Store.Effect (Store)
+import Kiroku.Store.Effect.Resource (KirokuStoreResource)
+import Kiroku.Store.Error (StoreError)
 
 -- ---------------------------------------------------------------------------
 -- Configuration
@@ -135,7 +136,7 @@ campaignAccessContext =
 
 -- | Entity scope per cell: @(namespace, cell, \"alpha.py\")@.
 cellScopeIn :: Namespace -> Text -> MemoryScope
-cellScopeIn ns path = ScopeEntity ns (either (error . T.unpack) id (mkScopeKind "cell")) path
+cellScopeIn ns = ScopeEntity ns (either (error . T.unpack) id (mkScopeKind "cell"))
 
 -- | The toy namespace's per-cell scope.
 cellScope :: Text -> MemoryScope
@@ -173,7 +174,8 @@ recordLesson ns path advice = do
   now <- liftIO getCurrentTime
   let ctx = campaignAccessContext
   result <-
-    recordWithContext ctx
+    recordWithContext
+      ctx
       RecordMemoryData
         { memoryId = mid,
           memorySpaceId = campaignMemorySpace,
@@ -190,7 +192,7 @@ recordLesson ns path advice = do
           supersedes = Nothing,
           recordedAt = now
         }
-  pure (const () <$> result)
+  pure (void result)
 
 -- | Record a project-level lesson at the namespace's /global/ scope — the
 -- scope kioku's L2 scenes and L3 personas distill over ('ScopeGlobal' ns).
@@ -208,7 +210,8 @@ recordGlobalLesson ns advice = do
   now <- liftIO getCurrentTime
   let ctx = campaignAccessContext
   result <-
-    recordWithContext ctx
+    recordWithContext
+      ctx
       RecordMemoryData
         { memoryId = mid,
           memorySpaceId = campaignMemorySpace,
@@ -225,7 +228,7 @@ recordGlobalLesson ns advice = do
           supersedes = Nothing,
           recordedAt = now
         }
-  pure (const () <$> result)
+  pure (void result)
 
 -- | 'recordGlobalLesson' for /revisable/ knowledge: the new atom carries
 -- 'RecordMemoryData.supersedes' pointing at the active atom it replaces
@@ -253,7 +256,7 @@ recordGlobalLessonSuperseding ns tag advice = do
         Left _ -> Nothing
       newContent = lessonText (tag <> ": " <> advice)
   case mOld of
-    Just old@MemoryRecord {content = oldContent, memoryId = oldMid}
+    Just MemoryRecord {content = oldContent, memoryId = oldMid}
       | oldContent == newContent -> pure (Right False)
       -- An unparsable id would break lineage; since these ids are minted by
       -- this very module (idText round-trips parseId), treat failure as the
@@ -267,7 +270,8 @@ recordGlobalLessonSuperseding ns tag advice = do
       now <- liftIO getCurrentTime
       let ctx = campaignAccessContext
       result <-
-        recordWithContext ctx
+        recordWithContext
+          ctx
           RecordMemoryData
             { memoryId = mid,
               memorySpaceId = campaignMemorySpace,
@@ -284,7 +288,7 @@ recordGlobalLessonSuperseding ns tag advice = do
               supersedes = mSupersedes,
               recordedAt = now
             }
-      pure (const True <$> result)
+      pure (True <$ result)
 
 -- | Start one fix session for a cell (L0 evidence container).
 startFixSession ::
@@ -298,7 +302,8 @@ startFixSession ns path = do
   sid <- genSessionId
   now <- liftIO getCurrentTime
   let ctx = campaignAccessContext
-  startWithContext ctx
+  startWithContext
+    ctx
     StartSessionData
       { sessionId = sid,
         memorySpaceId = campaignMemorySpace,
@@ -326,7 +331,8 @@ startInfraSession topic = do
   sid <- genSessionId
   now <- liftIO getCurrentTime
   let ctx = campaignAccessContext
-  startWithContext ctx
+  startWithContext
+    ctx
     StartSessionData
       { sessionId = sid,
         memorySpaceId = campaignMemorySpace,
@@ -356,7 +362,8 @@ recordFixTurn ::
 recordFixTurn sid idx role content = do
   now <- liftIO getCurrentTime
   let ctx = campaignAccessContext
-  recordTurnWithContext ctx
+  recordTurnWithContext
+    ctx
     RecordTurnData
       { sessionId = sid,
         memorySpaceId = campaignMemorySpace,
@@ -385,7 +392,8 @@ completeFixSession sid summary = do
   now <- liftIO getCurrentTime
   let ctx = campaignAccessContext
   result <-
-    completeWithContext ctx
+    completeWithContext
+      ctx
       CompleteSessionData
         { sessionId = sid,
           memorySpaceId = campaignMemorySpace,
@@ -394,7 +402,7 @@ completeFixSession sid summary = do
           modelUsed = Just "shikumi-stub",
           summary = Just summary
         }
-  pure (const () <$> result)
+  pure (void result)
 
 -- ---------------------------------------------------------------------------
 -- Reads (workflow side)
@@ -411,7 +419,7 @@ recallNotes ns = do
   pure $ case r of
     Left _ -> []
     Right records ->
-      [ maybe content id (parseLesson content)
+      [ fromMaybe content (parseLesson content)
       | MemoryRecord {content} <- records
       ]
 

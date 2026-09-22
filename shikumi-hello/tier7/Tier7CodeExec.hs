@@ -28,11 +28,10 @@ import Data.Text (Text)
 import Data.Text.Encoding (decodeUtf8)
 import Data.Vector qualified as V
 import GHC.Generics (Generic)
-
+import Shikumi.Adapter (ToPrompt)
 import Shikumi.Agent.ReAct (Action (..), Step (..), Trajectory (..))
 import Shikumi.CodeExec.CodeAct (codeActWithTrajectory, defaultCodeActConfig)
 import Shikumi.CodeExec.ProgramOfThought (programOfThought)
-import Shikumi.Adapter (ToPrompt)
 import Shikumi.Schema (FromModel, ToSchema, Validatable)
 import Shikumi.Signature (Signature, mkSignature)
 import Shikumi.Testing (mkTextResponse, runAgent)
@@ -94,16 +93,16 @@ main = do
   -- codeAct: a code snippet calls a provided tool, then a second computes a value.
   putStrLn "\n[codeAct] a code snippet calls a tool, accumulating a trajectory"
   let script =
-        [ mkTextResponse (codeTurn "call(\"addOne\", {\"n\": 41})" False)
-        , mkTextResponse (codeTurn "result = 42" True)
-        , mkTextResponse "{\"value\": 42}"
+        [ mkTextResponse (codeTurn "call(\"addOne\", {\"n\": 41})" False),
+          mkTextResponse (codeTurn "result = 42" True),
+          mkTextResponse "{\"value\": 42}"
         ]
   acted <- runAgent script (codeActWithTrajectory defaultCodeActConfig calcSig registry) (Task "add one to 41")
   case acted of
     Left err -> putStrLn $ "  failed: " <> show err
     Right (answer, traj) -> do
       putStrLn $ "  answer      -> " <> show answer
-      putStrLn $ "  steps:"
+      putStrLn "  steps:"
       mapM_ printStep (V.toList (steps traj))
   where
     printStep s =

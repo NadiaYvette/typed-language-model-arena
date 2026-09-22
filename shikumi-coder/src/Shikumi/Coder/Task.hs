@@ -55,7 +55,6 @@ import Data.Algorithm.Diff (PolyDiff (..), getGroupedDiff)
 import Data.Text (Text)
 import Data.Text qualified as T
 import GHC.Generics (Generic)
-
 import Shikumi.Adapter (ToPrompt)
 import Shikumi.Schema (FromModel, ToSchema, Validatable (..))
 import Shikumi.Schema.Types (Field (..), unField)
@@ -87,7 +86,7 @@ data CodeTask = CodeTask
   deriving stock (Generic, Show, Eq)
 
 mkCodeTask :: Text -> Text -> Text -> CodeFact -> Text -> CodeTask
-mkCodeTask p t w f body = CodeTask p t w f body
+mkCodeTask = CodeTask
 
 -- | The numbered fact lines, as the model sees them.
 codeFactLines :: CodeFact -> Text

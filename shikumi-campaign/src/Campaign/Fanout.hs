@@ -1,5 +1,4 @@
 {-# LANGUAGE GHC2024 #-}
-{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE OverloadedStrings #-}
 
@@ -45,6 +44,7 @@ import Campaign.Cell (FixAttempt (..))
 import Control.Concurrent (threadDelay)
 import Control.Monad (forM, forM_, unless, when)
 import Data.Aeson qualified as Aeson
+import Data.Either (rights)
 import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef)
 import Data.List (sortOn)
 import Data.Map.Strict qualified as Map
@@ -54,7 +54,7 @@ import Data.Text qualified as T
 import Data.Time (UTCTime, addUTCTime, getCurrentTime)
 import Data.Time.Clock.POSIX (utcTimeToPOSIXSeconds)
 import Data.Vector qualified as Vector
-import Effectful (Eff, IOE, (:>), liftIO, runEff)
+import Effectful (IOE, liftIO, runEff, (:>))
 import Keiro.Codec (decodeRecorded, encodeForAppend)
 import Keiro.Connection (keiroConnectionSettings)
 import Keiro.Workflow.Types (WorkflowJournalEvent (..), workflowJournalCodec)
@@ -82,12 +82,12 @@ import Shibuya
     runApp,
     stopApp,
   )
-import Shibuya.Core.Types (Envelope (..))
 import Shibuya.Adapter.Kiroku
   ( KirokuAdapterConfig (..),
     defaultKirokuAdapterConfig,
     kirokuAdapter,
   )
+import Shibuya.Core.Types (Envelope (..))
 import Shibuya.Telemetry.Effect (runTracingNoop)
 import Prelude
 
@@ -149,7 +149,8 @@ runCellFanout connString = withStore (keiroConnectionSettings connString "campai
   finalStates <- readIORef st.fsStates
   warnings <- reverse <$> readIORef st.fsWarnings
   unless (null warnings) $
-    forM_ warnings $ \w -> putStrLn ("[fanout] WARNING " <> T.unpack w)
+    forM_ warnings $
+      \w -> putStrLn ("[fanout] WARNING " <> T.unpack w)
   reportFanout store finalStates
 
 -- | Adapter-side filter: only events that decode as journal events reach
@@ -167,7 +168,7 @@ cellHandler ::
   (IOE :> es) =>
   FanoutState ->
   Handler es RecordedEvent
-cellHandler st = \Message {envelope = Envelope {payload = ev}} -> do
+cellHandler st Message {envelope = Envelope {payload = ev}} = do
   liftIO $ modifyIORef' st.fsCount (+ 1)
   case decodeRecorded workflowJournalCodec ev of
     Left _ -> pure AckOk -- unreachable behind the selector; kept total
@@ -223,8 +224,10 @@ reportFanout store finalStates = do
         ]
 
   putStrLn
-    ( "[fanout] streams tracked: " <> show (Map.size finalStates)
-        <> "; cell journals: " <> show (length cellStreams)
+    ( "[fanout] streams tracked: "
+        <> show (Map.size finalStates)
+        <> "; cell journals: "
+        <> show (length cellStreams)
     )
   results <- forM (sortOn snd cellStreams) $ \(sid, sname) -> do
     journalE <- runStoreIO store (Store.readStreamForward (StreamName sname) (StreamVersion 0) 1000)
@@ -242,13 +245,18 @@ reportFanout store finalStates = do
 
   forM_ results $ \(sname, live, offline, offlineOk, verdict) ->
     putStrLn $
-      "[fanout] " <> T.unpack (T.drop (T.length "wf:cell-campaign-") sname)
-        <> "  live: " <> T.unpack (describeSummary live)
+      "[fanout] "
+        <> T.unpack (T.drop (T.length "wf:cell-campaign-") sname)
+        <> "  live: "
+        <> T.unpack (describeSummary live)
         <> "  offline: "
-        <> if offlineOk then T.unpack (describeSummary (fromMaybe live offline)) else "REPLAY-FAILED"
-        <> "  ["
-        <> (if verdict then "MATCH" else "DIFF")
-        <> "]"
+        <> if offlineOk
+          then T.unpack (describeSummary (fromMaybe live offline))
+          else
+            "REPLAY-FAILED"
+              <> "  ["
+              <> (if verdict then "MATCH" else "DIFF")
+              <> "]"
 
   let nMatch = length [() | (_, _, _, _, True) <- results]
       nDiff = length [() | (_, _, _, _, False) <- results]
@@ -263,7 +271,7 @@ offlineSummary events =
     Right rst -> Just (cellSummaryOf rst)
 
 journalEventsOf :: [RecordedEvent] -> [WorkflowJournalEvent]
-journalEventsOf events = [wje | Right wje <- decodeRecorded workflowJournalCodec <$> events]
+journalEventsOf events = rights (decodeRecorded workflowJournalCodec <$> events)
 
 isCellStreamName :: Text -> Bool
 isCellStreamName = T.isPrefixOf "wf:cell-campaign-"
@@ -311,7 +319,7 @@ alphaEvents t0 =
 
 betaEvents :: UTCTime -> [WorkflowJournalEvent]
 betaEvents t0 =
-  [    StepRecorded "verify-initial" (Aeson.toJSON (["E: type error in main"] :: [Text])) t0,
+  [ StepRecorded "verify-initial" (Aeson.toJSON (["E: type error in main"] :: [Text])) t0,
     StepRecorded "propose-fix-1" (jsonAttempt 1 False) (addUTCTime 5 t0),
     StepRecorded "propose-fix-2" (jsonAttempt 2 False) (addUTCTime 10 t0),
     StepRecorded "propose-fix-3" (jsonAttempt 3 False) (addUTCTime 15 t0),

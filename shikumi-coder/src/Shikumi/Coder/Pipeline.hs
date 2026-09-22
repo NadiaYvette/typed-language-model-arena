@@ -40,12 +40,9 @@ where
 
 import Data.Text (Text)
 import Data.Text qualified as T
-import GHC.Generics (Generic)
-
 import Effectful.Error.Static (throwError)
-
+import GHC.Generics (Generic)
 import Shikumi.Adapter (ToPrompt)
-import Shikumi.Combinator (retry, (>>>))
 import Shikumi.Coder.Task
   ( CodeTask (..),
     EditFailure (..),
@@ -53,6 +50,7 @@ import Shikumi.Coder.Task
     applyPlan,
     renderEditFailure,
   )
+import Shikumi.Combinator (retry, (>>>))
 import Shikumi.Error (ShikumiError (..))
 import Shikumi.Module (predict)
 import Shikumi.Program (Program, embed)

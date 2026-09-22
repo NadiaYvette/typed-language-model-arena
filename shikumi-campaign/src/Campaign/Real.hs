@@ -48,6 +48,7 @@ module Campaign.Real
     hostVerdictFrom,
     hostVerdictFromProj,
     knownFailuresFor,
+
     -- * Scheduling from memory
     RealScheduleEntry (..),
     RealSchedule (..),
@@ -56,6 +57,7 @@ module Campaign.Real
     evidenceFromLessons,
     scheduleFromEvidence,
     lessonAdviceFor,
+
     -- * Execution
     RealMode (..),
     realModeFromEnv,
@@ -64,6 +66,7 @@ module Campaign.Real
     realLogPath,
     realAttemptRecord,
     runRealUnit,
+
     -- * Target manifests (Vector A, Track 10)
     TargetManifest (..),
     targetManifestsDir,
@@ -73,6 +76,7 @@ module Campaign.Real
     targetUnitOfManifest,
     manifestFor,
     governingManifest,
+
     -- * Workflow
     realCellWorkflow,
     realWorkflowName,
@@ -82,25 +86,27 @@ module Campaign.Real
   )
 where
 
+import Campaign.Cell (CellId (..))
+import Control.Applicative ((<|>))
+import Control.Exception (SomeException)
+import Control.Exception qualified as E
 import Data.Aeson qualified as Aeson
-import Data.Function (on)
-import Data.List (find, sort, sortOn)
+import Data.Char (isAsciiLower, isDigit)
+import Data.List (find, sort)
 import Data.List qualified as List
 import Data.Map.Strict qualified as Map
 import Data.Maybe (catMaybes, mapMaybe)
-import GHC.Natural (Natural)
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
 import Data.Text.Lazy qualified as TL
 import Data.Text.Lazy.Encoding qualified as TLE
-import Control.Exception qualified as E
-import Control.Exception (SomeException)
 import Data.Time (NominalDiffTime, diffUTCTime, getCurrentTime)
-import Dhall qualified as Dhall
+import Dhall qualified
 import Effectful (Eff, IOE, liftIO, (:>))
 import GHC.Generics (Generic)
+import GHC.Natural (Natural)
 import Keiro.Workflow (StepName (..), WorkflowId (..), step)
 import Keiro.Workflow qualified as KeiroWorkflow (Workflow)
 import Keiro.Workflow.Resume (WorkflowDef (..), WorkflowRegistry)
@@ -110,12 +116,10 @@ import Kiroku.Store.Effect.Resource (KirokuStoreResource)
 import System.Directory (doesDirectoryExist, doesFileExist, getCurrentDirectory, listDirectory)
 import System.Environment (lookupEnv)
 import System.Exit (ExitCode (..))
-import System.FilePath ((</>), takeExtension)
+import System.FilePath (takeExtension, (</>))
 import System.IO (hPutStrLn, stderr)
 import System.Process.Typed (proc, readProcess)
 import Text.Read (readMaybe)
-
-import Campaign.Cell (CellId (..))
 
 -- ---------------------------------------------------------------------------
 -- Units: one real verification cell
@@ -124,16 +128,16 @@ import Campaign.Cell (CellId (..))
 -- | One real verification unit. @ruKind@ names the process family; the
 -- remaining fields parameterize it exactly as the driver consumes them.
 data RealUnit = RealUnit
-  { ruProject :: !Text,
-    -- ^ @pgcl@ or @telix@ — also the memory namespace the unit reports into
+  { -- | @pgcl@ or @telix@ — also the memory namespace the unit reports into
+    ruProject :: !Text,
+    -- | @qemu-boot-matrix@ or @host-verify@
     ruKind :: !Text,
-    -- ^ @qemu-boot-matrix@ or @host-verify@
+    -- | target architecture (pgcl) or @host@ (telix)
     ruArch :: !Text,
-    -- ^ target architecture (pgcl) or @host@ (telix)
+    -- | kernel config tier (pgcl) or the make target set (telix)
     ruConfig :: !Text,
-    -- ^ kernel config tier (pgcl) or the make target set (telix)
+    -- | the driver arguments after LINUX_DIR, verbatim
     ruArgs :: ![Text]
-    -- ^ the driver arguments after LINUX_DIR, verbatim
   }
   deriving stock (Eq, Ord, Show, Generic)
   deriving anyclass (Aeson.ToJSON, Aeson.FromJSON)
@@ -204,7 +208,7 @@ pgclArchRowsFromDriver path = do
       -- underscore lives in real arch keys (x86_64, loongarch64 has none
       -- but riscv32's neighbors do); the class stays narrow enough that
       -- the @*)@ catch-all and bash constructs never match.
-      | T.all (\c -> ('a' <= c && c <= 'z') || ('0' <= c && c <= '9') || c == '-' || c == '_') k = Just ()
+      | T.all (\c -> isAsciiLower c || isDigit c || c == '-' || c == '_') k = Just ()
       | otherwise = Nothing
 
 pgclConfigCatalog :: [Text]
@@ -215,7 +219,9 @@ pgclConfigCatalog = ["mainline", "0", "2", "4", "6"]
 sh4XToolsProbe :: Text -> Text
 sh4XToolsProbe cc =
   "for d in \"$HOME\"/x-tools/*/sh4-linux/bin \"$HOME\"/x-tools/sh-sh4--*/bin; do\n\
-  \  [ -x \"$d/" <> cc <> "gcc\" ] && exit 0\ndone; exit 1"
+  \  [ -x \"$d/"
+    <> cc
+    <> "gcc\" ] && exit 0\ndone; exit 1"
 
 -- | @command -v@ probe; False on lookup failure.
 availableOnPath :: Text -> IO Bool
@@ -298,8 +304,7 @@ realUnitCells = do
   -- key replaces it (the manifest's command + oracle facts then govern).
   -- This is what makes authoring a new target a filesystem write, not a
   -- rebuild of the orchestrator.
-  manifests <- realUnitCellManifests
-  pure (realUnitsWithManifests builtIns manifests)
+  realUnitsWithManifests builtIns <$> realUnitCellManifests
 
 -- Ground-truth path the discovery reads: the full-catalog driver. The
 -- reduced matrix-driver.sh speaks only 10 of the 20 arches the historical
@@ -339,18 +344,24 @@ pgclDriverPath = "/home/nyc/src/pgcl/matrix-driver-all.sh"
 --   * timeoutSeconds  — wall-clock bound (documented; the driver/harness owns
 --                        its own timeouts for now)
 data TargetManifest = TargetManifest
-  { project        :: !Text
-  , kind           :: !Text  -- ^ @host-verify@ or @qemu-boot-matrix@
-  , arch           :: !Text
-  , config         :: !Text
-  , workDir        :: !Text
-  , command        :: !Text  -- ^ the exact command to run (journaled verbatim)
-  , successMarkers :: ![Text] -- ^ every one must appear in the log for @passed@
-  , waiveBaseline  :: ![Text] -- ^ documented known-fail names (pgcl; empty = no extra waivers)
-  , logSchema      :: !(Maybe Text) -- ^ richer fact kind, not yet interpreted
-  , proofHygiene   :: !(Maybe Text) -- ^ richer fact kind, not yet interpreted
-  , exitMustSucceed :: !Bool
-  , timeoutSeconds :: !Natural
+  { project :: !Text,
+    -- | @host-verify@ or @qemu-boot-matrix@
+    kind :: !Text,
+    arch :: !Text,
+    config :: !Text,
+    workDir :: !Text,
+    -- | the exact command to run (journaled verbatim)
+    command :: !Text,
+    -- | every one must appear in the log for @passed@
+    successMarkers :: ![Text],
+    -- | documented known-fail names (pgcl; empty = no extra waivers)
+    waiveBaseline :: ![Text],
+    -- | richer fact kind, not yet interpreted
+    logSchema :: !(Maybe Text),
+    -- | richer fact kind, not yet interpreted
+    proofHygiene :: !(Maybe Text),
+    exitMustSucceed :: !Bool,
+    timeoutSeconds :: !Natural
   }
   deriving stock (Eq, Show, Generic)
   deriving anyclass (Aeson.ToJSON, Aeson.FromJSON, Dhall.FromDhall, Dhall.ToDhall)
@@ -367,10 +378,11 @@ targetManifestsDir = do
 -- mistyped target is an operator error, not a silent no-op.
 loadTargetManifest :: FilePath -> IO (Either Text TargetManifest)
 loadTargetManifest path = do
-  m <- E.try (Dhall.inputFileWithSettings Dhall.defaultEvaluateSettings Dhall.auto path)
-    :: IO (Either SomeException TargetManifest)
+  m <-
+    E.try (Dhall.inputFileWithSettings Dhall.defaultEvaluateSettings Dhall.auto path) ::
+      IO (Either SomeException TargetManifest)
   pure $ case m of
-    Left  e -> Left (T.pack (show e))
+    Left e -> Left (T.pack (show e))
     Right t -> Right t
 
 -- | Discover all manifests in the target directory. Bad files are reported on
@@ -398,7 +410,9 @@ realUnitCellManifests = do
         Right t -> do
           hPutStrLn
             stderr
-            $ "[targets] " <> f <> ": unsupported kind \""
+            $ "[targets] "
+              <> f
+              <> ": unsupported kind \""
               <> T.unpack t.kind
               <> "\" (spike executes host-verify + qemu-boot-matrix) — skipped"
           pure Nothing
@@ -414,22 +428,22 @@ realUnitsWithManifests builtIns manifests =
       -- Drop built-ins whose key a manifest governs (that manifest unit
       -- replaces them); keep every other built-in.
       kept = [u | u <- builtIns, realCellKey u `Set.notMember` manifestKeys]
-      -- Append every manifest unit: a replacement for a dropped built-in,
+   in -- Append every manifest unit: a replacement for a dropped built-in,
       -- or a genuinely new target. Manifests never duplicate — discovery
       -- loads each file once, and two files claiming one key is a manifest
       -- authoring error the operator should see, not silently merge away.
-   in kept <> manifestUnits
+      kept <> manifestUnits
 
 -- | The @RealUnit@ a manifest declares. @ruArgs@ stays empty: host-verify
 -- execution (and resume reconstruction) is fully determined by the key.
 targetUnitOfManifest :: TargetManifest -> RealUnit
 targetUnitOfManifest m =
   RealUnit
-    { ruProject = m.project
-    , ruKind = m.kind
-    , ruArch = m.arch
-    , ruConfig = m.config
-    , ruArgs = []
+    { ruProject = m.project,
+      ruKind = m.kind,
+      ruArch = m.arch,
+      ruConfig = m.config,
+      ruArgs = []
     }
 
 -- | The manifest (if any) that governs a unit: looked up by key.
@@ -438,7 +452,6 @@ manifestFor manifests u =
   find ((== realCellKey u) . manifestKey) manifests
   where
     manifestKey m = m.project <> "/" <> m.arch <> "@" <> m.config
-
 
 -- ---------------------------------------------------------------------------
 -- The verdict: read off the log the tool wrote
@@ -457,7 +470,7 @@ manifestFor manifests u =
 -- (see 'knownFailuresFor') — any unnamed or novel failure still fails the
 -- cell. Not arch-scoped for @host-verify@ units, whose logs carry no LTP.
 classifyCellLogArch :: Text -> Text -> Text
-classifyCellLogArch arch logText = classifyCellLogBaseline arch (knownFailuresFor arch) logText
+classifyCellLogArch arch = classifyCellLogBaseline arch (knownFailuresFor arch)
 
 -- | The arch-scoped classifier with an explicit waiver baseline: a cell
 -- with failures passes as @passed-waived@ only when /every/ failure the log
@@ -465,11 +478,12 @@ classifyCellLogArch arch logText = classifyCellLogBaseline arch (knownFailuresFo
 -- arch's built-in baseline at the call site — the baseline is a /target
 -- fact/, and the manifest is where target facts live (decision #2).
 classifyCellLogBaseline :: Text -> [Text] -> Text -> Text
-classifyCellLogBaseline arch baseline logText
+classifyCellLogBaseline _arch baseline logText
   | any (\l -> "SKIP: no " `T.isPrefixOf` T.strip l) (T.lines logText) = "skipped"
   | Just fails <- lastSubtotalFails logText =
-      if fails == 0 && not (kernelWarned logText) then "passed"
-      else if fails > 0 && waivedByBaseline fails then "passed-waived" else "failed"
+      if fails == 0 && not (kernelWarned logText)
+        then "passed"
+        else if fails > 0 && waivedByBaseline fails then "passed-waived" else "failed"
   | otherwise = "failed"
   where
     waivedByBaseline n = case ltpFailList logText of
@@ -483,7 +497,7 @@ classifyCellLogBaseline arch baseline logText
     lastSubtotalFails t = go Nothing (T.lines t)
       where
         go acc [] = acc
-        go acc (l : ls) = go (case subtotalFails l of Just f -> Just f; Nothing -> acc) ls
+        go acc (l : ls) = go (subtotalFails l <|> acc) ls
     subtotalFails line = do
       -- "Test Summary: N passed, M failed" and "LTP subtotals: N passed, M
       -- failed, K skipped" both put each count /before/ its keyword (with
@@ -583,7 +597,9 @@ realBudgetFromEnv = do
       Just n | n >= 0 -> pure (Just n)
       _ ->
         error
-          ( "REAL_LIMIT=" <> s <> " is not a non-negative integer"
+          ( "REAL_LIMIT="
+              <> s
+              <> " is not a non-negative integer"
               <> " (live cells this invocation; 0 = plan only)"
           )
 
@@ -626,13 +642,21 @@ commandText u outDir mfs = case mfs of
       | ruProject u' == "organ-bank" =
           "cabal --project-dir=" <> realWorkDir u' <> " test organ-ir"
       | ruProject u' == "mowgli" =
-          "make -C " <> realWorkDir u' <> " film_episode_test film_annotation_fixture_test && "
-            <> realWorkDir u' <> "/src/logic/film_episode_test && "
-            <> realWorkDir u' <> "/src/logic/film_annotation_fixture_test"
+          "make -C "
+            <> realWorkDir u'
+            <> " film_episode_test film_annotation_fixture_test && "
+            <> realWorkDir u'
+            <> "/src/logic/film_episode_test && "
+            <> realWorkDir u'
+            <> "/src/logic/film_annotation_fixture_test"
       | ruKind u' == "host-verify" =
           "make -C " <> realWorkDir u' <> " " <> ruConfig u'
       | otherwise =
-          "bash " <> T.pack pgclDriverPath <> " " <> realWorkDir u' <> " "
+          "bash "
+            <> T.pack pgclDriverPath
+            <> " "
+            <> realWorkDir u'
+            <> " "
             <> T.intercalate " " (ruArch u' : ruArgs u' <> [T.pack outDir'])
 
 -- | The verdict gate for a driver-run pgcl cell: the log classifier (which
@@ -643,7 +667,7 @@ commandText u outDir mfs = case mfs of
 -- when this gate learned about @passed-waived@, its last consumer learned
 -- at the same time.
 verdictFrom :: ExitCode -> Text -> Text -> Text
-verdictFrom ec arch t = verdictFromBaseline ec arch (knownFailuresFor arch) t
+verdictFrom ec arch = verdictFromBaseline ec arch (knownFailuresFor arch)
 
 -- | The pgcl verdict gate with an explicit waiver baseline (a manifest's
 -- @waiveBaseline@ unioned with the arch's built-in). Kept exported so the
@@ -728,10 +752,10 @@ data RealAttempt = RealAttempt
     raMode :: !Text,
     raVerdict :: !Text,
     raLog :: !Text,
-    raSeconds :: !(Maybe NominalDiffTime)
-    -- ^ Driver-measured wall time of a live run; offline plans carry
+    -- | Driver-measured wall time of a live run; offline plans carry
     -- @Nothing@. In-band so the lesson line can carry cost, and cost then
     -- feeds the scheduler like any other evidence.
+    raSeconds :: !(Maybe NominalDiffTime)
   }
   deriving stock (Eq, Show, Generic)
   deriving anyclass (Aeson.ToJSON, Aeson.FromJSON)
@@ -897,9 +921,9 @@ data VerdictClass = VCPassed | VCUnknown | VCFailed
 -- unknown > passed) and the slowest run survive — the scheduler plans for
 -- the worst thing the cell has ever done, at its slowest.
 evidenceFromLessons :: [Text] -> Map.Map Text CellEvidence
-evidenceFromLessons = foldr step Map.empty
+evidenceFromLessons = foldr stepLesson Map.empty
   where
-    step lesson acc = case parseAdvice lesson of
+    stepLesson lesson acc = case parseAdvice lesson of
       Nothing -> acc
       Just (key, vc, msecs) ->
         Map.insertWith merge key (CellEvidence key vc msecs 1) acc
@@ -933,8 +957,9 @@ parseAdvice lesson = do
       -- trailing 's' count and won't parse as one).
       beforeSemi = T.takeWhile (/= ';') rest3
       secs = case T.breakOn "(" beforeSemi of
-        (_, parenRest) | "(" `T.isPrefixOf` parenRest ->
-          readDouble (T.takeWhile (/= 's') (T.drop 1 parenRest))
+        (_, parenRest)
+          | "(" `T.isPrefixOf` parenRest ->
+              readDouble (T.takeWhile (/= 's') (T.drop 1 parenRest))
         _ -> Nothing
   if mode == "live" then Just (key, vc, secs) else Nothing
   where
@@ -982,17 +1007,19 @@ scheduleFromEvidence units ev =
     tierClassOf u = maybe VCUnknown ceVerdict (Map.lookup (realCellKey u) ev)
     costOf u = case Map.lookup (realCellKey u) ev >>= ceSeconds of
       Just s -> (0, s)
-      Nothing -> (1, 0)
+      Nothing -> (1 :: Int, 0)
     whyOf u = case Map.lookup (realCellKey u) ev of
       Nothing -> "no evidence yet"
       Just e ->
-        (case ceVerdict e of
-           VCFailed -> "worst outcome failed"
-           VCUnknown -> "unclassified"
-           VCPassed -> "worst outcome passed")
-          <> (case ceSeconds e of
-                Just s -> ", worst run " <> T.pack (showR1 s) <> "s"
-                Nothing -> "")
+        ( case ceVerdict e of
+            VCFailed -> "worst outcome failed"
+            VCUnknown -> "unclassified"
+            VCPassed -> "worst outcome passed"
+        )
+          <> ( case ceSeconds e of
+                 Just s -> ", worst run " <> T.pack (showR1 s) <> "s"
+                 Nothing -> ""
+             )
           <> (if ceAttempts e > 1 then ", " <> T.pack (show (ceAttempts e)) <> " live runs" else "")
 
 -- | One decimal place, without pulling in printf formatting.

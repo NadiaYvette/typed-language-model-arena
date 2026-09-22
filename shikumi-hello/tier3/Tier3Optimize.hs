@@ -23,7 +23,6 @@ import Data.Aeson (ToJSON)
 import Data.Text (Text)
 import Data.Text.IO qualified as TIO
 import GHC.Generics (Generic)
-
 import Shikumi.Adapter (ToPrompt)
 import Shikumi.Compile (CompiledProgram (..), decodeCompiledOnto, encodeCompiled)
 import Shikumi.Eval (Dataset, dataset, evaluatePure, exactMatch, example, renderReportText)
@@ -50,10 +49,10 @@ classify = predict (mkSignature "Classify the review sentiment as positive or ne
 trainset :: Dataset Review Label
 trainset =
   dataset
-    [ example (Review "Loved it, would buy again") (Label "positive")
-    , example (Review "Total waste of money") (Label "negative")
-    , example (Review "Exceeded my expectations") (Label "positive")
-    , example (Review "Broke on day one") (Label "negative")
+    [ example (Review "Loved it, would buy again") (Label "positive"),
+      example (Review "Total waste of money") (Label "negative"),
+      example (Review "Exceeded my expectations") (Label "positive"),
+      example (Review "Broke on day one") (Label "negative")
     ]
 
 main :: IO ()
@@ -95,4 +94,4 @@ main = do
               (const (markerResponse [("label", "positive")]))
               (evaluatePure trainset exactMatch (compiledProgram reloaded))
           putStrLn "reloaded:"
-          either (putStrLn . show) TIO.putStr (fmap renderReportText scored)
+          either print (TIO.putStr . renderReportText) scored

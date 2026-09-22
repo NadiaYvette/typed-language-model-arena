@@ -34,7 +34,6 @@ import Data.Text (Text)
 import Data.Vector qualified as V
 import Effectful (runEff)
 import GHC.Generics (Generic)
-
 import Shikumi.Adapter (Adapter (..), ToPrompt, fallbackAdapter)
 import Shikumi.Error (ShikumiError)
 import Shikumi.LLM (complete)
@@ -49,8 +48,8 @@ import Shikumi.Testing (markerResponse, runStubLLM)
 -- ---------------------------------------------------------------------------
 
 data Describe = Describe
-  { photo :: !Image -- an input-only image field
-  , question :: !(Field "What to ask about the image" Text)
+  { photo :: !Image, -- an input-only image field
+    question :: !(Field "What to ask about the image" Text)
   }
   deriving stock (Generic, Show)
   deriving anyclass (ToPrompt) -- the generic default discovers the image field
@@ -73,8 +72,8 @@ rawPng = BS.pack [0x89, 0x50, 0x4e, 0x47]
 describeInput :: Describe
 describeInput =
   Describe
-    { photo = imageFromBytes "image/png" rawPng
-    , question = field "What vehicle is shown?"
+    { photo = imageFromBytes "image/png" rawPng,
+      question = field "What vehicle is shown?"
     }
 
 -- ---------------------------------------------------------------------------
@@ -84,15 +83,15 @@ describeInput =
 userImageBlocks :: Context -> [ImageContent]
 userImageBlocks ctx =
   [ ic
-  | UserMessage p <- V.toList (ctx ^. #messages)
-  , UserImage ic <- V.toList (p ^. #content)
+  | UserMessage p <- V.toList (ctx ^. #messages),
+    UserImage ic <- V.toList (p ^. #content)
   ]
 
 userTextBlocks :: Context -> [Text]
 userTextBlocks ctx =
   [ t
-  | UserMessage p <- V.toList (ctx ^. #messages)
-  , UserText (TextContent t) <- V.toList (p ^. #content)
+  | UserMessage p <- V.toList (ctx ^. #messages),
+    UserText (TextContent t) <- V.toList (p ^. #content)
   ]
 
 -- An image input has no FromModel, so this uses the manual render -> call ->

@@ -47,17 +47,23 @@ module Campaign.ReactFixer
   )
 where
 
-import Data.Aeson (ToJSON)
+import Campaign.Cell (Cell (..), unCellId)
+import Campaign.Oracle (CellOracle (..))
+import Campaign.Workflow (AttemptEngine)
 import Control.Monad (when)
+import Data.Aeson (ToJSON)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
-import Data.List (nub, sort)
+import Data.List (nub, sortBy)
+import Data.Maybe (mapMaybe)
+import Data.Ord (Down (..), comparing)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Vector qualified as V
-import Effectful (Eff)
 import Effectful.Internal.Monad (unsafeEff)
 import GHC.Generics (Generic)
-
+import Kioku.AI.Config (AIFeature (..))
+import Kioku.AI.Runtime (AIRuntime, runAIProgram)
+import Shikumi.Adapter (ToPrompt)
 import Shikumi.Agent.ReAct
   ( Action (..),
     ReActConfig (..),
@@ -68,22 +74,14 @@ import Shikumi.Agent.ReAct
     reactWithTrajectory,
   )
 import Shikumi.Error (ShikumiError)
+import Shikumi.Program (Program)
 import Shikumi.Schema (FromModel, ToSchema, Validatable)
 import Shikumi.Schema.Types (Field (..))
 import Shikumi.Signature (Signature, mkSignature, setInstruction)
-import Shikumi.Adapter (ToPrompt)
-import Shikumi.Program (Program)
 import Shikumi.Testing (mkTextResponse, runAgent)
 import Shikumi.Tool (SomeTool (..), Tool, ToolRegistry, mkRegistry, mkTool)
-
-import Kioku.AI.Config (AIFeature (..))
-import Kioku.AI.Runtime (AIRuntime, runAIProgram)
-
-import Campaign.Cell (Cell (..), unCellId)
-import Campaign.Oracle (CellOracle (..))
-import Campaign.Workflow (AttemptEngine)
 import Toy.Fixer.Domain (Diagnostic (..), Source (..), SourcePath, showDiagnostic, sourceText)
-import Toy.Fixer.Program (DiagnosticsIn (..), RepairOut)
+import Toy.Fixer.Program (DiagnosticsIn (..))
 
 -- ---------------------------------------------------------------------------
 -- Task in, typed report out
@@ -153,14 +151,14 @@ fixSignature env =
 
 -- | Tool outputs are plain records (compact-JSON observation text); 'Field'
 -- is a prompt/schema annotation, not an observation annotation.
-data ReadFileOut = ReadFileOut
-  { rfoContent :: !Text
+newtype ReadFileOut = ReadFileOut
+  { rfoContent :: Text
   }
   deriving stock (Generic, Eq, Show)
   deriving anyclass (ToJSON)
 
-data CheckArgs = CheckArgs
-  { caPath :: !Text
+newtype CheckArgs = CheckArgs
+  { caPath :: Text
   }
   deriving stock (Generic, Eq, Show)
   deriving anyclass (ToSchema, FromModel)
@@ -174,8 +172,8 @@ data CheckOut = CheckOut
   deriving stock (Generic, Eq, Show)
   deriving anyclass (ToJSON)
 
-data DeleteLinesArgs = DeleteLinesArgs
-  { dlaLineNumbers :: !(Field "1-based line numbers to delete" [Int])
+newtype DeleteLinesArgs = DeleteLinesArgs
+  { dlaLineNumbers :: Field "1-based line numbers to delete" [Int]
   }
   deriving stock (Generic, Eq, Show)
   deriving anyclass (ToSchema, FromModel)
@@ -190,8 +188,8 @@ data DeleteLinesOut = DeleteLinesOut
   deriving stock (Generic, Eq, Show)
   deriving anyclass (ToJSON)
 
-data ReadFileArgs = ReadFileArgs
-  { rfaPath :: !Text
+newtype ReadFileArgs = ReadFileArgs
+  { rfaPath :: Text
   }
   deriving stock (Generic, Eq, Show)
   deriving anyclass (ToSchema, FromModel)
@@ -233,7 +231,7 @@ reactToolsFor env =
           unsafeEff $ \_k -> do
             ls0 <- readIORef (weState env)
             let n = length ls0
-                wanted = reverse . sort . nub $ nums
+                wanted = sortBy (comparing Down) . nub $ nums
                 (ok, bad) = partition wanted
                 partition [] = ([], [])
                 partition (k : ks)
@@ -283,10 +281,11 @@ renderSteps traj =
   where
     renderStep s =
       "  - "
-        <> (case action s of
-              CallTool nm _ -> "call " <> nm
-              Finish -> "finish"
-              _ -> "summary")
+        <> ( case action s of
+               CallTool nm _ -> "call " <> nm
+               Finish -> "finish"
+               _ -> "summary"
+           )
         <> maybe "" (\o -> " -> " <> T.take 200 o) (observation s)
 
 -- ---------------------------------------------------------------------------
@@ -311,7 +310,7 @@ runReactAttempt runAgentAttempt oracle cell notes diags = do
   let env =
         WorkEnv
           { weState = ref,
-            weCheck = \ls -> oracleCheck oracle (cellPath cell) (Source (T.unlines ls)),
+            weCheck = oracleCheck oracle (cellPath cell) . Source . T.unlines,
             weNotes = notes
           }
       task =
@@ -345,7 +344,8 @@ runReactAttempt runAgentAttempt oracle cell notes diags = do
             putStrLn
               ( "    [react] checker clean but the diff is not minimal — rejected"
                   <> " (deleted lines must be exactly the flagged ones: "
-                  <> show (flaggedLines diags) <> ")"
+                  <> show (flaggedLines diags)
+                  <> ")"
               )
           pure Nothing
   where
@@ -358,7 +358,7 @@ runReactAttempt runAgentAttempt oracle cell notes diags = do
 flaggedLines :: [Text] -> [Int]
 flaggedLines = mapMaybe' lineOf
   where
-    mapMaybe' f xs = [y | Just y <- f <$> xs]
+    mapMaybe' = mapMaybe
     lineOf d = case T.splitOn ":" d of
       (_ : n : _) -> readMaybeInt (T.strip n)
       _ -> Nothing

@@ -1,20 +1,21 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
-module Campaign.Dispatch.Pgmq
-  ( enqueueDispatch
-  , PGMQMessage (..)
-  ) where
 
-import qualified Data.ByteString.Lazy as BL
+module Campaign.Dispatch.Pgmq
+  ( enqueueDispatch,
+    PGMQMessage (..),
+  )
+where
+
+import Campaign.Dispatch (DispatchAction)
 import Data.Aeson (ToJSON, encode)
 import GHC.Generics (Generic)
-import Campaign.Dispatch (DispatchAction)
 import Keiro.Workflow.Awakeable (AwakeableId)
 
 -- | Message payload for the PGMQ queue
 data PGMQMessage = PGMQMessage
-  { action :: !DispatchAction
-  , awakeableId :: !AwakeableId
+  { action :: !DispatchAction,
+    awakeableId :: !AwakeableId
   }
   deriving (Show, Generic, ToJSON)
 

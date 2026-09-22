@@ -16,7 +16,7 @@ import Data.List (sort)
 import Data.Text qualified as T
 import System.Directory (listDirectory)
 import System.Environment (getArgs)
-import System.FilePath ((</>), takeExtension, takeFileName)
+import System.FilePath (takeExtension, takeFileName, (</>))
 
 main :: IO ()
 main = do

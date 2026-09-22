@@ -1,7 +1,9 @@
 cabal-version: 3.8
-name:            shikumi-campaign
-version:         0.1.0.0
-synopsis:        One-cell verification campaign: shikumi decisions on keiro's durable runtime
+name:          shikumi-campaign
+version:       0.1.0.0
+synopsis:
+  One-cell verification campaign: shikumi decisions on keiro's durable runtime
+
 description:
   The one-cell campaign skeleton: a failing cell (toy-fixer's seeded corpus)
   flows through a keiro durable workflow whose decision step is a shikumi
@@ -9,16 +11,16 @@ description:
   checker, retried under a typed budget, and a human-escalation path parks
   the workflow on an awakeable until an answer is signalled. A simulated
   restart proves durability.
-license:         BSD-3-Clause
-build-type:      Simple
-tested-with:     ghc >=9.12 && <9.13
+
+license:       BSD-3-Clause
+build-type:    Simple
+tested-with:   GHC >=9.12 && <9.13
 
 common warnings
-  ghc-options:
-    -Wall
+  ghc-options: -Wall
 
 common shared
-  default-language: GHC2024
+  default-language:   GHC2024
   default-extensions:
     BlockArguments
     DeriveAnyClass
@@ -32,146 +34,138 @@ common shared
     QualifiedDo
 
 library
-  import: warnings, shared
+  import:          warnings, shared
   exposed-modules:
     Campaign.Aggregate
+    Campaign.Attestation
     Campaign.Bootstrap
     Campaign.Cell
-    Campaign.Attestation
     Campaign.Dispatch
+    Campaign.Dispatch.Pgmq
     Campaign.Fanout
     Campaign.Hands
     Campaign.Landing
-    Campaign.Memory
     Campaign.Matrix
+    Campaign.Memory
     Campaign.Mercury
     Campaign.Oracle
     Campaign.ReactFixer
+    Campaign.Real
     Campaign.RepairReceipt
     Campaign.Review
-    Campaign.Real
     Campaign.SshAgent
-    Campaign.Dispatch.Pgmq
     Campaign.Workflow
-  hs-source-dirs: src
+
+  hs-source-dirs:  src
   build-depends:
-    aeson >=2.2,
-    base >=4.21 && <5,
-    baikai,
-    base16,
-    base64,
-    binary,
-    bytestring,
-    containers,
-    crypton,
-    cryptohash-sha256,
-    directory,
-    dhall,
-    effectful >=2.6,
-    effectful-core >=2.6,
-    filepath,
-    generic-lens >=2.2,
-    hasql >=1.9,
-    hasql-pool >=1.4,
-    keiki >=0.9 && <0.10,
-    keiro,
-    keiro-core,
-    kioku-api,
-    kioku-core,
-    kiroku-store >=0.8 && <0.9,
-    lens >=5.2,
-    network,
-    process >=1.6,
-    shibuya-core >=0.9,
-    shibuya-kiroku-adapter >=0.5,
-    shikumi ^>=0.4.0.0,
-    shikumi-coder,
-    shikumi-testing ^>=0.1.0.0,
-    shikumi-tools ^>=0.4.0.0,
-    text >=2.1,
-    time >=1.12,
-    toy-fixer,
-    typed-process >=0.2,
-    uuid >=1.3,
-    vector >=0.13,
+    , aeson                   >=2.2
+    , baikai
+    , base                    >=4.21     && <5
+    , base16
+    , base64
+    , binary
+    , bytestring
+    , containers
+    , cryptohash-sha256
+    , crypton
+    , dhall
+    , directory
+    , effectful               >=2.6
+    , effectful-core          >=2.6
+    , filepath
+    , generic-lens            >=2.2
+    , hasql                   >=1.9
+    , hasql-pool              >=1.4
+    , keiki                   >=0.9      && <0.10
+    , keiro
+    , keiro-core
+    , kioku-api
+    , kioku-core
+    , kiroku-store            >=0.8      && <0.9
+    , lens                    >=5.2
+    , network
+    , process                 >=1.6
+    , shibuya-core            >=0.9
+    , shibuya-kiroku-adapter  >=0.5
+    , shikumi                 ^>=0.4.0.0
+    , shikumi-coder
+    , shikumi-testing         ^>=0.1.0.0
+    , shikumi-tools           ^>=0.4.0.0
+    , text                    >=2.1
+    , time                    >=1.12
+    , toy-fixer
+    , typed-process           >=0.2
+    , uuid                    >=1.3
+    , vector                  >=0.13
 
 executable real-validate
-  import: warnings, shared
-  main-is: RealValidate.hs
+  import:         warnings, shared
+  main-is:        RealValidate.hs
   hs-source-dirs: app
-  ghc-options:
-    -threaded
-    -rtsopts
-    -with-rtsopts=-N
+  ghc-options:    -threaded -rtsopts -with-rtsopts=-N
   build-depends:
-    base,
-    directory,
-    filepath,
-    shikumi-campaign,
-    text,
+    , base
+    , directory
+    , filepath
+    , shikumi-campaign
+    , text
 
 executable repair-receipt
-  import: warnings, shared
-  main-is: RepairReceipt.hs
+  import:         warnings, shared
+  main-is:        RepairReceipt.hs
   hs-source-dirs: app
-  ghc-options:
-    -threaded
-    -rtsopts
-    -with-rtsopts=-N
+  ghc-options:    -threaded -rtsopts -with-rtsopts=-N
   build-depends:
-    base,
-    directory,
-    filepath,
-    shikumi-campaign,
-    text,
+    , base
+    , directory
+    , filepath
+    , shikumi-campaign
+    , text
 
 executable campaign-demo
-  import: warnings, shared
-  main-is: Main.hs
+  import:         warnings, shared
+  main-is:        Main.hs
   hs-source-dirs: app
-  ghc-options:
-    -threaded
-    -rtsopts
-    -with-rtsopts=-N
+  ghc-options:    -threaded -rtsopts -with-rtsopts=-N
   build-depends:
-    aeson >=2.2,
-    async,
-    baikai,
-    base >=4.21 && <5,
-    bytestring,
-    containers,
-    directory,
-    effectful >=2.6,
-    effectful-core >=2.6,
-    filepath,
-    generic-lens >=2.2,
-    hasql-transaction >=1.1,
-    keiki >=0.9 && <0.10,
-    keiro,
-    keiro-core,
-    kioku-api,
-    kioku-core,
-    kiroku-store >=0.8 && <0.9,
-    lens >=5.2,
-    shikumi-campaign,
-    shikumi ^>=0.4.0.0,
-    shikumi-coder,
-    shikumi-testing ^>=0.1.0.0,
-    shikumi-tools ^>=0.4.0.0,
-    text >=2.1,
-    time >=1.12,
-    toy-fixer,
-    typed-process >=0.2,
-    uuid >=1.3,
-    vector >=0.13,
+    , aeson              >=2.2
+    , async
+    , baikai
+    , base               >=4.21     && <5
+    , bytestring
+    , containers
+    , directory
+    , effectful          >=2.6
+    , effectful-core     >=2.6
+    , filepath
+    , generic-lens       >=2.2
+    , hasql-transaction  >=1.1
+    , keiki              >=0.9      && <0.10
+    , keiro
+    , keiro-core
+    , kioku-api
+    , kioku-core
+    , kiroku-store       >=0.8      && <0.9
+    , lens               >=5.2
+    , shikumi            ^>=0.4.0.0
+    , shikumi-campaign
+    , shikumi-coder
+    , shikumi-testing    ^>=0.1.0.0
+    , shikumi-tools      ^>=0.4.0.0
+    , text               >=2.1
+    , time               >=1.12
+    , toy-fixer
+    , typed-process      >=0.2
+    , uuid               >=1.3
+    , vector             >=0.13
 
 executable ed-ssh-probe
-  import: warnings, shared
-  main-is: EdSshProbe.hs
+  import:         warnings, shared
+  main-is:        EdSshProbe.hs
   hs-source-dirs: app
   build-depends:
-    base,
-    shikumi-campaign,
-    crypton,
-    bytestring,
-    base64,
+    , base
+    , base64
+    , bytestring
+    , crypton
+    , shikumi-campaign

@@ -1,34 +1,37 @@
-cabal-version:   3.4
-name:            toy-fixer
-version:         0.1.0.0
-synopsis:        Toy project: an LM repairs seeded warnings, Haskell owns the ground truth
+cabal-version: 3.4
+name:          toy-fixer
+version:       0.1.0.0
+synopsis:
+  Toy project: an LM repairs seeded warnings, Haskell owns the ground truth
+
 description:
   A toy shikumi project: a seeded corpus of broken sources, a deterministic
   checker as ground truth, a minimal LM contract (diagnostics in, the whole
   repaired file out), a no-regression subset guard surfaced as a typed error,
   and the standard evaluation harness over the corpus. Fully offline.
-license:         BSD-3-Clause
-build-type:      Simple
+
+license:       BSD-3-Clause
+build-type:    Simple
 
 common common-all
   default-language: GHC2024
   ghc-options:      -Wall
   build-depends:
-    , aeson           ^>=2.2
-    , base            >=4.20    && <5
+    , aeson            ^>=2.2
+    , base             >=4.20     && <5
     , Diff
-    , effectful       >=2.5     && <2.7
-    , generic-lens    >=2.2     && <2.4
-    , lens            ^>=5.3
-    , shikumi         ^>=0.4.0.0
-    , shikumi-eval    ^>=0.3.0.0
-    , shikumi-testing ^>=0.1.0.0
-    , text            ^>=2.1
+    , effectful        >=2.5      && <2.7
+    , generic-lens     >=2.2      && <2.4
+    , lens             ^>=5.3
+    , shikumi          ^>=0.4.0.0
+    , shikumi-eval     ^>=0.3.0.0
+    , shikumi-testing  ^>=0.1.0.0
+    , text             ^>=2.1
     , vector
 
 library
-  import:         common-all
-  hs-source-dirs: src
+  import:          common-all
+  hs-source-dirs:  src
   exposed-modules:
     Toy.Fixer.Domain
     Toy.Fixer.Program

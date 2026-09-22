@@ -1,7 +1,6 @@
 {-# LANGUAGE GHC2024 #-}
-{-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE DeriveAnyClass #-}
 {-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE OverloadedStrings #-}
 
 -- | Phase 6 attestation record (docs/ATTESTATION_MAPPING_DRAFT.md, step 1).
 --
@@ -42,10 +41,9 @@ where
 
 import Crypto.Hash.SHA256 (hash)
 import Data.Aeson (ToJSON (..), object, (.=))
-import Data.ByteString.Base16 (encodeBase16')
 import Data.Base16.Types (extractBase16)
-import qualified Data.ByteString as B
-import Data.List (foldl')
+import Data.ByteString qualified as B
+import Data.ByteString.Base16 (encodeBase16')
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding (decodeUtf8, encodeUtf8)
@@ -59,11 +57,16 @@ import GHC.Generics (Generic)
 -- namespace), so the ref names the session it will describe; the act range
 -- is the verdict session's fix turns.
 data JournalRef = JournalRef
-  { jrMemorySpace :: !Text -- ^ the campaign memory space id ("shikumi-campaign")
-  , jrNamespace :: !Text -- ^ the sanitized project namespace
-  , jrSession :: !Text -- ^ the fix-session name ("review <branch>")
-  , jrFromAct :: !Int -- ^ first fix turn of the verdict session (1)
-  , jrToAct :: !Int -- ^ last fix turn of the verdict session (2)
+  { -- | the campaign memory space id ("shikumi-campaign")
+    jrMemorySpace :: !Text,
+    -- | the sanitized project namespace
+    jrNamespace :: !Text,
+    -- | the fix-session name ("review <branch>")
+    jrSession :: !Text,
+    -- | first fix turn of the verdict session (1)
+    jrFromAct :: !Int,
+    -- | last fix turn of the verdict session (2)
+    jrToAct :: !Int
   }
   deriving stock (Eq, Show, Generic)
 
@@ -87,11 +90,11 @@ journalRefText j =
 -- Field order is identity order; 'attFiles' is sorted so the file set is
 -- comparison-stable.
 data Attestation = Attestation
-  { attProject :: !Text
-  , attBranch :: !Text
-  , attOracleId :: !Text
-  , attFiles :: ![Text]
-  , attJournal :: !JournalRef
+  { attProject :: !Text,
+    attBranch :: !Text,
+    attOracleId :: !Text,
+    attFiles :: ![Text],
+    attJournal :: !JournalRef
   }
   deriving stock (Eq, Show, Generic)
 
@@ -102,11 +105,11 @@ data Attestation = Attestation
 attestationCanonical :: Attestation -> Text
 attestationCanonical a =
   T.unlines
-    [ "project=" <> attProject a
-    , "branch=" <> attBranch a
-    , "oracle=" <> attOracleId a
-    , "files=" <> T.intercalate "," (attFiles a)
-    , "journal=" <> journalRefText (attJournal a)
+    [ "project=" <> attProject a,
+      "branch=" <> attBranch a,
+      "oracle=" <> attOracleId a,
+      "files=" <> T.intercalate "," (attFiles a),
+      "journal=" <> journalRefText (attJournal a)
     ]
 
 didKeyFromRaw :: B.ByteString -> Text
@@ -127,8 +130,12 @@ b58encode bs =
       fromInt n
         | n <= 0 = B.empty
         | otherwise = B.cons (fromIntegral (n `mod` 256)) (fromInt (n `div` 256))
-   in take leadZeros (replicate leadZeros (b58chars !! 0)) <> go (B.dropWhile (== 0) bs)
+      b58first = case b58chars of
+        c : _ -> c
+        [] -> '1'
+   in take leadZeros (replicate leadZeros b58first) <> go (B.dropWhile (== 0) bs)
 
+b58chars :: String
 b58chars = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
 -- | SHA-256 of the canonical form, hex-encoded, prefixed `sha256:` — the
@@ -144,9 +151,11 @@ attestationHash a =
 -- signer (the campaign's `did:key`) will be a second line under the same
 -- token (step 3 — DID signing); heartwood keeps multiple values per token.
 data VerificationTrailer = VerificationTrailer
-  { vtHash :: !Text -- ^ 'attestationHash'
-  , vtJournal :: !JournalRef
-  , vtSigner :: !(Maybe Text) -- ^ the campaign's did:key (None until step 3)
+  { -- | 'attestationHash'
+    vtHash :: !Text,
+    vtJournal :: !JournalRef,
+    -- | the campaign's did:key (None until step 3)
+    vtSigner :: !(Maybe Text)
   }
   deriving stock (Eq, Show, Generic)
 
@@ -168,20 +177,20 @@ appendVerificationTrailer msg vt =
 instance ToJSON Attestation where
   toJSON a =
     object
-      [ "project" .= attProject a
-      , "branch" .= attBranch a
-      , "oracle" .= attOracleId a
-      , "files" .= attFiles a
-      , "journal" .= journalRefText (attJournal a)
-      , "hash" .= attestationHash a
+      [ "project" .= attProject a,
+        "branch" .= attBranch a,
+        "oracle" .= attOracleId a,
+        "files" .= attFiles a,
+        "journal" .= journalRefText (attJournal a),
+        "hash" .= attestationHash a
       ]
 
 instance ToJSON JournalRef where
   toJSON j =
     object
-      [ "memorySpace" .= jrMemorySpace j
-      , "namespace" .= jrNamespace j
-      , "session" .= jrSession j
-      , "fromAct" .= jrFromAct j
-      , "toAct" .= jrToAct j
+      [ "memorySpace" .= jrMemorySpace j,
+        "namespace" .= jrNamespace j,
+        "session" .= jrSession j,
+        "fromAct" .= jrFromAct j,
+        "toAct" .= jrToAct j
       ]

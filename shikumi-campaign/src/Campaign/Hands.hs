@@ -46,18 +46,17 @@ module Campaign.Hands
   )
 where
 
+import Campaign.Oracle (CellOracle (..))
+import Control.Monad (unless)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Lazy qualified as TL
 import Data.Text.Lazy.Encoding qualified as TLE
 import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesFileExist)
-import System.FilePath (takeDirectory, (</>))
 import System.Exit (ExitCode (..))
+import System.FilePath (takeDirectory, (</>))
 import System.Process.Typed (proc, readProcess, runProcess_)
-
 import Toy.Fixer.Domain (Diagnostic (..), Source (..), SourcePath)
-
-import Campaign.Oracle (CellOracle (..))
 
 -- | One landed repair, as the workflow returns it: everything the scoreboard
 -- (and a human reviewing the branch) wants to know.
@@ -109,7 +108,11 @@ gitCapture dir args = do
     then pure (T.strip (TL.toStrict (TLE.decodeUtf8 out)))
     else
       ioError . userError $
-        "git " <> unwords args <> " failed in " <> dir <> ": "
+        "git "
+          <> unwords args
+          <> " failed in "
+          <> dir
+          <> ": "
           <> T.unpack (TL.toStrict (TLE.decodeUtf8 err))
 
 -- | Idempotently ensure the project's worktree for one campaign branch
@@ -127,7 +130,7 @@ ensureCampaignWorktree proj branch = do
   -- it only removes registrations whose directories are gone.
   git_ parent ["worktree", "prune"]
   exists <- worktreeExists wt
-  unless' exists $ do
+  unless exists $ do
     branchExists <- do
       (ec, _, _) <- readProcess (proc "git" ["-C", parent, "rev-parse", "--verify", "--quiet", T.unpack branch])
       pure (ec == ExitSuccess)
@@ -135,8 +138,6 @@ ensureCampaignWorktree proj branch = do
       then git_ parent ["worktree", "add", wt, T.unpack branch]
       else git_ parent ["worktree", "add", wt, "-b", T.unpack branch]
   pure wt
-  where
-    unless' b act = if b then pure () else act
 
 -- | Write the repaired bytes over the cell's file inside the worktree.
 -- The repair is the /complete file/, so converging is simple: reset the file
