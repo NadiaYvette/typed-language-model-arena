@@ -2,7 +2,9 @@
 
 > **Merges**: [`docs/CODE_HANDLING.md`](CODE_HANDLING.md) (Shinzui/Nadeem code-graph retrieval architecture, Nadia's 5 repos, Hermes replication with verification) and [`docs/ECOSYSTEM_INTEGRATION_PLAN.md`](ECOSYSTEM_INTEGRATION_PLAN.md) (Nadeem Bitar Haskell ecosystem → Hermes roles, autonomous loop, tiered roadmap).
 >
-> **Thesis**: Shikumi decides over code the CodeGraph has already indexed; nothing is re-read as raw text. Code retrieval and agent orchestration are one stack, not two.
+> **Nativeisation**: storage, façade, and required-language ingestion are further specified by [`docs/CODE_INGESTION_NATIVISATION.md`](CODE_INGESTION_NATIVISATION.md) (repo assessments, backend neutrality, reimplementation verdicts, strategy B).
+>
+> **Thesis**: Shikumi decides over code the code-intelligence substrate has already indexed; nothing is re-read as raw text. Code retrieval and agent orchestration are one stack, not two — owned natively at the Haskell/effectful/servant boundary, not delegated wholesale to a Node sidecar.
 
 ---
 
@@ -14,10 +16,12 @@ Two complementary halves:
 
 | Half | Source | Answers |
 | :--- | :--- | :--- |
-| **Code Intelligence** | `CODE_HANDLING.md` | *How does the agent see the code?* — Offline knowledge graph (`CodeGraph` + `universal-ctags` + SQLite WAL + MCP), multi-repo symbol/predicate/citation indexing, sub-millisecond lookup. |
+| **Code Intelligence** | `CODE_HANDLING.md` + `CODE_INGESTION_NATIVISATION.md` | *How does the agent see the code?* — Offline knowledge graph over a backend-neutral `CodeGraphStore` effect (SQLite testbeds / Postgres campaign), mixed ingestion (ctags JSONL, tree-sitter queries, custom scanners for the **required language set**: Haskell, Mercury, Julia, Lean, Coq, Sail, **and more**), thin MCP/servant façade, sub-millisecond lookup. |
 | **Decision Orchestration** | `ECOSYSTEM_INTEGRATION_PLAN.md` | *How does it decide and act?* — Shikumi plans, Keiro journals, Kioku remembers, Seihou scaffolds, PGMQ/Shibuya transport, Mori validates, Shomei signs, Kiroku audits. |
 
 Integrated, they form a single closed loop: **observe → retrieve code context + episodic lessons → decide → act → persist → validate**, with every structured exchange schema-enforced and every decision journaled.
+
+**Nativeisation stance** (from `CODE_INGESTION_NATIVISATION.md`): codegraph's stock 41-language matrix is web/apps-weighted and **omits the arena's verification-target languages**; strategy **B** applies now — own the store effect, façade, and required-language scanners in Haskell; consume codegraph as a sidecar only where its coverage helps; do not port its long-tail extractor matrix or reimplement tree-sitter/ctags parsers.
 
 ---
 
@@ -31,15 +35,20 @@ Integrated, they form a single closed loop: **observe → retrieve code context 
 | **Keiro** | Durable Orchestration | Workflow Runner: Ensures persistence, resumability, and state-machine integrity. |
 | **Kioku** | Memory Backend | Episodic/Semantic Memory: Provides the context store for lessons, history, and known-fails. |
 
-### 2.2 Code Intelligence Substrate
+### 2.2 Code Intelligence Substrate (nativeised)
+
+Owned at the Haskell boundary per `CODE_INGESTION_NATIVISATION.md` §5–6 (strategy B):
 
 | Component | Hermes Role | Technical Definition |
 | :--- | :--- | :--- |
-| **CodeGraph MCP** | Context Retrieval | Zero-token symbol/caller/callee/path-trace lookup (`find_symbol`, `get_callers`, `get_callees`, `trace_path`) feeding precise diagnostics to Shikumi. |
-| **universal-ctags + Tree-sitter** | Multi-Paradigm Ingestion | Symbol extraction across polyglot trees (C, Rust, Haskell, Mercury); AST call-graphs, definitions, type signatures. |
-| **SQLite WAL Knowledge Graph** | Relational Graph Substrate | `repo_graph.sqlite` / `codegraph.db` with `nodes` (id, repo, path, name, type, line_start, line_end), `edges` (source_id, target_id, relation), FTS5 trigram index, WAL concurrency. |
-| **Custom Logic/Citation Scanners** | Exotic Syntax & Provenance | Mercury `:- pred`/`:- func` extraction, academic DOI (`10.xxxx/...`) parsing, markdown concept headers — layers standard tokenizers miss. |
+| **`CodeGraphStore` effect** | Relational Graph Substrate | Backend-neutral effectful effect over `nodes` (id, repo, path, name, type, line_start, line_end) / `edges` (source_id, target_id, relation); carriers: **SQLite** (local, matches `repo_graph.sqlite` testbed contracts) and **Postgres** (campaign-shared, beside keiro/kiroku/pgmq; FTS5 → `tsvector`/`pg_trgm`). |
+| **MCP / servant façade** | Context Retrieval | Thin wire surface (`find_symbol`, `get_callers`, `get_callees`, `trace_path`) over the store; Mori-validated types; feeds precise diagnostics to Shikumi with zero raw-tree token crawl. |
+| **Mixed ingestion pipeline** | Multi-Paradigm Ingestion | (1) **universal-ctags** subprocess → JSONL (haskell, julia, rust, c, python, ocaml, …); (2) **tree-sitter queries** for structure/sigs/callers on core languages; (3) **codegraph sidecar** only where its coverage helps (optional, not load-bearing). |
+| **Custom domain scanners** | Required Languages & Provenance | **Required, open-ended set**: Mercury `:- pred`/`:- func`, **Haskell, Julia, Lean, Coq, Sail** symbol/structure scanners (and more as targets are added); academic DOI (`10.xxxx/...`) parsing; markdown concept headers. |
+| **Keiro reindex workflow** | Incremental Sync | mtime+hash reindex orchestrated as a durable workflow — no bespoke file watcher. |
 | **graph_explorer** | Topology Visualizer | `vis-network` interactive canvas over the same node/edge store; filters citations, predicates, concepts, functions. |
+
+**Not owned** (consume, don't port): tree-sitter runtime/grammars, ctags' 119 parsers, codegraph's long-tail language matrix and framework synthesizers, FTS engines, visualizer stack — see `CODE_INGESTION_NATIVISATION.md` §5.4.
 
 ### 2.3 Infrastructure & Auxiliary Components
 
@@ -56,9 +65,9 @@ Integrated, they form a single closed loop: **observe → retrieve code context 
 
 ---
 
-## 3. Shinzui's 4-Tier Code Retrieval Architecture
+## 3. Shinzui's 4-Tier Code Retrieval Architecture (reference)
 
-The code-intelligence half is grounded on Nadeem Bitar (Shinzui)'s insight:
+The code-intelligence half is grounded on Nadeem Bitar (Shinzui)'s insight. The diagram below is the **source architecture from the Hermes replication** (`CODE_HANDLING.md`); the arena **nativeises** Tiers 1–3 as specified in §2.2 and `CODE_INGESTION_NATIVISATION.md` (CodeGraphStore effect, mixed ingestion, required-language scanners) while leaving the conceptual tiering intact:
 
 > *"Codebases are deterministic relational graphs, not unstructured streams of text. An LLM should never be used to do what an indexed relational database does in 0.5 milliseconds."*
 
@@ -72,14 +81,14 @@ The code-intelligence half is grounded on Nadeem Bitar (Shinzui)'s insight:
 │   • Custom Logic/DOI Scanners (Mercury :- pred, academic DOIs)                │
 │                                    │                                           │
 │                                    ▼                                           │
-│ [ Tier 2: Relational Graph Substrate (SQLite WAL) ]                           │
-│   • Database: repo_graph.sqlite (nodes, edges, citations, predicates)         │
-│   • Indexes: FTS5 trigram full-text, B-tree path/symbol lookups               │
-│   • Concurrency: Multi-threaded read pool for sub-ms queries                  │
+│ [ Tier 2: Relational Graph Substrate (CodeGraphStore) ]                       │
+│   • Native: CodeGraphStore effect → SQLite | Postgres (nodes, edges, …)       │
+│   • (Hermes reference: repo_graph.sqlite WAL + FTS5 trigram index)            │
+│   • Concurrency: SQLite read pool | Postgres pool for sub-ms queries          │
 │                                    │                                           │
 │                                    ▼                                           │
-│ [ Tier 3: Zero-Token Model Interface (MCP Server) ]                           │
-│   • CodeGraph MCP Server over Stdio JSON-RPC / UNIX daemon.sock               │
+│ [ Tier 3: Zero-Token Model Interface (MCP / servant façade) ]                 │
+│   • Thin façade over CodeGraphStore (stdio MCP and/or servant endpoints)      │
 │   • Tools: find_symbol, get_callers, get_callees, trace_path                  │
 │   • Zero LLM tokens during discovery; results injected on-demand              │
 │                                    │                                           │
@@ -92,9 +101,9 @@ The code-intelligence half is grounded on Nadeem Bitar (Shinzui)'s insight:
 
 **Ingestion layers** (all normalized into the same `nodes`/`edges` schema):
 
-1. **Layer 1 — Code AST**: Functions, structs, classes, call graphs.
-2. **Layer 2 — Exotic Logic**: Mercury predicates (`pred`, `func`) — e.g. `mowgli`'s `all_in`, `check`, `bounded_loop`.
-3. **Layer 3 — Academic Citations**: DOIs (`10.xxxx/...`) linking papers to implementing modules.
+1. **Layer 1 — Code AST**: Functions, structs, classes, call graphs — via ctags JSONL + tree-sitter queries on the required language set (Haskell, Mercury, Julia, Lean, Coq, Sail, **and more**); codegraph sidecar only where it covers a language.
+2. **Layer 2 — Exotic Logic**: Mercury predicates (`pred`, `func`) — e.g. `mowgli`'s `all_in`, `check`, `bounded_loop` (custom scanner; no off-the-shelf parser exists).
+3. **Layer 3 — Academic Citations**: DOIs (`10.xxxx/...`) linking papers to implementing modules (custom, pure Haskell).
 4. **Layer 4 — Markdown Concepts**: Architectural specification headers (`#`, `##`).
 
 ---
@@ -123,7 +132,7 @@ Full commands and paths: [`CODE_HANDLING.md` §4](CODE_HANDLING.md).
 
 ## 5. Autonomous Integration Flow (Merged Loop)
 
-The agent loop inserts **CodeGraph as a parallel context-retrieval tier** alongside Kioku, so Shikumi's repair blueprints are grounded in both historical lessons *and* exact structural code context — before any action is journaled or validated.
+The agent loop inserts the **code-intelligence substrate (`CodeGraphStore` + façade) as a parallel context-retrieval tier** alongside Kioku, so Shikumi's repair blueprints are grounded in both historical lessons *and* exact structural code context — before any action is journaled or validated.
 
 ```
 1. Observability (Trigger)
@@ -132,12 +141,13 @@ The agent loop inserts **CodeGraph as a parallel context-retrieval tier** alongs
 2a. Context Retrieval — Kioku
    Query episodic/semantic memory for historical precedents, known-fails, lessons.
 
-2b. Code Context Retrieval — CodeGraph MCP          ← NEW (from CODE_HANDLING)
+2b. Code Context Retrieval — CodeGraphStore + façade   ← NEW (from CODE_HANDLING)
    find_symbol / get_callers / get_callees / trace_path
+   (servant/MCP over CodeGraphStore; SQLite | Postgres)
    → exact file, line range, callers — zero token crawl of raw source trees.
 
 3. Decision — Shikumi (scaffolded by Seihou)
-   Invoke Shikumi Decision Tool with diagnostics + Kioku lessons + CodeGraph context
+   Invoke Shikumi Decision Tool with diagnostics + Kioku lessons + code-graph context
    → typed "Repair Blueprint".
 
 4. Action — Keiro / PGMQ / Shibuya-PGMQ
@@ -158,11 +168,11 @@ The agent loop inserts **CodeGraph as a parallel context-retrieval tier** alongs
 
 ### Why both retrieval tiers?
 
-| | Kioku (Episodic) | CodeGraph (Structural) |
+| | Kioku (Episodic) | CodeGraphStore (Structural) |
 | :--- | :--- | :--- |
 | **Answers** | *What happened last time?* | *Where is the code and how is it wired?* |
-| **Store** | L0 logs → L1 episodes → L2 lessons → L3 priors | SQLite nodes/edges, FTS5, line ranges |
-| **Cost** | Distilled memory lookup | <150 tokens per MCP query |
+| **Store** | L0 logs → L1 episodes → L2 lessons → L3 priors | SQLite \| Postgres `nodes`/`edges`, FTS, line ranges |
+| **Cost** | Distilled memory lookup | <150 tokens per façade query |
 | **Feeds** | Shikumi priors, known-fails | Shikumi diagnostics, exact edit sites |
 
 ---
@@ -171,14 +181,16 @@ The agent loop inserts **CodeGraph as a parallel context-retrieval tier** alongs
 
 ### Tier 1 — Foundations
 - Integrate **Seihou** (Dhall-typed scaffolding).
-- **Deploy CodeGraph MCP as a first-class context tool** alongside Seihou — decisions require code context before orchestration.
-- Index the 5 verification repos (+ arena workspace targets) into `repo_graph.sqlite`.
+- **Implement the `CodeGraphStore` effect** (SQLite + Postgres carriers) as a first-class context substrate alongside Seihou — decisions require code context before orchestration (`CODE_INGESTION_NATIVISATION.md` strategy B).
+- **Stand up mixed ingestion**: ctags JSONL subprocess + tree-sitter queries for core languages + **custom scanners for the required language set (Haskell, Mercury, Julia, Lean, Coq, Sail, and more)** + DOI/markdown layers; codegraph as optional sidecar only where coverage helps.
+- **Expose the MCP/servant façade** (`find_symbol`, `callers`, `callees`, `trace_path`) over the store; Mori-validate wire types.
+- Index the 5 verification repos (+ arena workspace targets) via the façade into the store (SQLite gate queries / Postgres campaign view).
 - Implement **Orchestrator-Worker Transport Bridge** (Shibuya-PGMQ Adapter).
 - Implement **Asynchronous Worker Event Loop** (consuming PGMQ, evaluating via Shikumi-Eval).
 
-**Tier 1 acceptance gates** (from `CODE_HANDLING.md` §5 verification contracts):
+**Tier 1 acceptance gates** (from `CODE_HANDLING.md` §5 verification contracts; run against the SQLite carrier):
 
-| # | Contract | Gate Query (against `repo_graph.sqlite`) |
+| # | Contract | Gate Query (against SQLite `repo_graph.sqlite` or store-equivalent) |
 | :--- | :--- | :--- |
 | 1 | Formal logic (`mowgli` preds) vs. microkernel concurrency (`telix` sched) | `nodes WHERE repo='mowgli' AND type='pred' AND name IN ('all_in','check')` ≥ 2 |
 | 2 | Linear regex invariants (`smirk`) vs. compiler AST (`frankenstein`) | `nodes WHERE repo='smirk' AND name='compileRegex'` = 1 |
@@ -187,11 +199,15 @@ The agent loop inserts **CodeGraph as a parallel context-retrieval tier** alongs
 
 ### Tier 2 — Governance / Security
 - Integrate **Shomei** (security/identity, passkey/signing).
-- Integrate **Mori-Schema** (validation) — extend schemas to cover CodeGraph tool I/O (symbol nodes, edge responses, predicate/citation types) so retrieval results are typed end-to-end.
+- Integrate **Mori-Schema** (validation) — extend schemas to cover façade tool I/O (symbol nodes, edge responses, predicate/citation types) so retrieval results are typed end-to-end.
 
 ### Tier 3 — Audit / Provenance
 - Integrate **Kiroku** (event sourcing/auditing) — journal graph mutations, repair-blueprint lifecycle, and retrieval queries as append-only events.
-- Optional: wire CodeGraph topology diffs into the human review seam (`Campaign.Review` from `CAMPAIGN_GENERALIZATION.md`).
+- Optional: wire graph topology diffs into the human review seam (`Campaign.Review` from `CAMPAIGN_GENERALIZATION.md`).
+
+### Deferred / out of scope (see `CODE_INGESTION_NATIVISATION.md`)
+- **Native extraction service (strategy C)**: port per-language extractors onto `hs-tree-sitter` — only if/when the Node sidecar must be dropped; AGPL → separate process/service, never a BSD library dep.
+- **Do not reimplement**: tree-sitter grammars, ctags parsers, codegraph's 40-lang extractor matrix / framework synthesizers, search stack, visualizer.
 
 ---
 
@@ -199,27 +215,30 @@ The agent loop inserts **CodeGraph as a parallel context-retrieval tier** alongs
 
 | Metric | Brute-Force File Reading | Shinzui / Hermes Database Retrieval |
 | :--- | :--- | :--- |
-| **Token Cost per Discovery** | 25,000 – 60,000 tokens | **< 150 tokens** (MCP tool query + result) |
-| **Query Latency** | 8 – 25 seconds (read + parse) | **0.5 – 3 milliseconds** (SQLite index) |
+| **Token Cost per Discovery** | 25,000 – 60,000 tokens | **< 150 tokens** (façade tool query + result) |
+| **Query Latency** | 8 – 25 seconds (read + parse) | **0.5 – 3 milliseconds** (SQLite/Postgres index) |
 | **Exotic Syntax Visibility** | Missed by standard LLM tokenizers | **100% captured** via custom type classifiers |
 | **Academic Traceability** | Inferred probabilistically | **Deterministic relational edges** (DOI → Code) |
 | **Hardware Memory Footprint** | Bloats context to 64K+ (high VRAM) | **Zero VRAM overhead** (database in CPU RAM) |
 
-Combined with the decision stack: **Shikumi never plans from raw text** — it plans from Kioku's distilled lessons *and* CodeGraph's exact line ranges, executes through Keiro's durable journals, and passes every exchange through Mori's schemas.
+Combined with the decision stack: **Shikumi never plans from raw text** — it plans from Kioku's distilled lessons *and* the store's exact line ranges, executes through Keiro's durable journals, and passes every exchange through Mori's schemas.
 
 ---
 
 ## 8. Operational Status & Related Documents
 
-**Code substrate (CODE_HANDLING §7):**
-- 1.17 GB code graph indexed at `repos/.codegraph/codegraph.db`.
+**Code substrate — Hermes replication reference (`CODE_HANDLING.md` §7):**
+- 1.17 GB code graph indexed at `repos/.codegraph/codegraph.db` (stock codegraph sidecar).
 - Relational graph synchronized at `~/.hermes/memory/repo_graph.sqlite`.
 - Interactive visualizer live at `graph_explorer.html`.
 - All 4 testbed verification gates pass with exit code 0.
 
+**Code substrate — arena nativeisation (`CODE_INGESTION_NATIVISATION.md`):** design/decision record; `CodeGraphStore` + mixed ingestion + façade are Tier 1 work items (not yet implemented). Target: ~3–6 weeks to parity with the four testbed contracts while covering the required language set stock codegraph misses.
+
 **Decision stack roadmap:** see `ECOSYSTEM_INTEGRATION_PLAN.md` §4 (original tiers) and this document §6 (merged tiers).
 
 **Related living documents:**
+- [`CODE_INGESTION_NATIVISATION.md`](CODE_INGESTION_NATIVISATION.md) — repo assessments, backend neutrality, integration strategies A/B/C, reimplementation verdicts, narrow arena-native indexer.
 - [`WORKQUEUE.md`](WORKQUEUE.md) — scheduler ground truth, portfolio roadmap, failure baselines, commit ledger.
 - [`CAMPAIGN_GENERALIZATION.md`](CAMPAIGN_GENERALIZATION.md) — declarative target manifests, distributed workers, sovereign forge integration.
 - [`ATTESTATION_MAPPING_DRAFT.md`](ATTESTATION_MAPPING_DRAFT.md) — attestation record, receipts-as-gate-input, DID-key signing.
