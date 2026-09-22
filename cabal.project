@@ -84,8 +84,12 @@ benchmarks: False
 -- these binaries; individual demos can still be rebuilt with -O if needed.
 optimization: False
 
--- …except shikumi's own suite, so its regression tests run from here too.
+-- …except shikumi's own suite, so its regression tests run from here too,
+-- and shikumi-campaign's L1 tests-of-the-gates (oracle/receipt/attestation).
 package shikumi
+  tests: True
+
+package shikumi-campaign
   tests: True
 
 -- ---------------------------------------------------------------------------

@@ -40,15 +40,18 @@ library
     Campaign.Attestation
     Campaign.Bootstrap
     Campaign.Cell
+    Campaign.CodeGraph
     Campaign.Dispatch
     Campaign.Dispatch.Pgmq
     Campaign.Fanout
     Campaign.Hands
     Campaign.Landing
+    Campaign.LogSchema
     Campaign.Matrix
     Campaign.Memory
     Campaign.Mercury
     Campaign.Oracle
+    Campaign.ProofHygiene
     Campaign.ReactFixer
     Campaign.Real
     Campaign.RepairReceipt
@@ -169,3 +172,71 @@ executable ed-ssh-probe
     , bytestring
     , crypton
     , shikumi-campaign
+
+test-suite oracle-tests
+  import:         warnings, shared
+  type:           exitcode-stdio-1.0
+  main-is:        Main.hs
+  hs-source-dirs: test/oracle
+  ghc-options:    -threaded -with-rtsopts=-N
+  build-depends:
+    , base
+    , shikumi-campaign
+    , tasty
+    , tasty-hunit
+    , text
+
+test-suite receipt-tests
+  import:         warnings, shared
+  type:           exitcode-stdio-1.0
+  main-is:        Main.hs
+  hs-source-dirs: test/receipt
+  ghc-options:    -threaded -with-rtsopts=-N
+  build-depends:
+    , base
+    , shikumi-campaign
+    , tasty
+    , tasty-hunit
+    , text
+
+test-suite attestation-tests
+  import:         warnings, shared
+  type:           exitcode-stdio-1.0
+  main-is:        Main.hs
+  hs-source-dirs: test/attestation
+  ghc-options:    -threaded -with-rtsopts=-N
+  build-depends:
+    , base
+    , bytestring
+    , shikumi-campaign
+    , tasty
+    , tasty-hunit
+    , text
+
+test-suite interpreter-tests
+  import:         warnings, shared
+  type:           exitcode-stdio-1.0
+  main-is:        Main.hs
+  hs-source-dirs: test/interpreters
+  ghc-options:    -threaded -with-rtsopts=-N
+  build-depends:
+    , base
+    , shikumi-campaign
+    , tasty
+    , tasty-hunit
+    , text
+
+test-suite codegraph-tests
+  import:         warnings, shared
+  type:           exitcode-stdio-1.0
+  main-is:        Main.hs
+  hs-source-dirs: test/codegraph
+  ghc-options:    -threaded -with-rtsopts=-N
+  build-depends:
+    , base
+    , containers
+    , shikumi-campaign
+    , tasty
+    , tasty-hunit
+    , tasty-quickcheck
+    , text

@@ -1,0 +1,6 @@
+<?xml version="1.0"?>
+<testsuite name="cbmc" tests="3" failures="1" errors="0" skipped="0">
+  <testcase name="ok_case"/>
+  <testcase name="bad_case" message="assertion failed"/>
+  <testcase name="other"/>
+</testsuite>

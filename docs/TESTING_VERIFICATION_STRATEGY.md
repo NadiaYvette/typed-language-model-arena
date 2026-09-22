@@ -209,13 +209,13 @@ Maps to plan §2.4 last row + HARNESS_CLONE_QUEUE §3/§6.8–6.9.
 
 ## 5. Concrete Near-Term Checklist (next implementation slice)
 
-1. [ ] `make test` target → `cabal test all` (even if suites are empty, establishes the hook).
-2. [ ] `scripts/verify-l2.sh`: discovery count, CLASSIFY triple, `repair-receipt`, attestation hash recompute — exit non-zero on any regression.
-3. [ ] `oracle-tests` suite covering `classifyCellLogBaseline` + `verdictFromBaseline` with the m68k archived log fixture (same cases as Milestone 2).
-4. [ ] `receipt-tests` + `attestation-tests` reusing `shikumi-campaign/repairs/*` fixtures (ADMISSIBLE + three tamper reasons).
-5. [ ] Draft `proofHygiene` / `logSchema` interpreter modules **with** golden logs from `tessera/host@proof` and a TAP snippet — even before full 4a manifests, so Tier 4a is test-first.
-6. [ ] Skeleton `CodeGraphStore` property laws (id stability, edge referential integrity, reindex idempotence) as hedgehog generators over a tiny fixture graph — runs before full ingestion lands.
-7. [ ] Record L4 contract SQL as `docs/fixtures/codegraph-contracts.sql` so Tier 1 acceptance is copy-paste runnable against SQLite and Postgres.
+1. [x] `make test` target → `cabal test all` (five suites landed under shikumi-campaign).
+2. [x] `scripts/verify-l2.sh`: discovery count, CLASSIFY triple, `repair-receipt`, L1 suites — exit non-zero on any regression (`make l2`).
+3. [x] `oracle-tests` suite covering `classifyCellLogBaseline` + `verdictFromBaseline` + `hostVerdictFromProj` with golden m68k/alpha/skip fixtures.
+4. [x] `receipt-tests` + `attestation-tests` reusing `repairs/*` fixtures (ADMISSIBLE + three tamper reasons; trailer/hash surface).
+5. [x] `proofHygiene` / `logSchema` interpreters (`Campaign.ProofHygiene`, `Campaign.LogSchema`) with golden logs — `interpreter-tests` covers clean/dirty, TAP/JSON/JUnit, unknown-fact-id negatives.
+6. [x] Skeleton `CodeGraphStore` laws (`Campaign.CodeGraph`) — id stability, edge referential integrity, reindex idempotence, façade empty-on-unknown (`codegraph-tests`).
+7. [x] L4 contract SQL recorded as `docs/fixtures/codegraph-contracts.sql` (four Tier-1 contracts + required-language filters).
 
 ---
 

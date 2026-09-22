@@ -1,0 +1,7 @@
+Lean 4 theorem — hygiene scan golden (Tier 4a proofHygiene).
+theorem dirty : False := by
+  sorry
+-- internal: generates sorryAx
+axiom extra : Nat → Nat
+def bar : Nat := by
+  admit

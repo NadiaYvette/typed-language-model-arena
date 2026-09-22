@@ -1,0 +1,4 @@
+Lean 4 theorem — hygiene scan golden (Tier 4a proofHygiene).
+This body is hygienic: closed proof, no admissions.
+
+theorem honest : True := trivial

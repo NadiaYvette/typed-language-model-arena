@@ -1,0 +1,4 @@
+-- Same cell, only documented known-fails named by the baseline.
+=== matrix cell: ARCH=m68k CONFIG=6 LINUX_DIR=/home/nyc/src/linux ===
+  LTP subtotals: 69 passed, 2 failed, 30 skipped
+  LTP FAIL LIST: fork04 mincore04
