@@ -31,6 +31,7 @@ module Campaign.Attestation
     journalRefText,
     attestationCanonical,
     attestationHash,
+    didKeyFromRaw,
 
     -- * Trailer emission (Q1)
     VerificationTrailer (..),
@@ -41,7 +42,10 @@ where
 
 import Crypto.Hash.SHA256 (hash)
 import Data.Aeson (ToJSON (..), object, (.=))
-import Data.ByteString.Base16 (encode)
+import Data.ByteString.Base16 (encodeBase16')
+import Data.Base16.Types (extractBase16)
+import qualified Data.ByteString as B
+import Data.List (foldl')
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding (decodeUtf8, encodeUtf8)
@@ -105,15 +109,37 @@ attestationCanonical a =
     , "journal=" <> journalRefText (attJournal a)
     ]
 
+didKeyFromRaw :: B.ByteString -> Text
+didKeyFromRaw raw32 = "did:key:z" <> T.pack (b58encode (B.singleton 0xED <> B.singleton 0x01 <> raw32))
+
+b58encode :: B.ByteString -> String
+b58encode bs =
+  let leadZeros = length (takeWhile (== 0) (B.unpack bs))
+      go b
+        | B.null b = ""
+        | otherwise =
+            let iv = toInt b
+                (q, r) = iv `divMod` 58
+             in go (fromInt q) ++ [b58chars !! fromIntegral r]
+      toInt :: B.ByteString -> Integer
+      toInt = foldl' (\acc x -> acc * 256 + fromIntegral x) 0 . B.unpack
+      fromInt :: Integer -> B.ByteString
+      fromInt n
+        | n <= 0 = B.empty
+        | otherwise = B.cons (fromIntegral (n `mod` 256)) (fromInt (n `div` 256))
+   in take leadZeros (replicate leadZeros (b58chars !! 0)) <> go (B.dropWhile (== 0) bs)
+
+b58chars = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
 -- | SHA-256 of the canonical form, hex-encoded, prefixed `sha256:` — the
 -- value the `Verification:` trailer carries.
 attestationHash :: Attestation -> Text
 attestationHash a =
-  "sha256:" <> decodeUtf8 (encode (hash (encodeUtf8 (attestationCanonical a))))
+  "sha256:" <> decodeUtf8 (extractBase16 . encodeBase16' . hash . encodeUtf8 $ attestationCanonical a)
 
 -- | The trailer block appended to the merge commit message (Q1). Token
 -- charset (heartwood `Token::try_from`): alphanumerics + `-` only, so
--- `Verification` is a legal token; the value splits on the FIRST `": "`,
+-- `Verification` is a legal token; the value splits on the FIRST `": "`
 -- which is why the hash keeps its `sha256:` prefix inside the value. The
 -- signer (the campaign's `did:key`) will be a second line under the same
 -- token (step 3 — DID signing); heartwood keeps multiple values per token.

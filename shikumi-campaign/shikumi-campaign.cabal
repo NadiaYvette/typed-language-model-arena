@@ -1,4 +1,4 @@
-cabal-version:   3.0
+cabal-version: 3.8
 name:            shikumi-campaign
 version:         0.1.0.0
 synopsis:        One-cell verification campaign: shikumi decisions on keiro's durable runtime
@@ -50,15 +50,20 @@ library
     Campaign.RepairReceipt
     Campaign.Review
     Campaign.Real
+    Campaign.SshAgent
+    Campaign.Dispatch.Pgmq
     Campaign.Workflow
   hs-source-dirs: src
   build-depends:
     aeson >=2.2,
     base >=4.21 && <5,
     baikai,
-    base16-bytestring,
+    base16,
+    base64,
+    binary,
     bytestring,
     containers,
+    crypton,
     cryptohash-sha256,
     directory,
     dhall,
@@ -75,6 +80,7 @@ library
     kioku-core,
     kiroku-store >=0.8 && <0.9,
     lens >=5.2,
+    network,
     process >=1.6,
     shibuya-core >=0.9,
     shibuya-kiroku-adapter >=0.5,
@@ -158,3 +164,14 @@ executable campaign-demo
     typed-process >=0.2,
     uuid >=1.3,
     vector >=0.13,
+
+executable ed-ssh-probe
+  import: warnings, shared
+  main-is: EdSshProbe.hs
+  hs-source-dirs: app
+  build-depends:
+    base,
+    shikumi-campaign,
+    crypton,
+    bytestring,
+    base64,

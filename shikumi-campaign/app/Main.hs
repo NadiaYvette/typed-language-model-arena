@@ -63,7 +63,7 @@ import Data.Aeson.KeyMap qualified as KeyMap
 import Data.ByteString.Lazy qualified as BL
 import Data.Foldable (for_, traverse_)
 import Data.IORef (atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
-import Data.Maybe (catMaybes, isJust, maybeToList)
+import Data.Maybe (catMaybes, isJust)
 import Data.Either (isRight)
 import Data.Set qualified as SSet
 import Data.Text (Text)
@@ -74,13 +74,11 @@ import Data.Time.Clock.POSIX (utcTimeToPOSIXSeconds)
 import Data.Vector qualified as Vector
 import Control.Concurrent.Async (mapConcurrently)
 import Effectful (Eff, IOE, UnliftStrategy (..), liftIO, raise, runEff, withEffToIO)
-import Effectful.Concurrent (runConcurrent)
 import Effectful.Error.Static (Error, runErrorNoCallStack)
 import Keiro.Codec (decodeRecorded)
 import Keiro.Connection (keiroConnectionSettings)
 import Keiro.Workflow
-  ( CancelWorkflowOutcome (..),
-    WorkflowId (..),
+  ( WorkflowId (..),
     WorkflowJournalEvent (..),
     WorkflowName (..),
     WorkflowOutcome (..),
@@ -112,9 +110,8 @@ import Kiroku.Store.Types
     StreamName (..),
     StreamVersion (..),
   )
-import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesFileExist, listDirectory, removeFile)
+import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesFileExist, removeFile)
 import System.Environment (lookupEnv)
-import Data.Function ((&))
 import Data.Maybe (fromMaybe, listToMaybe)
 import Text.Read (readMaybe)
 
@@ -127,7 +124,6 @@ import Campaign.Bootstrap
   , defaultCampaignConn
   , parseCampaignConn
   , dropDatabase
-  , ensureOwnedServer
   , ownedServerAlive
   , ownedServerConn
   , ownedServerStateDir
@@ -140,9 +136,7 @@ import Campaign.Bootstrap
   )
 import System.Exit (ExitCode (..), exitFailure, exitSuccess)
 import Control.Exception (try, SomeException)
-import System.FilePath ((</>))
 import System.IO (hClose, hPutStrLn, openTempFile, stderr)
-import Data.UUID.V4 (nextRandom)
 
 import Kioku.AI.Config (AIExecutionError (..), AIFeature (..))
 import Kioku.AI.File (loadAIRuntime)
@@ -157,10 +151,10 @@ import Kioku.Distill.Extract
 import Kioku.Distill.L1 (L1Outcome (..), L1RunMode (..), L1Summary (..), distillSessionL1, scopedScanCandidates)
 import Kioku.Id (parseId)
 import Kioku.Distill.L2 (SceneRow (..), regenerateScene)
-import Kioku.Distill.L3 (PersonaRow (..), getPersonaByScope, regeneratePersona)
-import Kioku.Distill.Persona (PersonaInput (..), PersonaOutput (..), personaProgram, personaSignature)
+import Kioku.Distill.L3 (PersonaRow (..), regeneratePersona)
+import Kioku.Distill.Persona (PersonaInput (..), PersonaOutput (..), personaSignature)
 import Kioku.Distill.Runtime (TestRunners (..), newDistillRuntime, withDistillWorkspace, withTestRunners)
-import Kioku.Distill.Scene (SceneInput (..), SceneOutput (..), sceneProgram, sceneSignature)
+import Kioku.Distill.Scene (SceneInput (..), SceneOutput (..), sceneSignature)
 import Kioku.Id (SessionId)
 import Kioku.ReadModel (registerKiokuReadModels)
 import Shikumi.Adapter (ToPrompt)
@@ -171,7 +165,7 @@ import Shikumi.Schema (FromModel, ToSchema, Validatable)
 import Shikumi.Schema.Types (Field (Field, unField), field)
 import Shikumi.Signature (Demo (..), Signature, getInstruction, mkSignature, setDemos, setInstruction)
 import Shikumi.Coder.Pipeline (ProposeIn (..))
-import Shikumi.Coder.Task (PatchPlan (..), applyPlan)
+import Shikumi.Coder.Task (PatchPlan (..))
 
 import Campaign.Aggregate (CellSummary (..), CellVertex (..), cellSummaryOf, replayCellJournal)
 import Campaign.Cell (Cell (..), CellId (..), FixAttempt (..), corpusCells, cellForId, unCellId)
@@ -213,7 +207,6 @@ import Campaign.Matrix
   ( ArchName (..),
     ConfigName (..),
     MatrixAttempt (..),
-    MatrixCell (..),
     TriageIn (..),
     TriageOut (..),
     matrixAttemptsOf,
@@ -228,7 +221,6 @@ import Campaign.Matrix
   )
 import Campaign.Dispatch
   ( DispatchAction (..),
-    DispatchOutcome (..),
     dispatchActionOfPlanLine,
     dispatchRegistry,
     dispatchWorkflowIdTagged,
@@ -241,7 +233,6 @@ import Campaign.Mercury
     MercuryEngine,
     MercuryFact (..),
     mercuryAttemptsOf,
-    mercuryBranchFor,
     mercuryCellFor,
     mercuryCellSpecs,
     mercuryCellWorkflow,
@@ -296,10 +287,10 @@ import Campaign.Review
     listReviewBranches,
     rejectBranch,
   )
-import Campaign.RepairReceipt (RepairReceipt, loadRepairReceipt)
+import Campaign.RepairReceipt (loadRepairReceipt)
 import Campaign.Attestation (journalRefText)
 import Campaign.Real
-import Campaign.ReactFixer (renderSteps, reactEngineFor, scriptedReactEngine)
+import Campaign.ReactFixer (reactEngineFor, scriptedReactEngine)
 import Campaign.Workflow
   ( AttemptEngine,
     EngineFor,
@@ -310,17 +301,15 @@ import Campaign.Workflow
     cellCampaignWorkflow,
     cellCampaignWorkflowName,
     defaultMaxAttempts,
-    guidedFixer,
     projectCampaignWorkflowName,
     projectWorkflowId,
     stubEngine,
   )
 import Shikumi.Testing (markerResponse)
 import Toy.Fixer.Domain (Source (..), sourceText)
-import Toy.Fixer.Program (DiagnosticsIn (..), RepairOut (..))
+import Toy.Fixer.Program (RepairOut (..))
 import GHC.Generics (Generic)
-import Data.Aeson qualified as Aeson
-import Data.Aeson (FromJSON, ToJSON)
+import Data.Aeson ()
 
 main :: IO ()
 main = do
@@ -426,7 +415,7 @@ main = do
             23 -> runRealAct >> pure mSid
             24 -> runEscalationDistillAct >> pure mSid
             25 -> runMercuryReplayAct >> pure mSid
-            n -> fail ("unknown act: " <> show n)
+            n' -> fail ("unknown act: " <> show n')
   foldM_ step Nothing [1 .. 24 :: Int]
 
 -- ---------------------------------------------------------------------------
@@ -912,7 +901,6 @@ journalIsComplete = any isCompletion
 journaledAttempts :: [WorkflowJournalEvent] -> [FixAttempt]
 journaledAttempts = mapMaybe extract
   where
-    mapMaybe f xs = [y | Just y <- f <$> xs]
     extract = \case
       StepRecorded name result _
         | "propose-fix-" `T.isPrefixOf` name ->
@@ -1668,6 +1656,7 @@ fireTimerSweep store registry streamSteps = do
             -- /completed journal/ satisfies the sweep too.
             journalIsComplete . decodedJournal <$> readJournal store s
       pending = filterM (fmap not . satisfied) streamSteps
+      loop :: Int -> IO ()
       loop n
         | n > 20 = fail "timer sweep: steps still unjournaled after 20 passes"
         | otherwise = do
@@ -2246,9 +2235,9 @@ runLandingAct = do
   -- The campaign's work, as a human would review it: one branch per project.
   for_ (nub (map pcProject pcs)) $ \proj -> do
     let wt = campaignWorktreePath proj (campaignBranchFor proj)
-    log <- gitCapture wt ["log", "--oneline", T.unpack (campaignBranchFor proj)]
+    log' <- gitCapture wt ["log", "--oneline", T.unpack (campaignBranchFor proj)]
     putStrLn ("  " <> T.unpack proj <> " branch log:")
-    for_ (T.lines log) (putStrLn . ("    " <>) . T.unpack)
+    for_ (T.lines log') (putStrLn . ("    " <>) . T.unpack)
   putStrLn "[landing] done — the journals decided, the worktrees received, the parents untouched"
 
 -- ---------------------------------------------------------------------------
@@ -2626,6 +2615,9 @@ runInfraMemoryAct = do
 
   putStrLn "[infra-memory] done — the campaign's memory now knows how the campaign runs"
 
+genTag :: IO Text
+genTag = T.pack . show . (floor :: Double -> Int) . realToFrac . utcTimeToPOSIXSeconds <$> getCurrentTime
+
 -- ---------------------------------------------------------------------------
 -- Act 16: the verification matrix — (arch × config) cells whose verification
 -- is a staged boot → stress process, triaged by a typed shikumi verdict that
@@ -2652,7 +2644,7 @@ runInfraMemoryAct = do
 runMatrixAct :: IO ()
 runMatrixAct = do
   putStrLn "\n=== act 16: the verification matrix — boot/stress cells, triage, hardware seam ==="
-  runTag <- T.pack . show . floor . utcTimeToPOSIXSeconds <$> getCurrentTime 
+  runTag <- genTag
   sink <- newIORef []
   let publishHumanQuery :: AwakeableId -> Eff CampaignEffects ()
       publishHumanQuery aid = do
@@ -3142,7 +3134,7 @@ runMercuryAct = do
   -- The campaign works on per-run worktrees off the campaign clone
   -- (/home/nyc/src/mercury-campaign — the clean checkout with the dump
   -- family still private).
-  runTag <- T.pack . show . floor . utcTimeToPOSIXSeconds <$> getCurrentTime
+  runTag <- genTag
   sink <- newIORef []
   let campaignTree = "/home/nyc/src/mercury-campaign"
       publishHumanQuery :: AwakeableId -> Eff CampaignEffects ()
@@ -3163,7 +3155,11 @@ runMercuryAct = do
       -- whitespace and the applier re-indents), constructor swapped. That
       -- is exactly what a good model emits.
       factOldLine :: ProposeIn -> Text
-      factOldLine pin = snd (T.breakOnEnd ": " (head (T.lines (unField (piFact pin)))))
+      factOldLine pin
+        | h : _t <- T.lines . unField $ piFact pin
+        = snd $ T.breakOnEnd ": " h
+        | otherwise
+        = ""
       swapCtor :: Text -> Text
       swapCtor = T.replace "priv_alt_arg_help" "alt_arg_help" . T.replace "priv_arg_help" "arg_help"
       goodPlan :: ProposeIn -> Response
@@ -3382,7 +3378,7 @@ mercuryCampaignClone = "/home/nyc/src/mercury-campaign"
 runMercuryReplay :: IO ()
 runMercuryReplay = do
   putStrLn "\n=== mercury replay: the promotion campaign as a demo ==="
-  replayTag <- T.pack . show . floor . utcTimeToPOSIXSeconds <$> getCurrentTime
+  replayTag <- genTag
 
   -- ---------------------------------------------------------------- (1)
   -- Preflight 1: the tree and its facts. The demo cannot start without
@@ -3589,7 +3585,7 @@ runLiveMercuryAct :: IO ()
 runLiveMercuryAct = do
   putStrLn "\n=== act 19: the Mercury promotion, live — a real model proposes the edits ==="
   withLoadedAIRuntime $ \air -> do
-    runTag0 <- T.pack . show . floor . utcTimeToPOSIXSeconds <$> getCurrentTime
+    runTag0 <- genTag
     let liveTag = "live" <> runTag0
         campaignTree = "/home/nyc/src/mercury-campaign"
     sink <- newIORef []
@@ -4007,7 +4003,7 @@ runHelpCheckAct = do
 runDispatchAct :: IO ()
 runDispatchAct = do
   putStrLn "\n=== act 21: the dispatch loop — the planner decides, the stack runs, the journal records ==="
-  runTag0 <- T.pack . show . floor . utcTimeToPOSIXSeconds <$> getCurrentTime
+  runTag0 <- genTag
   let tag = "d" <> runTag0
   sink <- newIORef []
   let publishHumanQuery :: AwakeableId -> Eff CampaignEffects ()
@@ -4429,7 +4425,7 @@ runAppPhaseAct = do
   mproj <- lookupEnv "CAMPAIGN_APP_PROJECT"
   let proj = T.pack (fromMaybe "mowgli" (listToMaybe . words =<< mproj))
   putStrLn "\n=== act 22: the application phase — unused imports, live, landed ==="
-  runTag0 <- T.pack . show . floor . utcTimeToPOSIXSeconds <$> getCurrentTime
+  runTag0 <- genTag
   let runTag = "app" <> runTag0
       branch = appPhaseBranchFor runTag proj
 
@@ -4561,7 +4557,7 @@ runAppPhaseFixAndLand proj runTag branch cells = do
     -- each attempt a proposed deletion the guard re-checks); a parked one
     -- means the model proposed something the guard kept rejecting, and the
     -- honest move is to report it, not to answer for it.
-    withCampaignStore $ \store -> do
+    withCampaignStore $ \_store -> do
       published <- readIORef sink
       unless (null published) $ putStrLn ("  parked queries (reported, not answered): " <> show (length published))
 
@@ -4750,7 +4746,7 @@ runRealAct = do
               <> T.unpack (T.intercalate ", " (sort (nub (map keyOf group))))
           )
 
-  ts <- T.pack . show . (floor :: Double -> Int) . realToFrac . utcTimeToPOSIXSeconds <$> getCurrentTime
+  ts <- genTag
   let outDir = "/tmp/real-cells-" <> T.unpack ts
       rows = [(u, realWorkflowIdTagged u ts) | u <- units]
       streamOf wid = campaignStreamNameText realWorkflowName wid

@@ -4,11 +4,11 @@
 -- | The human merge seam: operator verdicts over landed campaign branches,
 -- journaled like every other campaign event.
 --
--- The application phase lands repairs on @campaign\/\<run\>@ branches in git
+-- The application phase lands repairs on @campaign/<run>@ branches in git
 -- worktrees, and stops there — on purpose. Merging is a human decision. This
 -- module is the boundary layer for that decision:
 --
---   * 'listReviewBranches' — every @campaign\/*@ branch of a project with
+--   * 'listReviewBranches' — every @campaign/*@ branch of a project with
 --     its ahead-count and merged-ness, so a verdict is never guessed from
 --     memory.
 --   * 'approveBranch' — re-verify every file the branch touched with the
@@ -54,14 +54,14 @@ import GHC.Generics (Generic)
 import Campaign.Hands (campaignWorktreePath, gitCapture, parentRepoPath)
 import Campaign.Oracle (CellOracle (..))
 import Campaign.RepairReceipt (RepairReceipt, admitReceiptsForFiles)
-import Campaign.Attestation
-  ( Attestation (..),
-    JournalRef (..),
-    VerificationTrailer (..),
-    appendVerificationTrailer,
-    attestationHash,
-    journalRefText,
-  )
+import qualified Data.ByteString as B
+import qualified Data.ByteString.Base64 as B64
+import qualified Data.Base64.Types as B64
+import qualified Data.Text as T
+import qualified Data.Text.Encoding as T
+import Campaign.Attestation (Attestation(..), JournalRef(..), VerificationTrailer(..), appendVerificationTrailer, attestationHash, didKeyFromRaw)
+import Campaign.SshAgent (getSshAgentKey, signWithAgent, pubKeyBlobForEd25519)
+import Crypto.PubKey.Ed25519 (SecretKey, sign, PublicKey)
 import Toy.Fixer.Domain (Source (..), showDiagnostic)
 
 -- | One reviewable branch of one project, as 'listReviewBranches' reports it.
@@ -101,7 +101,7 @@ defaultBranchOf proj = do
     Right b | b /= "origin/HEAD" -> pure (T.strip b)
     _ -> T.strip <$> fromHead
 
--- | Every @campaign\/*@ branch of a project, with how far ahead of the
+-- | Every @campaign/*@ branch of a project, with how far ahead of the
 -- default branch it is and whether git already considers it merged.
 listReviewBranches :: Text -> IO [ReviewBranch]
 listReviewBranches proj = do
@@ -231,18 +231,27 @@ approveBranch oracle receipts proj branch = do
                   -- itself).
                   let att =
                         Attestation
-                          { attProject = proj,
-                            attBranch = branch,
-                            attOracleId = oracleId oracle,
-                            attFiles = sort files,
-                            attJournal = journalRefFor proj branch
+                          { attProject = proj
+                          , attBranch = branch
+                          , attOracleId = oracleId oracle
+                          , attFiles = sort files
+                          , attJournal = journalRefFor proj branch
                           }
                       attHash = attestationHash att
+
+                      -- Use SSH Agent to sign attHash
+                  rawKey <- getSshAgentKey
+                  let pubKeyBlob = pubKeyBlobForEd25519 rawKey
+                  sig <- signWithAgent pubKeyBlob (T.encodeUtf8 attHash)
+
+                  let didKey = didKeyFromRaw rawKey
+                      signature = B64.encodeBase64 sig
+
                       attTrailer =
                         VerificationTrailer
-                          { vtHash = attHash,
-                            vtJournal = journalRefFor proj branch,
-                            vtSigner = Nothing -- step 3: DID-key signer
+                          { vtHash = attHash
+                          , vtJournal = journalRefFor proj branch
+                          , vtSigner = Just $ didKey <> ":" <> B64.extractBase64 signature
                           }
                   -- HEAD is the merge target (the parent is on a branch and
                   -- clean — checked above). origin/<def> is a remote-tracking
