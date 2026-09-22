@@ -4,24 +4,29 @@
 >
 > **Nativeisation**: storage, façade, and required-language ingestion are further specified by [`docs/CODE_INGESTION_NATIVISATION.md`](CODE_INGESTION_NATIVISATION.md) (repo assessments, backend neutrality, reimplementation verdicts, strategy B).
 >
-> **Thesis**: Shikumi decides over code the code-intelligence substrate has already indexed; nothing is re-read as raw text. Code retrieval and agent orchestration are one stack, not two — owned natively at the Haskell/effectful/servant boundary, not delegated wholesale to a Node sidecar.
+> **Verification**: the forms of testing that may *gate* implementation states — formal, guest boots, in-guest stress, bootstrap fixpoints, network interop, cluster fault injection, FS crash-consistency — and the four barriers to wiring them are specified by [`docs/VERIFICATION_LADDER.md`](VERIFICATION_LADDER.md); harness-repo assessment and the remaining clone queue live in [`docs/HARNESS_CLONE_QUEUE.md`](HARNESS_CLONE_QUEUE.md).
+>
+> **Thesis**: Shikumi decides over code the code-intelligence substrate has already indexed; nothing is re-read as raw text. Code retrieval, decision, and verification gating are one stack, not two — owned natively at the Haskell/effectful/servant boundary, not delegated wholesale to a Node sidecar. Every gate is an honest deterministic oracle; the ladder decides *when* a change is allowed to promote, the graph tells Shikumi *where* to repair when it fails.
 
 ---
 
 ## 1. Executive Summary
 
-This document presents the unified architecture for the **typed-language-model-arena** / Hermes Agent stack: a deterministic, zero-token code-intelligence substrate feeding a durable, typed decision-and-action loop.
+This document presents the unified architecture for the **typed-language-model-arena** / Hermes Agent stack: a deterministic, zero-token code-intelligence substrate feeding a durable, typed decision-and-action loop, with a verification ladder that honestly gates promotion.
 
-Two complementary halves:
+Three complementary halves:
 
 | Half | Source | Answers |
 | :--- | :--- | :--- |
 | **Code Intelligence** | `CODE_HANDLING.md` + `CODE_INGESTION_NATIVISATION.md` | *How does the agent see the code?* — Offline knowledge graph over a backend-neutral `CodeGraphStore` effect (SQLite testbeds / Postgres campaign), mixed ingestion (ctags JSONL, tree-sitter queries, custom scanners for the **required language set**: Haskell, Mercury, Julia, Lean, Coq, Sail, **and more**), thin MCP/servant façade, sub-millisecond lookup. |
 | **Decision Orchestration** | `ECOSYSTEM_INTEGRATION_PLAN.md` | *How does it decide and act?* — Shikumi plans, Keiro journals, Kioku remembers, Seihou scaffolds, PGMQ/Shibuya transport, Mori validates, Shomei signs, Kiroku audits. |
+| **Verification Gating** | `VERIFICATION_LADDER.md` + `HARNESS_CLONE_QUEUE.md` | *What must pass before a change may promote?* — Seven forms (formal, guest boot, in-guest stress, bootstrap fixpoint, network interop, cluster fault-injection, FS crash-consistency) staged as a ladder; four barriers to opening them; honest deterministic oracles only — never an LLM verdict. |
 
-Integrated, they form a single closed loop: **observe → retrieve code context + episodic lessons → decide → act → persist → validate**, with every structured exchange schema-enforced and every decision journaled.
+Integrated, they form a single closed loop: **observe → retrieve code context + episodic lessons → decide → act → persist → validate → (ladder) gate → promote or repair**, with every structured exchange schema-enforced, every decision journaled, and every gate a deterministic tool verdict.
 
 **Nativeisation stance** (from `CODE_INGESTION_NATIVISATION.md`): codegraph's stock 41-language matrix is web/apps-weighted and **omits the arena's verification-target languages**; strategy **B** applies now — own the store effect, façade, and required-language scanners in Haskell; consume codegraph as a sidecar only where its coverage helps; do not port its long-tail extractor matrix or reimplement tree-sitter/ctags parsers.
+
+**Verification stance** (from `VERIFICATION_LADDER.md`, informed by `HARNESS_CLONE_QUEUE.md`): the campaign loop is already kind-agnostic; what blocks new gates is four concrete barriers — **closed kind vocabulary**, **uninterpreted oracle facts** (`proofHygiene`, `logSchema`, `timeoutSeconds`), **process-spawn-only execution**, and **capability/budget discovery**. Strategy: open the seams first (kinds + interpreters + driver contract), keep console/fault logic in external drivers (pgcl pattern; `avocado`/`avocado-vt` as driver-contract references), then harvest cloned harnesses into manifests. **Harness clones inform the driver contract; they do not replace it.**
 
 ---
 
@@ -62,6 +67,20 @@ Owned at the Haskell boundary per `CODE_INGESTION_NATIVISATION.md` §5–6 (stra
 | **Shibuya-PGMQ Adapter** | Transport Bridge | Adapter: Links Shibuya pipelines to PGMQ queues. |
 | **Shibuya** | Data Pipeline Processor | Effectful Pipeline Tool: Manages async streams and transformation flows. |
 | **baikai** | Provider Transport | Typed LLM transport, model definitions, token accounting, and cost models. |
+
+### 2.4 Verification Substrate (ladder)
+
+Per `VERIFICATION_LADDER.md` §2–3; harness sources per `HARNESS_CLONE_QUEUE.md`:
+
+| Component | Role | Technical Definition |
+| :--- | :--- | :--- |
+| **Ladder kinds** | Gate vocabulary | Extend the closed allow-list beyond `host-verify` / `qemu-boot-matrix` with **`vm-console-boot`**, **`stress-soak`**, **`bootstrap-fixpoint`**, **`vm-crash-consistency`** — declared in Dhall `TargetManifest`s; unknown kinds remain recorded, never run. |
+| **Oracle interpreters** | Honest verdicts | Implement reserved facts: **`proofHygiene`** (scan `sorryAx`/`Admitted`/axioms), **`logSchema`** (TAP/JSON/JUnit), **`timeoutSeconds`** (honored in driver contract); plus fsck/fixpoint/abidiff fact kinds. Exit × markers × baselines stays the floor. LLMs never grade. |
+| **Driver contract** | Execution seam | *Host tools* = `readProcess`; *boots/faults/fixpoints* = **external driver owns console, timeouts, kill schedule**, writes a log file (pgcl pattern). Manifest facts carry send/expect strings, kill schedules, stage inputs. Reference designs: pgcl `matrix-driver-all.sh`, **`avocado`/`avocado-vt`**, `syzkaller` manager/report, `expect`/`pexpect`. Defer in-process PTY/expect until a driver cannot express the interaction. |
+| **Capability flags** | Placement | Probe and register: `has_qemu`, `has_fault_injection`, `has_dm` (crashmonkey/`lvm2`), `opam_switch`, `lake`, `verus`, sandbox provider (`nsjail`/`bubblewrap`/`runc`/`gvisor`) — gate worker assignment (barrier #4; Phase 5 federation). |
+| **Honest oracles + baselines** | Trust | Deterministic tool verdicts only: markers, exit codes, `sorryAx` scan, fsck/`xfs_repair` exit, `abidiff`, diffoscope normalized equality, checker output (porcupine/Elle). Known-fails (`knownFailuresFor`, `waiveBaseline`) separate environment noise from regressions. |
+| **Gate → repair seam** | Closed loop | Any ladder rung regression → failed-first reschedule + bisection (Vector D) → Shikumi repair blueprint **grounded by CodeGraphStore** (§5 step 2b) → human review (`Campaign.Review`) → re-run the same rung. |
+| **Tests-of-the-gates** | Meta-verification | Property tests (**QuickCheck**/**hedgehog**) for oracles, `CodeGraphStore`, and façade schemas; optional mutation metrics (`cargo-mutants`/`mutatest`) to measure oracle sensitivity. Sandbox agent-proposed binaries before any rung executes them. |
 
 ---
 
@@ -128,11 +147,13 @@ The code substrate is indexed and verified across five Framagit repositories (al
 
 Full commands and paths: [`CODE_HANDLING.md` §4](CODE_HANDLING.md).
 
+Portfolio verification targets beyond these five (pgcl matrix, tessera proofs, organ-bank, etc.) are catalogued in [`WORKQUEUE.md`](WORKQUEUE.md) and assessed form-by-form in [`VERIFICATION_LADDER.md`](VERIFICATION_LADDER.md) §3.
+
 ---
 
 ## 5. Autonomous Integration Flow (Merged Loop)
 
-The agent loop inserts the **code-intelligence substrate (`CodeGraphStore` + façade) as a parallel context-retrieval tier** alongside Kioku, so Shikumi's repair blueprints are grounded in both historical lessons *and* exact structural code context — before any action is journaled or validated.
+The agent loop inserts the **code-intelligence substrate (`CodeGraphStore` + façade) as a parallel context-retrieval tier** alongside Kioku, so Shikumi's repair blueprints are grounded in both historical lessons *and* exact structural code context — before any action is journaled or validated. The **verification ladder** sits after persistence: a change may only promote when every declared rung for that target returns an honest pass (or a documented waive).
 
 ```
 1. Observability (Trigger)
@@ -164,6 +185,16 @@ The agent loop inserts the **code-intelligence substrate (`CodeGraphStore` + fa�
    All structured exchanges validated via Mori-Schema middleware:
    workflow events, tool calls, AND CodeGraph node/edge/tool response schemas.
    Graph mutation events also journaled through Kiroku.
+
+7. Ladder gate — honest rungs (VERIFICATION_LADDER)
+   Deterministic oracle interpreters grade the changed unit against its
+   declared ladder membership (host-verify → formal → guest boot →
+   in-guest suites → adversarial → fixpoint, as applicable):
+     • pass / passed-waived  → eligible to promote (attestation receipt)
+     • fail / unknown        → failed-first reschedule + bisection (Vector D)
+                               → back to step 2b with CodeGraph diagnostics
+   Sandbox (nsjail/bubblewrap/runc) wraps any agent-proposed binary
+   before it executes; LLMs never grade a rung.
 ```
 
 ### Why both retrieval tiers?
@@ -173,7 +204,9 @@ The agent loop inserts the **code-intelligence substrate (`CodeGraphStore` + fa�
 | **Answers** | *What happened last time?* | *Where is the code and how is it wired?* |
 | **Store** | L0 logs → L1 episodes → L2 lessons → L3 priors | SQLite \| Postgres `nodes`/`edges`, FTS, line ranges |
 | **Cost** | Distilled memory lookup | <150 tokens per façade query |
-| **Feeds** | Shikumi priors, known-fails | Shikumi diagnostics, exact edit sites |
+| **Feeds** | Shikumi priors, known-fails, **ladder waivers** | Shikumi diagnostics, exact edit sites |
+
+Ladder outcomes flow back into Kioku as lessons/waivers (step 7 → next run's evidence ranking); raw driver logs (and optionally `rr` replays) land in L0 — closing **observe → repair → gate → remember**.
 
 ---
 
@@ -200,14 +233,31 @@ The agent loop inserts the **code-intelligence substrate (`CodeGraphStore` + fa�
 ### Tier 2 — Governance / Security
 - Integrate **Shomei** (security/identity, passkey/signing).
 - Integrate **Mori-Schema** (validation) — extend schemas to cover façade tool I/O (symbol nodes, edge responses, predicate/citation types) so retrieval results are typed end-to-end.
+- **Sandbox seam**: wrap agent-proposed / tier7 binaries in **`nsjail`** or **`bubblewrap`** (`runc`/`gvisor` if container workers) before any ladder rung executes them — capability flag `sandbox_provider`.
 
 ### Tier 3 — Audit / Provenance
 - Integrate **Kiroku** (event sourcing/auditing) — journal graph mutations, repair-blueprint lifecycle, and retrieval queries as append-only events.
 - Optional: wire graph topology diffs into the human review seam (`Campaign.Review` from `CAMPAIGN_GENERALIZATION.md`).
+- Ladder rung outcomes + waiver rationale journaled as attestation inputs (Phase 6 receipts bind commit → rung results).
 
-### Deferred / out of scope (see `CODE_INGESTION_NATIVISATION.md`)
+### Tier 4 — Verification Ladder Enablement (from `VERIFICATION_LADDER.md` §5, sequenced with `HARNESS_CLONE_QUEUE.md`)
+
+Enablement order — **seams before harvests**; each step unblocks the next without new Haskell runtimes:
+
+| Step | Barrier | Work | Harness sources (`HARNESS_CLONE_QUEUE.md`) |
+| :--- | :--- | :--- | :--- |
+| **4a. Quick wins** | #2 | Interpret **`proofHygiene`** + **`logSchema`**; Dhall manifests for `tessera/host@iris`, `tessera/host@ci` (wrap `ci.sh`), `telix/host@verus` | Form 1 set already landed (`mirror-isabelle`, `kani`, `cbmc`, …) |
+| **4b. Open kinds + driver contract** | #1, #3 | Allow-list **`vm-console-boot`**, **`stress-soak`**, **`bootstrap-fixpoint`**, **`vm-crash-consistency`**; write driver conformance doc (log path, exit semantics, timeout ownership, fact inputs) | **Clone priority:** `avocado`+`avocado-vt`, then `ipxe` (tftp/PXE), `edk2` (UEFI); pgcl/syzkaller/expect already in-tree |
+| **4c. Bootstrap fixpoint** | #1 | Kind `bootstrap-fixpoint`; staged keiro workflow; **normalized-equality** oracle (diffoscope/objcopy) + compile-and-run sub-check (Mercury campaign = template) | **Clone:** `stage0-posix`+`mes`; `diffoscope`/`csmith`/`creduce`/`yarpgen` landed |
+| **4d. Guest stress + crash-consistency** | #1, #2 | Drivers reusing LTP/initramfs; crash-reboot loop; fsck fact kind; honor `timeoutSeconds` | **Clone:** `lkl` (cheap screening), `lvm2` (dmsetup for crashmonkey); `xfstests`/`pjdfstest`/`crashmonkey`/`e2fsprogs`/`xfsprogs` landed |
+| **4e. Network interop** | #1 | Phase A: LTP-net subset as existing kind; Phase B: packetdrill/netperf behind capability flags; NFS server topology for `nfstest` | **Clone:** `nfs-utils`/`nfs-ganesha`, `nghttp2`; rest landed (`packetdrill`, `mininet`, `scapy`, QUIC stacks) |
+| **4f. Cluster / nemesis** | #3, #4 | Two-node **Postgres/pgmq** kill-restart first (reuse `Campaign/Bootstrap.hs`); then composite multi-cell keiro workflow; capability `has_fault_injection` | **Clone:** `patroni` then `corosync`+`pacemaker`; `jepsen`/`maelstrom`/`porcupine`/`toxiproxy`/`failpoint`/`postgresql` landed; `tlaplus/examples`+`spin` for spec-first pre-work |
+| **4g. Diagnostics & meta** | — | `rr` replays into kioku L0; **QuickCheck**/**hedgehog`** tests-of-the-gates for oracles/store/façade | **Clone:** `rr`, `QuickCheck`, `hedgehog` |
+
+**Deferred / out of scope (see `CODE_INGESTION_NATIVISATION.md` + `HARNESS_CLONE_QUEUE.md` §4–5):**
 - **Native extraction service (strategy C)**: port per-language extractors onto `hs-tree-sitter` — only if/when the Node sidecar must be dropped; AGPL → separate process/service, never a BSD library dep.
 - **Do not reimplement**: tree-sitter grammars, ctags parsers, codegraph's 40-lang extractor matrix / framework synthesizers, search stack, visualizer.
+- **Conditional harness clones** (`openocd`, `NUT`, `openzfs`, `CompCert`/`KLEE`, mutation tools, full gcc/llvm/rustc, …) only when a concrete target or HIL/PDU lane is scoped — see clone queue §4–5.
 
 ---
 
@@ -221,7 +271,7 @@ The agent loop inserts the **code-intelligence substrate (`CodeGraphStore` + fa�
 | **Academic Traceability** | Inferred probabilistically | **Deterministic relational edges** (DOI → Code) |
 | **Hardware Memory Footprint** | Bloats context to 64K+ (high VRAM) | **Zero VRAM overhead** (database in CPU RAM) |
 
-Combined with the decision stack: **Shikumi never plans from raw text** — it plans from Kioku's distilled lessons *and* the store's exact line ranges, executes through Keiro's durable journals, and passes every exchange through Mori's schemas.
+Combined with the decision stack: **Shikumi never plans from raw text** — it plans from Kioku's distilled lessons *and* the store's exact line ranges, executes through Keiro's durable journals, passes every exchange through Mori's schemas, and only promotes when the verification ladder's deterministic oracles agree.
 
 ---
 
@@ -235,10 +285,16 @@ Combined with the decision stack: **Shikumi never plans from raw text** — it p
 
 **Code substrate — arena nativeisation (`CODE_INGESTION_NATIVISATION.md`):** design/decision record; `CodeGraphStore` + mixed ingestion + façade are Tier 1 work items (not yet implemented). Target: ~3–6 weeks to parity with the four testbed contracts while covering the required language set stock codegraph misses.
 
+**Verification ladder (`VERIFICATION_LADDER.md`):** design assessment; Tier 4 (4a–4g) is the enablement plan. Live today: `tessera/host@proof`, `tessera/host@cbmc-sanity`, 95-cell `pgcl` qemu-boot-matrix, Mercury promotion campaign. Barriers #1–#4 still open; reserved oracle facts still uninterpreted.
+
+**Harness inventory (`HARNESS_CLONE_QUEUE.md`):** most form-critical repos landed under `~/src/` (see queue §1); remainder prioritised in queue §6 — `ipxe`, `stage0-posix`+`mes`, `lkl`, `avocado`, `patroni`, `corosync`+`pacemaker`, `lvm2`, `rr`, `QuickCheck`+`hedgehog`, sandbox (`nsjail`/`bubblewrap`). Clones feed Tier 4 driver/oracle design; they do not bypass the seams.
+
 **Decision stack roadmap:** see `ECOSYSTEM_INTEGRATION_PLAN.md` §4 (original tiers) and this document §6 (merged tiers).
 
 **Related living documents:**
 - [`CODE_INGESTION_NATIVISATION.md`](CODE_INGESTION_NATIVISATION.md) — repo assessments, backend neutrality, integration strategies A/B/C, reimplementation verdicts, narrow arena-native indexer.
+- [`VERIFICATION_LADDER.md`](VERIFICATION_LADDER.md) — seven testing forms, four barriers, honesty invariant, ladder staging, enablement order.
+- [`HARNESS_CLONE_QUEUE.md`](HARNESS_CLONE_QUEUE.md) — landed harness inventory, remaining clone candidates, assessment lens, clone priority.
 - [`WORKQUEUE.md`](WORKQUEUE.md) — scheduler ground truth, portfolio roadmap, failure baselines, commit ledger.
 - [`CAMPAIGN_GENERALIZATION.md`](CAMPAIGN_GENERALIZATION.md) — declarative target manifests, distributed workers, sovereign forge integration.
 - [`ATTESTATION_MAPPING_DRAFT.md`](ATTESTATION_MAPPING_DRAFT.md) — attestation record, receipts-as-gate-input, DID-key signing.
