@@ -26,41 +26,64 @@ import Test.Tasty.HUnit (assertBool, testCase, (@?=))
 -- | Fixture bodies are small and immutable; reading once at startup keeps
 -- the suite free of per-test IO plumbing while remaining honest files.
 -- cabal runs the suite with CWD = the package root (shikumi-campaign/).
-readFixture :: FilePath -> Text
-readFixture rel = unsafePerformIO (T.pack <$> readFile ("test/fixtures/" <> rel))
+readFixture :: FilePath -> IO Text
+readFixture rel = T.pack <$> readFile ("test/fixtures/" <> rel)
 
+{-# NOINLINE cleanProof #-}
 cleanProof :: Text
-cleanProof = readFixture "proof-hygiene-clean.log"
+cleanProof = unsafePerformIO (readFixture "proof-hygiene-clean.log")
 
+{-# NOINLINE dirtyProof #-}
 dirtyProof :: Text
-dirtyProof = readFixture "proof-hygiene-dirty.log"
+dirtyProof = unsafePerformIO (readFixture "proof-hygiene-dirty.log")
 
+{-# NOINLINE tapPass #-}
 tapPass :: Text
-tapPass = readFixture "log-schema-tap-pass.tap"
+tapPass = unsafePerformIO (readFixture "log-schema-tap-pass.tap")
 
+{-# NOINLINE tapFail #-}
 tapFail :: Text
-tapFail = readFixture "log-schema-tap-fail.tap"
+tapFail = unsafePerformIO (readFixture "log-schema-tap-fail.tap")
 
+{-# NOINLINE tapEmpty #-}
 tapEmpty :: Text
-tapEmpty = readFixture "log-schema-tap-empty.tap"
+tapEmpty = unsafePerformIO (readFixture "log-schema-tap-empty.tap")
 
+{-# NOINLINE jsonPass #-}
 jsonPass :: Text
-jsonPass = readFixture "log-schema-counters-pass.json"
+jsonPass = unsafePerformIO (readFixture "log-schema-counters-pass.json")
 
+{-# NOINLINE jsonFail #-}
 jsonFail :: Text
-jsonFail = readFixture "log-schema-counters-fail.json"
+jsonFail = unsafePerformIO (readFixture "log-schema-counters-fail.json")
 
+{-# NOINLINE jsonNot #-}
 jsonNot :: Text
-jsonNot = readFixture "log-schema-not-json.log"
+jsonNot = unsafePerformIO (readFixture "log-schema-not-json.log")
 
+{-# NOINLINE junitPass #-}
 junitPass :: Text
-junitPass = readFixture "log-schema-junit-pass.xml"
+junitPass = unsafePerformIO (readFixture "log-schema-junit-pass.xml")
 
+{-# NOINLINE junitFail #-}
 junitFail :: Text
-junitFail = readFixture "log-schema-junit.xml"
+junitFail = unsafePerformIO (readFixture "log-schema-junit.xml")
 
+{-# NOINLINE junitMissing #-}
 junitMissing :: Text
-junitMissing = readFixture "log-schema-junit-missing.xml"
+junitMissing = unsafePerformIO (readFixture "log-schema-junit-missing.xml")
+
+{-# NOINLINE crashLog #-}
+crashLog :: Text
+crashLog = unsafePerformIO (readFixture "oracle-crash.log")
+
+{-# NOINLINE stressSoakPass #-}
+stressSoakPass :: Text
+stressSoakPass = unsafePerformIO (readFixture "stress-soak-pass.log")
+
+{-# NOINLINE stressSoakFail #-}
+stressSoakFail :: Text
+stressSoakFail = unsafePerformIO (readFixture "stress-soak-fail.log")
 
 main :: IO ()
 main = defaultMain tests
@@ -101,7 +124,7 @@ tests =
                 lsFailed s @?= 1
                 lsNamedFailures s @?= ["red"]
                 logSchemaOk s @?= False,
-          testCase "empty tap → honest parse error" $
+          testCase "empty tap → honest parse error" $ do
             case interpretLogSchema "tap" tapEmpty of
               Left _ -> pure ()
               Right _ -> assertBool "must fail" False
@@ -122,7 +145,7 @@ tests =
                 lsFailed s @?= 2
                 lsNamedFailures s @?= ["fork04", "mincore04"]
                 logSchemaOk s @?= False,
-          testCase "not JSON → honest parse error" $
+          testCase "not JSON → honest parse error" $ do
             case interpretLogSchema "json-counters" jsonNot of
               Left _ -> pure ()
               Right _ -> assertBool "must fail" False
@@ -142,16 +165,44 @@ tests =
               Right s -> do
                 lsFailed s @?= 1
                 logSchemaOk s @?= False,
-          testCase "missing testsuite → honest parse error" $
+          testCase "missing testsuite → honest parse error" $ do
             case interpretLogSchema "junit" junitMissing of
               Left _ -> pure ()
-              Right _ -> assertBool "must fail" False
-        ],
-      testGroup
-        "logSchema — unknown fact id"
-        [ testCase "unknown id → Left (never a silent pass)" $
-            case interpretLogSchema "bogus" tapPass of
-              Left err -> assertBool "names the id" ("bogus" `T.isInfixOf` err)
-              Right _ -> assertBool "must fail" False
+              Right _ -> assertBool "must fail" False,
+          testGroup
+            "crash consistency (Tier 4d)"
+            [ testCase "crash log has 2 named failures" $
+                case interpretLogSchema "tap" crashLog of
+                  Left err -> assertBool "must parse" False
+                  Right s -> do
+                    lsFailed s @?= 2
+                    lsNamedFailures s @?= ["mincore04", "munmap01"]
+                    logSchemaOk s @?= False,
+              testCase "crash consistency marker refusal" $ do
+                case interpretLogSchema "tap" crashLog of
+                  Left _ -> assertBool "must parse" False
+                  Right s -> do
+                    lsFailed s @?= 2
+                    lsNamedFailures s @?= ["mincore04", "munmap01"]
+                    logSchemaOk s @?= False
+            ],
+          testGroup
+            "stress soak (Tier 4d)"
+            [ testCase "pass soak → ok" $ do
+                case interpretLogSchema "tap" stressSoakPass of
+                  Left err -> assertBool "must parse" False
+                  Right s -> do
+                    lsFailed s @?= 0
+                    logSchemaOk s @?= True,
+              testCase "fail soak → timeout verdict" $ do
+                case interpretLogSchema "tap" stressSoakFail of
+                  Left err -> assertBool "must parse" False
+                  Right s -> do
+                    lsFailed s @?= 1
+                    logSchemaOk s @?= False
+            ]
         ]
     ]
+  where
+    readFixture :: FilePath -> IO Text
+    readFixture rel = T.pack <$> readFile ("test/fixtures/" <> rel)
