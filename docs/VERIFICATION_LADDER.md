@@ -164,3 +164,97 @@ None of this fights the architecture: **3.1 and 3.4** are mostly interpreters an
 - **COMBINED_ECOSYSTEM_PLAN / CODE_INGESTION_NATIVISATION**: code intelligence (CodeGraphStore, façade) supplies the *repair* side once any ladder rung fails — scheduler evidence feeds Shikumi diagnostics with exact edit sites.
 
 This ladder and its barrier list are the standing answer to "what forms of verification can gate implementation states, and what must exist before they can."
+
+### New Verification Kinds (Tier 4+)
+
+The following verification kinds are now documented and can be declared in 
+`TargetManifest` Dhall files. Each kind has an associated driver contract.
+
+#### `vm-console-boot`
+- **Purpose**: Interactive/console-style boot verification
+- **Driver contract**: 
+  - stdout/stderr captured to log file
+  - Exit code semantics: 0 = pass, non-zero = fail
+  - Timeout ownership: external driver (harness provides `timeoutSeconds`)
+  - Console script parameters (send strings, expect patterns) become manifest facts
+  - Defer in-process PTY/expect until driver script cannot express the interaction
+- **Manifest format**: `kind: "vm-console-boot"`, `command` = driver script path
+- **Oracle facts**: `proofHygiene`, `logSchema`, `timeoutSeconds` (honored in driver contract)
+
+#### `stress-soak`
+- **Purpose**: Duration-bound stress test
+- **Driver contract**:
+  - Runs for specified duration (documented in `timeoutSeconds`)
+  - Periodic health checks logged
+  - Exit code: 0 = all iterations pass, non-zero = failure
+  - Timeout: harness-owned but documented in manifest
+  - Known-fail baselines documented per suite
+- **Manifest format**: `kind: "stress-soak"`, `timeoutSeconds` = duration in seconds
+- **Oracle facts**: `logSchema` (TAP/JUnit structured), `timeoutSeconds` (honored verdict: pass/fail/timeout)
+
+#### `bootstrap-fixpoint`
+- **Purpose**: Nested/compiler bootstrap verification
+- **Driver contract**:
+  - Stage-1 build → stage-2 build (stage-1 drives it) → stage-3 build (stage-2 drives it)
+  - Separate journaled steps, crash-resumable
+  - Exit code: 0 = all stages pass
+  - Normalized equality oracle (strip build-ids, debug info)
+  - Known-fails for documented non-determinism
+- **Manifest format**: `kind: "bootstrap-fixpoint"`, staged commands
+- **Oracle facts**: `proofHygiene` (scan for Admitted/sorryAx), normalized equality
+
+#### `vm-crash-consistency`
+- **Purpose**: Crash consistency + reboot loop verification
+- **Driver contract**:
+  - Workload → QEMU kill/reset mid-run → reboot → fsck/mount probe
+  - Post-reboot `fsck` exit 0 / clean-mount markers
+  - Optional known-fails for documented races
+  - Driver embeds: workload + kill schedule (facts) + reboot + probe mount
+- **Manifest format**: `kind: "vm-crash-consistency"`, command + kill schedule
+- **Oracle facts**: `fsck` exit 0 / clean-mount markers, `proofHygiene` for documented races
+
+
+### `bootstrap-fixpoint` Kind
+
+- **Purpose**: Verify nested/compiler bootstrap chains (e.g., GHC bootstrapping itself,
+  or Mercury compiler bootstrapping from an existing version).
+- **Driver contract** (staged keiro workflow):
+  1. **Stage 1**: Build base compiler/interpreter from source
+  2. **Stage 2**: Build target using stage-1 compiler
+  3. **Stage 3**: Verify target produces correct output
+  - Each stage is a separate journaled keiro step, crash-resumable
+  - Exit code 0 = all stages pass
+  - Build artifacts preserved between stages for reproducibility
+- **Normalized equality oracle**:
+  - Strip build-ids, debug info via `objcopy --strip-debug` / `objcopy --strip-all`
+  - Compare canonical dumps or use `--version` + behavioral corpus
+  - Never compare raw bytes (build-ids, timestamps, path strings differ)
+- **Known-fails**: Documented non-determinism (e.g., timestamp-dependent outputs)
+- **Manifest format**: `kind: "bootstrap-fixpoint"`, staged commands with
+  `stage1_cmd`, `stage2_cmd`, `stage3_cmd` fields
+- **Oracle facts**: `proofHygiene` (scan for Admitted/sorryAx in generated code),
+  normalized equality of build outputs
+- **Example**: Mercury compiler bootstrapping from v1 to v2, verifying ABI compatibility
+
+
+### `vm-crash-consistency` Kind
+
+- **Purpose**: Verify crash consistency of filesystems/partitions across reboots.
+  Workload → QEMU kill/reset mid-run → reboot → fsck/mount probe.
+- **Driver contract**:
+  1. **Execute workload** under QEMU/Virtualization with root filesystem
+  2. **Mid-run kill**: QEMU sends SIGKILL or power-off at arbitrary point
+  3. **Reboot**: Virtual machine reboots (firmware-assisted or save/restore)
+  4. **Probe mount**: Run `fsck` on returned state; check for clean-mount markers
+  5. **Driver embeds**: workload + kill schedule (facts) + reboot + probe mount
+- **Oracle facts**:
+  - `fsck` exit code 0 = filesystem consistent
+  - Clean-mount markers in dmesg/journal (e.g., `EXT4-fs: mounted filesystem with ordered option`)
+  - Optional `proofHygiene` for documented races / non-deterministic corruption
+- **Known-fail baselines**: Documented known race conditions, e.g., 
+  specific interleavings that cause benign corruption
+- **Manifest format**: `kind: "vm-crash-consistency"`, command + kill_schedule
+  fields specifying when to interrupt the workload
+- **Example**: LTP (Linux Test Project) subset run across reboot cycle, 
+  checking `fsck` exit 0 and clean-mount markers
+
