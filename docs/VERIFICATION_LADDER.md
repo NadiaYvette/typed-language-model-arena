@@ -258,3 +258,173 @@ The following verification kinds are now documented and can be declared in
 - **Example**: LTP (Linux Test Project) subset run across reboot cycle, 
   checking `fsck` exit 0 and clean-mount markers
 
+
+### Network Interop (Step 4e)
+
+- **Purpose**: Verify network connectivity and protocol handling across diverse 
+  network topologies and stack configurations.
+- **Driver contract**:
+  - **Phase A (LTP-net subset)**: Linux Test Project network subset as existing kind;
+    runs `npf-test`, `ddt`, `iptables` subsets as checkpoint rungs
+  - **Phase B**: `packetdrill` and `netperf` behind capability flags (`has_fault_injection`)
+    - `packetdrill`: packet rate testing, loss injection, latency measurement
+    - `netperf`: TCP/throughput, RPC, latency benchmarks
+  - Capability probe: `has_fault_injection` gates worker assignment
+  - Network namespace isolation for test containment
+  - `timeoutSeconds` documented per-suite; external driver owns kill schedule
+- **Manifest format**: `kind: "network-interop"`, `capability_flags` field
+  containing `has_fault_injection`, `has_qemu`, etc.
+- **Oracle facts**: `logSchema` (structured TAP/JUnit from npf/ddt outputs),
+  `timeoutSeconds` (honored verdict), custom `packetdrill`/`netperf` fact kinds
+- **Known-fail baselines**: Documented protocol-specific interoperability issues,
+  middlebox behaviors, version skew effects
+- **Example**: LTP `npf-test` suite across 3 network configurations, 
+  `packetdrill` latency/loss targets, `netperf` TCP throughput targets
+
+
+### Cluster / Nemesis (Step 4f)
+
+- **Purpose**: Multi-cell cluster fault injection and nemesis testing for 
+  resilience verification across distributed state.
+- **Driver contract**:
+  - **Two-node Postgres/pgmq kill-restart**: Coordinated primary/secondary 
+    failure scenarios using pgmq message queue for failure coordination
+  - **Composite multi-cell keiro workflow**: Staged workflow across multiple 
+    keiro-managed cells, each with independent state and fault injection
+  - Capability `has_fault_injection` gates worker assignment to cluster-capable nodes
+  - Folded test: single-cell keiro workflow with composite fault patterns
+  - `timeoutSeconds` per-rung documented; external driver owns kill schedule
+- **Oracle facts**: `proofHygiene` (scan for Admitted/sorryAx in composite 
+  workflow outputs), `logSchema` (workflow step completion TAP markers),
+  `timeoutSeconds` (per-rung honored), custom `pgmq` fact kinds for message 
+  queue state
+- **Known-fail baselines**: Documented split-brain scenarios, split-session 
+  timeouts, quorum loss conditions, STONITH fencing edge cases
+- **Manifest format**: `kind: "cluster-nemesis"`, `cell_count` field, 
+  `fault_schedule` (jornaled pgmq messages), `capability_flags`
+- **Example**: 3-cell keiro workflow with partitioned primary, 
+  `pgmq` message-mediated failure coordination, `fault-injection` gated workers
+
+
+### `4g` Deep Ladder Stage & Autonomous Loop
+
+- **Purpose**: Full autonomous integration verification — the complete
+  observe→retrieve→decide→act→persist→validate→(ladder)gate→promote loop
+  under realistic conditions, with all substrates active and interacting.
+- **Scope**: All seven verification forms staged as a ladder; four barriers
+  fully open; harness clones assessed and fed into driver contracts; Kioku
+  lessons ranking evidence for evidence-driven scheduling; Mori-Schema 
+  middleware validates all structured exchanges including CodeGraphStore
+  façade responses and Kiroku journal entries.
+- **Postgres carrier parity**: All SQL contracts verified against both
+  SQLite testbed (`docs/fixtures/test_repo_graph.sqlite`) and Postgres
+  campaign database (`Campaign/Matrix.hs` carries; `CodeGraphStore` effect
+  carriers). Four cornerstone contracts verified:
+  1. **Node/edge existence**: `SELECT COUNT(*) FROM nodes WHERE repo=$1`
+     matches between SQLite and Postgres result sets
+  2. **Predicate/citation lookup**: `SELECT * FROM edges WHERE relation='cites'`
+     AND `source_id IN (SELECT id FROM nodes WHERE repo=$1)`
+  3. **FTS5 search**: `SELECT * FROM nodes WHERE nodes MATQ 'acpi*'`
+     between SQLite `fts5` virtual table and Postgres `tsvector`/`pg_trgm`
+  4. **Full node/edge round-trip**: INSERT → SELECT → DELETE idempotency
+     across both carriers; mutation events journaled through Kiroku
+- **Autonomous loop scenarios**:
+  - **Scenario 1 (Repair-after-failure)**: Test failure → Kioku lesson lookup
+    → Shikumi repair blueprint → Keiro durable workflow → PGMQ enqueue →
+    Worker execution → Mori-Schema validation → Ladder rung grade → Promote
+    or failed-first reschedule + bisection (Vector D) → Shikumi diagnostics
+    with CodeGraphStore context → Kiroku journal → Kioku evidence ranking
+  - **Scenario 2 (Kind-promotion)**: New kind `vm-console-boot` declared in
+    manifest → Driver conformance check → Ladder grade → If pass, promote
+    with attestation receipt → Kiroku journal → Kioku lesson for future
+    runs → CodeGraphStore context for repair blueprint grounding
+  - **Scenario 3 (Capability upgrade)**: Worker upgraded with `has_fault_injection`
+    capability → Kind `stress-soak` re-evaluated → Driver contract re-validated
+    → Ladder re-grade → If pass, promote → Kiroku journal → Kioku lesson
+  - **Scenario 4 (Meta-verification)**: QuickCheck/hedgehog property tests
+    for oracle sensitivity (proofHygiene, logSchema, timeoutSeconds,
+    fsck/fixpoint fact kinds), CodeGraphStore façade accuracy, Mori-Schema
+    schema validity → If all pass, promote ladder-wide confidence → Kiroku
+    journal → Kioku evidence for future ladder-wide confidence decay
+- **Driver contract** (autonomous loop seam):
+  - All tool calls validated through Mori-Schema before execution
+  - All structured exchanges (tool calls, workflow events, CodeGraph queries)
+    journaled through Kiroku append-only
+  - Ladder gate outcomes (pass/fail/unknown) journaled through Kiroku;
+    evidence ranking through Kioku
+  - All CodeGraphStore façade queries Mori-validated for schema compliance
+  - All driver kill schedules and timeoutSeconds honored per manifest
+  - All known-fail baselines documented per-suite; waiver rationale journaled
+- **Ladder outcome flow**: Outcomes flow back into Kioku as lessons/waivers
+  (Step 7 → next run's evidence ranking); raw driver logs (and optionally
+  `rr` replays) land in L0 — closing observe→repair→gate→remember loop.
+- **Meta-verification**: Property tests (QuickCheck/hedgehog) for oracle
+  sensitivity, CodeGraphStore façade accuracy, Mori-Schema schema validity;
+  optional mutation metrics (`cargo-mutants`/`mutatest`) to measure oracle
+  sensitivity; sandbox (nsjail/bubblewrap/runc) wraps any agent-proposed
+  binary before it executes; LLMs never grade a rung.
+
+
+### Postgres Carrier Parity Setup (Step 4g)
+
+The `CodeGraphStore` effect carries two backend carriers: SQLite (local testbed)
+and Postgres (campaign-shared). Full carrier parity means all standard SQL
+contracts yield identical results across both carriers, verified as a gating
+step before any ladder rung may promote.
+
+#### Carrier Parity Contracts (verified against SQLite `repo_graph.sqlite`
+and Postgres campaign DB):
+
+**C1 — Node existence by repo**: 
+`SELECT COUNT(*) FROM nodes WHERE repo=$1` 
+must return identical counts in SQLite and Postgres.
+
+**C2 — Predicate/citation edges**: 
+`SELECT COUNT(*) FROM edges WHERE relation='cites' AND source_id IN 
+(SELECT id FROM nodes WHERE repo=$1)` 
+must return identical counts.
+
+**C3 — FTS5/ trigram search**: 
+`SELECT COUNT(*) FROM nodes WHERE nodes MATCH 'acpi*'` (SQLite FTS5) must
+return identical count to `SELECT COUNT(*) FROM nodes WHERE nodes 
+MATCH 'acpi*'` using Postgres `tsvector`/`pg_trgm` similarity.
+
+**C4 — Full round-trip idempotency**: 
+INSERT a test node/edge, SELECT it back, DELETE it, then verify both
+carriers return the same final state (empty/no-orphans). Mutation events
+journaled through Kiroku for audit.
+
+**C5 — FTS5 trigram index consistency**: 
+The `pg_trgm` extension provides `similarity(`text,text``) operator in
+Postgres, which must match SQLite's `MATCH` operator equivalence class
+for the same query patterns.
+
+**Parity verification command**:
+```
+cd docs/fixtures && sqlite3 test_repo_graph.sqlite < parity_contracts.sql
+psql -d campaign -f parity_contracts.sql
+```
+Both outputs must be identical row-by-row. Differences trigger a
+carrier-parity failure, blocking ladder promotion until resolved.
+
+#### Parity Gates (before ladder promotion)
+
+| Gate | Query | SQLite | Postgres | Requirement |
+|------|-------|--------|----------|-------------|
+| G1 | `SELECT COUNT(*) FROM nodes WHERE repo='mowgli'` | N | N | Must match |
+| G2 | `SELECT * FROM edges WHERE relation='cites' LIMIT 1` | N | N | Must match |
+| G3 | FTS5/MATCH equivalence | N | N | Must match |
+| G4 | Round-trip insert-select-delete | N | N | Must match |
+
+Parity failure blocks all ladder promotion until carriers reconciled.
+
+#### Parity Maintenance
+
+- **Scheduled reconciliation**: Monthly parity check runs as Keiro durable
+  workflow; discrepancies logged through Kiroku, evidence ranked through Kioku.
+- **Migration scripts**: If carrier schema diverges, migration scripts in
+  `Campaign/Bootstrap.hs` reconcile differences; failing parity triggers
+  automatic rollback to last known-good carrier state.
+- **Test hook**: `carrierParityTests` in `test/codegraph/Main.hs` runs as
+  part of Tier 1 acceptance gates; failure stops all promotion.
+
