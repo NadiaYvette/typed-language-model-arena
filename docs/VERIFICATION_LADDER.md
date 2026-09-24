@@ -428,3 +428,118 @@ Parity failure blocks all ladder promotion until carriers reconciled.
 - **Test hook**: `carrierParityTests` in `test/codegraph/Main.hs` runs as
   part of Tier 1 acceptance gates; failure stops all promotion.
 
+
+### Enhanced Meta-Verification (Step 4h)
+
+- **Purpose**: Comprehensive property-based verification of all oracle facts,
+  CodeGraphStore façade accuracy, Mori-Schema schema validity, and driver contract
+  compliance to ensure the entire verification stack is trustworthy.
+- **Property Tests** (QuickCheck/hedgehog):
+  - **Oracle Sensitivity**: Rapidly generate test cases with varying exit codes,
+    marker patterns, known-fail baselines, and timeout values to verify that
+    interpreter verdicts are deterministic and consistent.
+  - **CodeGraphStore Façord Accuracy**: Generate façade queries with edge cases
+    (missing nodes, invalid predicates, out-of-range line numbers) and verify
+    that Mori-validated responses are either correct or properly rejected.
+  - **Mori-Schema Schema Validity**: Generate Mori exchange payloads that span
+    the full schema space and verify that validation passes for valid inputs
+    and fails for invalid inputs.
+  - **Driver Contract Compliance**: Generate driver contract scenarios
+    (timeout expirations, kill schedule violations, known-fail baseline
+    violations) and verify that driver behavior is consistent with the contract.
+- **Mutation Testing** (cargo-mutants/mutatest, optional):
+  - Measure oracle sensitivity by applying mutations to interpreter logic
+  - Verify that property tests detect the mutations (high sensitivity = good oracle)
+  - Measure CodeGraphStore façade accuracy by mutating query results
+  - Track mutation detection rate as an oracle quality metric
+- **Sandbox Verification**:
+  - All agent-proposed binaries wrapped in nsjail/bubblewrap/runc before execution
+  - No LLM verdicts; all rung outcomes from deterministic tool verdicts only
+  - Sandbox audit logs journaled through Kiroku
+  - `rr` replays optionally stored in Kioku L0 for post-mortem analysis
+- **Meta-Outcome Flow**:
+  - Property test results flow back into Kioku as lessons/evidence weights
+  - Mutation testing results inform oracle sensitivity metrics
+  - Sandbox audit outcomes flow back into Kioku as risk assessments
+  - All outcomes affect future run evidence ranking and worker capability assignment
+- **Gate Implications**:
+  - If property tests fail for any oracle, that oracle is marked "sensitive-susceptible"
+  - Mutation testing results inform oracle sensitivity scoring
+  - Sandbox failures trigger automatic worker quarantine and capability reassignment
+  - All meta-verification outcomes journaled through Kiroku for future reference
+
+
+### Full Autonomous Loop Deployment (Step 4i)
+
+- **Purpose**: Deploy the complete observe→retrieve→decide→act→persist→validate→(ladder)gate→promote
+  loop across the entire campaign ecosystem with all substrates active and interacting.
+- **Integration Points**:
+  - **Shikumi Decision**: Receives diagnostics from Kioku lessons + CodeGraphStore context
+    + generates typed "Repair Blueprints" validated through Mori-Schema
+  - **Keiro Orchestration**: Executes blueprints as durable workflows with crash-resumable
+    stages, journaled through Kiroku
+  - **PGMQ/Shibuya Transport**: Moves blueprints between orchestration layers via PGMQ
+    queues, validated by Mori-Schema at each hand-off point
+  - **Kioku Memory**: Auto-updates evidence rankings and evidence weights based on
+    rung outcomes, meta-verification results, and sandbox audit logs
+  - **Kiroku Journal**: Append-only store for all structured exchanges, outcomes, and
+    meta-verification results; serves as the source of truth for evidence ranking
+  - **Mori-Schema Middleware**: Validates all structured exchanges (tool calls, workflow
+    events, CodeGraph queries, driver contract outputs) at every seam in the loop
+  - **Driver Contract**: All driver interactions (kill schedules, timeoutSeconds, fact
+    inputs, known-fail baselines) validated against manifest declarations before execution
+  - **Capability Flags**: `has_fault_injection`, `has_qemu`, `has_sandbox`, `has_fsck`
+    gate worker assignment and determine which ladder rungs a worker may execute
+  - **Harness Clones**: Assessed harness clones (from HARNESS_CLONE_QUEUE.md) feed into
+    driver contract declarations and capability flag assignments
+- **Full Loop Scenario**:
+  1. **Trigger**: Hermes detects event (test failure, symbol change, verification gate miss)
+  2. **2a. Context Retrieval — Kioku**: Query episodic/semantic memory for historical
+    precedents, known-fails, lessons.
+  3. **2b. Code Context Retrieval — CodeGraphStore + façade**: query façade for
+    `find_symbol`/`get_callers`/`get_callees`/`trace_path`; Mori-validate wire types
+  4. **3. Decision — Shikumi**: Invoke Shikumi Decision Tool with diagnostics + Kioku
+    lessons + code-graph context → typed "Repair Blueprint".
+  5. **4. Action — Keiro / PGMQ / Shibuya-PGMQ**: 
+     Keiro Durable Workflow Plugin receives blueprint.
+     Shibuya-PGMQ Adapter enqueues blueprint via PGMQ.
+     Worker event loop (Shikumi-Eval) processes blueprint and journals results
+     back via Kiroku.
+  6. **5. Persistence — Kiroku / Kioku**: 
+     Kiroku journals the event append-only; on completion, Kioku updates the final
+     result for future reference.
+  7. **6. Verification — Mori-Schema (+ graph contracts)**: All structured exchanges
+     validated through Mori-Schema middleware: workflow events, tool calls, AND
+     CodeGraph node/edge/tool response schemas. Graph mutation events also journaled
+     through Kiroku.
+  7. **7. Ladder gate — honest rungs (VERIFICATION_LADDER)**: Deterministic oracle
+     interpreters grade the changed unit against its declared ladder membership.
+     • pass / passed-waived → eligible to promote (attestation receipt)
+     • fail / unknown → failed-first reschedule + bisection (Vector D) → back to
+       step 2b with CodeGraph diagnostics → Shikumi repair blueprint → human
+       review (Campaign.Review) → re-run the same rung.
+  8. **8. Ladder outcome flow**: Outcomes flow back into Kioku as lessons/waivers
+     (step 7 → next run's evidence ranking); raw driver logs (and optionally `rr`
+     replays) land in L0 — closing observe→repair→gate→remember loop.
+  9. **9. Meta-verification**: Property tests (QuickCheck/hedgehog) for oracle
+     sensitivity, CodeGraphStore façade accuracy, Mori-Schema schema validity;
+     optional mutation metrics (cargo-mutants/mutatest) to measure oracle sensitivity;
+     sandbox (nsjail/bubblewrap/runc) wraps any agent-proposed binary before it
+     executes; LLMs never grade a rung.
+- **Ecosystem-Wide Integration**: The autonomous loop operates across all campaign
+  portfolio repositories (pgcl, telix, tessera, organ-bank, mowgli, peirce, mercury,
+  and others), with carrier parity ensured through C1-C5 Postgres↔SQLite contracts,
+  capability flags gating worker assignment, and Kioku evidence ranking informing
+  future run prioritization.
+- **Full Deployment Checklist**:
+  - [ ] All 7 verification forms active and gated
+  - [ ] All 4 barriers open (1-4)
+  - [ ] All carrier parity contracts (C1-C5) verified
+  - [ ] All driver conformance contracts declared and validated
+  - [ ] All meta-property tests passing
+  - [ ] All sandbox protections in place
+  - [ ] All Kioku evidence rankings current
+  - [ ] All Kiroku journals up to date
+  - [ ] All harness clones assessed and integrated
+  - [ ] All capability flags assigned and verified
+
